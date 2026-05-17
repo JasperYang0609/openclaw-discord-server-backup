@@ -1,0 +1,16 @@
+{
+  "guildId": "YOUR_DISCORD_GUILD_ID",
+  "backupRoot": "~/OpenClawBackups/discord",
+  "statePath": "memory/channel_backup_summary_state.json",
+  "queuePath": "memory/channel_backup_backlog_queue.json",
+  "reportChannel": "discord:channel:YOUR_REPORT_CHANNEL_OR_THREAD_ID",
+  "timezone": "Asia/Taipei",
+  "limits": {
+    "dailyEntryLimit": 6,
+    "dailyMessageLimitPerEntry": 60,
+    "backlogEntryLimit": 4,
+    "backlogBatchLimit": 12,
+    "backlogPageLimit": 100,
+    "auditProbeLimit": 1
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "version": 3,
+  "schema": "channel-backup-state-v3",
+  "guildId": "YOUR_DISCORD_GUILD_ID",
+  "rootPath": "~/OpenClawBackups/discord",
+  "queuePath": "memory/channel_backup_backlog_queue.json",
+  "cursorPolicy": {
+    "sourceOfTruth": "lastWrittenMessageId",
+    "compatField": "lastMessageId",
+    "completeWhen": "message read after cursor returns 0",
+    "neverAdvancePastUnwrittenRaw": true
+  },
+  "entries": {}
+}
