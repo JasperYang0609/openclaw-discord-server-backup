@@ -14,7 +14,7 @@ Clone this repo, then run the installer with Python 3:
 
 `skill/openclaw-discord-server-backup/scripts/install.py --workspace ~/.openclaw/workspace`
 
-Then edit the generated config and add the OpenClaw cron jobs from `examples/cron.examples.md`.
+Install `openclaw-lancedb-knowledge` first if the customer wants searchable memory. Then edit the generated backup config and add the OpenClaw cron jobs from `examples/cron.examples.md`.
 
 ## Contents
 

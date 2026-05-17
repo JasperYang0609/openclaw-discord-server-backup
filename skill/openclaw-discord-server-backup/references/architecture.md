@@ -10,6 +10,7 @@ Back up Discord channels and threads in OpenClaw without silently missing messag
 - Daily sync: bounded reads for healthy entries.
 - Backlog worker: queue-first catch-up for heavy or partial entries.
 - Audit: full live probe across all registered entries.
+- LanceDB indexing: optional incremental knowledge index after backup files are written.
 
 ## Completion rule
 

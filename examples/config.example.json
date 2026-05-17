@@ -12,5 +12,17 @@
     "backlogBatchLimit": 12,
     "backlogPageLimit": 100,
     "auditProbeLimit": 1
+  },
+  "installOrder": [
+    "openclaw-lancedb-knowledge",
+    "openclaw-discord-server-backup"
+  ],
+  "lancedb": {
+    "enabled": true,
+    "projectPath": "knowledge-lancedb",
+    "incrementalCommand": "npm run incremental",
+    "latestManifest": "knowledge-lancedb/reports/incremental-manifest.latest.json",
+    "runAfterBackup": true,
+    "externalEmbeddingsRequireApproval": true
   }
 }

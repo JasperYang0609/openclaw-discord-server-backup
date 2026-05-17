@@ -8,3 +8,4 @@
 - Deterministic backlog worker.
 - Full caught-up audit probe.
 - Customer install/config skeleton.
+- Optional LanceDB post-backup incremental indexing integration.

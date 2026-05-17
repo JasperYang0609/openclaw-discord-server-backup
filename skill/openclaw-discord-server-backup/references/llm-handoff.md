@@ -1,6 +1,6 @@
 # LLM Handoff
 
-This skill is for OpenClaw Discord backups.
+This skill is for OpenClaw Discord backups. It can optionally trigger LanceDB incremental indexing after backups.
 
 Any LLM operating this skill should follow these rules:
 

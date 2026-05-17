@@ -2,6 +2,7 @@
 
 ## Steps
 
+0. If searchable knowledge is required, install and baseline `openclaw-lancedb-knowledge` first.
 1. Clone the GitHub repository.
 2. Run the installer with Python 3.
 3. Set the customer config values.

@@ -21,3 +21,11 @@ The prompt should run `scripts/run_backlog_worker_v3.py` with config-derived pat
 Schedule: daily 06:30 or 23:30.
 
 The prompt should run `scripts/audit_caught_up_v3.py` and report any false healthy entries.
+
+## LanceDB incremental indexing
+
+Schedule: after backup and audit, for example daily 06:30.
+
+The prompt should run `scripts/run_lancedb_incremental.py` with the customer config.
+
+Recommended customer flow: install and baseline `openclaw-lancedb-knowledge` first, then enable this backup skill's LanceDB post-backup indexing.
