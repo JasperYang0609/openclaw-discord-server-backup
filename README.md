@@ -26,3 +26,9 @@ Install `openclaw-lancedb-knowledge` first if the customer wants searchable memo
 ## Safety
 
 Do not commit tokens, OpenClaw config files, or customer backup data. Only commit templates, scripts, prompts, references, and tests.
+
+## Maintainer use of Codex
+
+This project is maintained as part of the OpenClaw ecosystem. We plan to use Codex to help review pull requests, reproduce backup edge cases, expand regression tests, and keep release notes accurate when OpenClaw channel, thread, or message APIs change.
+
+API-assisted maintenance should focus on safe, auditable workflows: issue triage, test generation, compatibility checks, documentation updates, and release automation. Codex should not be used to process private Discord exports, customer secrets, or local backup data.
