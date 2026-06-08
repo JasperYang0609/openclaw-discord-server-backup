@@ -27,6 +27,20 @@ def today_tw() -> str:
     return datetime.now(TZ_TAIPEI).date().isoformat()
 
 
+def snowflake_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def newest_cursor(*values: Any) -> str | None:
+    cursors = [str(v) for v in values if v]
+    if not cursors:
+        return None
+    return max(cursors, key=snowflake_int)
+
+
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -168,25 +182,45 @@ def append_batch(root: Path, entry: dict[str, Any], msgs: list[dict[str, Any]], 
                 f.write(f"- {x}\n")
 
 
-def upsert_queue_item(queue: dict[str, Any], key: str, entry: dict[str, Any], status: str, reason: str | None = None) -> dict[str, Any]:
+def upsert_queue_item(queue: dict[str, Any], key: str, entry: dict[str, Any], status: str, reason: str | None = None, priority: int | None = None) -> dict[str, Any]:
     queue.setdefault("version", 1)
     queue.setdefault("items", [])
+    entry_cursor = newest_cursor(entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
+    now = now_utc()
     for item in queue["items"]:
         if item.get("entryKey") == key:
+            # Reactivate stale/caught_up items safely and never let an old queue cursor
+            # move work behind the durable state cursor. Re-reading behind state can
+            # duplicate raw appends; reading from the newest cursor preserves monotonicity.
+            item["channelId"] = entry.get("channelId")
+            item["relativePath"] = entry.get("relativePath", key)
+            item["type"] = entry.get("type")
+            item["cursorMessageId"] = newest_cursor(item.get("cursorMessageId"), entry_cursor)
+            item["targetHintMessageId"] = entry.get("lastSeenMessageId") or item.get("targetHintMessageId")
+            item["status"] = status
+            if reason:
+                item["reason"] = reason
+            elif not item.get("reason"):
+                item["reason"] = entry.get("backlogReason") or "state_partial"
+            if priority is not None:
+                item["priority"] = priority
+            elif item.get("priority") is None:
+                item["priority"] = 50
+            item["updatedAt"] = now
             return item
     item = {
         "entryKey": key,
         "channelId": entry.get("channelId"),
         "relativePath": entry.get("relativePath", key),
         "type": entry.get("type"),
-        "cursorMessageId": entry.get("lastWrittenMessageId") or entry.get("lastMessageId"),
+        "cursorMessageId": entry_cursor,
         "targetHintMessageId": entry.get("lastSeenMessageId"),
-        "priority": 50,
+        "priority": priority if priority is not None else 50,
         "reason": reason or entry.get("backlogReason") or "state_partial",
         "status": status,
         "attempts": 0,
-        "createdAt": now_utc(),
-        "updatedAt": now_utc(),
+        "createdAt": now,
+        "updatedAt": now,
     }
     queue["items"].append(item)
     return item
@@ -195,24 +229,59 @@ def upsert_queue_item(queue: dict[str, Any], key: str, entry: dict[str, Any], st
 def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
     entries = state.get("entries", {})
     selected: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
-    seen = set()
+    seen: set[str] = set()
+
+    def add(key: str, entry: dict[str, Any], item: dict[str, Any]) -> None:
+        item["cursorMessageId"] = newest_cursor(item.get("cursorMessageId"), entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
+        selected.append((key, entry, item))
+        seen.add(key)
+
+    # 1) Active queue always wins. It represents work already discovered by daily
+    # sync/audit/backlog and should not be starved by broad stale probes.
     items = [i for i in queue.get("items", []) if i.get("status", "queued") in ACTIVE]
     items.sort(key=lambda i: (int(i.get("priority") or 50), i.get("createdAt") or "", i.get("relativePath") or ""))
     for item in items:
         key = item.get("entryKey")
         if key in entries and key not in seen:
-            selected.append((key, entries[key], item)); seen.add(key)
+            add(key, entries[key], item)
         if len(selected) >= limit:
             return selected
-    partials = []
+
+    # 2) State-marked incomplete/error entries. Upsert refreshes stale/caught_up
+    # queue items and keeps the queue cursor monotonic with state.
+    partials: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for key, entry in entries.items():
         if key in seen:
             continue
         if entry.get("syncStatus") in {"partial", "queued", "catching_up", "error"} or entry.get("backlogReason"):
-            item = upsert_queue_item(queue, key, entry, "queued")
+            item = upsert_queue_item(queue, key, entry, "queued", reason=entry.get("backlogReason") or "state_partial", priority=40)
             partials.append((key, entry, item))
     partials.sort(key=lambda t: (int(t[2].get("priority") or 50), t[1].get("lastBackup") or "9999-99-99", t[0]))
-    selected.extend(partials[: max(0, limit - len(selected))])
+    for key, entry, item in partials[: max(0, limit - len(selected))]:
+        add(key, entry, item)
+    if len(selected) >= limit:
+        return selected
+
+    # 3) Safety net for quiet channels/threads that became active again. Daily sync
+    # intentionally skips old healthy entries and delegates them to backlog. If the
+    # backlog worker does not probe healthy-stale entries, they can stay invisible
+    # forever. A zero-message probe marks them checked/today; any messages are
+    # appended normally from the durable cursor.
+    stale_healthy: list[tuple[str, dict[str, Any]]] = []
+    for key, entry in entries.items():
+        if key in seen:
+            continue
+        if entry.get("syncStatus", "healthy") != "healthy" or entry.get("backlogReason"):
+            continue
+        if not newest_cursor(entry.get("lastWrittenMessageId"), entry.get("lastMessageId")):
+            continue
+        if entry.get("lastBackup") == today_tw():
+            continue
+        stale_healthy.append((key, entry))
+    stale_healthy.sort(key=lambda t: (t[1].get("lastBackup") or "0000-00-00", t[0]))
+    for key, entry in stale_healthy[: max(0, limit - len(selected))]:
+        item = upsert_queue_item(queue, key, entry, "queued", reason="healthy_stale_probe", priority=60)
+        add(key, entry, item)
     return selected
 
 
@@ -259,7 +328,7 @@ def main() -> int:
     for key, entry, qitem in candidates:
         if total_batches >= args.max_batches:
             break
-        cursor = qitem.get("cursorMessageId") or entry.get("lastWrittenMessageId") or entry.get("lastMessageId")
+        cursor = newest_cursor(qitem.get("cursorMessageId"), entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
         if not cursor:
             report.append({"entry": key, "status": "skipped_bootstrap_not_implemented", "added": 0})
             continue
@@ -270,6 +339,7 @@ def main() -> int:
         entry["syncStatus"] = "catching_up"
         entry["backlogAttempts"] = int(entry.get("backlogAttempts") or 0) + 1
         qitem["status"] = "catching_up"
+        qitem["cursorMessageId"] = cursor
         qitem["attempts"] = int(qitem.get("attempts") or 0) + 1
         qitem["updatedAt"] = now_utc()
         save_json(state_path, state); save_json(queue_path, queue)
