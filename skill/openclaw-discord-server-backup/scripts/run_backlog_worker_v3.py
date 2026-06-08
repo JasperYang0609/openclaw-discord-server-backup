@@ -282,6 +282,27 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int) 
     for key, entry in stale_healthy[: max(0, limit - len(selected))]:
         item = upsert_queue_item(queue, key, entry, "queued", reason="healthy_stale_probe", priority=60)
         add(key, entry, item)
+    if len(selected) >= limit:
+        return selected
+
+    # 4) Bootstrap entries with no durable cursor. Use a synthetic cursor of "0"
+    # so the normal after-cursor loop can establish the first real written cursor.
+    # This is bounded by the same worker limits and prevents null-cursor entries
+    # from being skipped forever.
+    bootstrap: list[tuple[str, dict[str, Any]]] = []
+    for key, entry in entries.items():
+        if key in seen:
+            continue
+        if newest_cursor(entry.get("lastWrittenMessageId"), entry.get("lastMessageId")):
+            continue
+        if not entry.get("channelId"):
+            continue
+        bootstrap.append((key, entry))
+    bootstrap.sort(key=lambda t: (t[1].get("lastBackup") or "0000-00-00", t[0]))
+    for key, entry in bootstrap[: max(0, limit - len(selected))]:
+        item = upsert_queue_item(queue, key, entry, "queued", reason="bootstrap_needed", priority=90)
+        item["cursorMessageId"] = item.get("cursorMessageId") or "0"
+        add(key, entry, item)
     return selected
 
 
@@ -330,8 +351,8 @@ def main() -> int:
             break
         cursor = newest_cursor(qitem.get("cursorMessageId"), entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
         if not cursor:
-            report.append({"entry": key, "status": "skipped_bootstrap_not_implemented", "added": 0})
-            continue
+            cursor = "0"
+            qitem["cursorMessageId"] = cursor
         if args.dry_run:
             report.append({"entry": key, "status": "would_process", "cursor": cursor})
             continue

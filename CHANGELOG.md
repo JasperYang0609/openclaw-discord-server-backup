@@ -6,6 +6,7 @@
 - Keep queue cursors monotonic with state cursors to prevent duplicate raw appends from stale queue items.
 - Limit stale probe queue upserts to the entries selected for the current bounded run.
 - Add backlog worker selection regression tests for stale probes and cursor monotonicity.
+- Add bounded bootstrap selection for entries with null cursors so they do not remain permanently unprocessed.
 
 ## 1.0.0 - planned
 

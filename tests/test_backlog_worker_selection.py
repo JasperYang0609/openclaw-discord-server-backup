@@ -130,9 +130,33 @@ def test_stale_probe_only_enqueues_selected_limit():
     assert len(queue["items"]) == 2
     assert all(item["reason"] == "healthy_stale_probe" for item in queue["items"])
 
+
+def test_null_cursor_entry_is_selected_for_bounded_bootstrap():
+    state = {
+        "entries": {
+            "new-thread": {
+                "type": "thread",
+                "channelId": "500",
+                "relativePath": "parent/new-thread",
+                "lastBackup": None,
+                "syncStatus": "healthy",
+            }
+        }
+    }
+    queue = {"version": 1, "items": []}
+
+    selected = worker.select_candidates(state, queue, 1)
+
+    assert selected[0][0] == "new-thread"
+    item = selected[0][2]
+    assert item["reason"] == "bootstrap_needed"
+    assert item["priority"] == 90
+    assert item["cursorMessageId"] == "0"
+
 if __name__ == "__main__":
     test_selects_healthy_stale_entry_not_in_queue()
     test_reactivated_queue_cursor_never_lags_state_cursor()
     test_active_queue_cursor_is_advanced_to_state_cursor()
     test_stale_probe_only_enqueues_selected_limit()
+    test_null_cursor_entry_is_selected_for_bounded_bootstrap()
     print("backlog worker selection tests passed")
