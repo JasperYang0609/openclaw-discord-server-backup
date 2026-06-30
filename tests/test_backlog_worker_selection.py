@@ -153,10 +153,39 @@ def test_null_cursor_entry_is_selected_for_bounded_bootstrap():
     assert item["priority"] == 90
     assert item["cursorMessageId"] == "0"
 
+
+def test_normalize_queue_collapses_stale_duplicate_active_item():
+    state = {
+        "entries": {
+            "topic": {
+                "type": "thread",
+                "channelId": "1",
+                "relativePath": "parent/topic",
+                "lastWrittenMessageId": "300",
+                "lastMessageId": "300",
+                "syncStatus": "healthy",
+            }
+        }
+    }
+    queue = {
+        "version": 1,
+        "items": [
+            {"entryKey": "topic", "cursorMessageId": "300", "status": "caught_up", "priority": 5, "attempts": 1},
+            {"entryKey": "topic", "cursorMessageId": "250", "status": "catching_up", "priority": 80, "attempts": 9},
+        ],
+    }
+
+    worker.normalize_queue_items(queue, state)
+
+    assert len(queue["items"]) == 1
+    assert queue["items"][0]["cursorMessageId"] == "300"
+    assert queue["items"][0]["status"] == "caught_up"
+
 if __name__ == "__main__":
     test_selects_healthy_stale_entry_not_in_queue()
     test_reactivated_queue_cursor_never_lags_state_cursor()
     test_active_queue_cursor_is_advanced_to_state_cursor()
     test_stale_probe_only_enqueues_selected_limit()
     test_null_cursor_entry_is_selected_for_bounded_bootstrap()
+    test_normalize_queue_collapses_stale_duplicate_active_item()
     print("backlog worker selection tests passed")

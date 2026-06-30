@@ -182,6 +182,59 @@ def append_batch(root: Path, entry: dict[str, Any], msgs: list[dict[str, Any]], 
                 f.write(f"- {x}\n")
 
 
+def normalize_queue_items(queue: dict[str, Any], state: dict[str, Any]) -> None:
+    """Collapse duplicate queue items by entryKey and keep cursor monotonic.
+
+    Older duplicate active items can otherwise keep the queue permanently active
+    even after a newer duplicate reached caught_up. The merged item follows the
+    newest cursor and preserves entry metadata from current state.
+    """
+    items = queue.get("items") or []
+    entries = state.get("entries", {})
+    merged: dict[str, dict[str, Any]] = {}
+    passthrough: list[dict[str, Any]] = []
+    for item in items:
+        key = item.get("entryKey")
+        if not key:
+            passthrough.append(item)
+            continue
+        entry = entries.get(key, {})
+        item_cursor = newest_cursor(item.get("cursorMessageId"), entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
+        item["cursorMessageId"] = item_cursor
+        current = merged.get(key)
+        if current is None:
+            merged[key] = item
+            continue
+        current_cursor = newest_cursor(current.get("cursorMessageId"))
+        replace = snowflake_int(item_cursor) > snowflake_int(current_cursor)
+        if snowflake_int(item_cursor) == snowflake_int(current_cursor):
+            # Prefer a completed item on equal cursor, otherwise keep lower priority.
+            if item.get("status") == "caught_up" and current.get("status") != "caught_up":
+                replace = True
+            elif item.get("status") != "caught_up" and current.get("status") == "caught_up":
+                replace = False
+            else:
+                replace = int(item.get("priority") or 50) < int(current.get("priority") or 50)
+        chosen = item if replace else current
+        other = current if replace else item
+        chosen["attempts"] = max(int(chosen.get("attempts") or 0), int(other.get("attempts") or 0))
+        chosen["cursorMessageId"] = newest_cursor(chosen.get("cursorMessageId"), other.get("cursorMessageId"))
+        if not chosen.get("targetHintMessageId"):
+            chosen["targetHintMessageId"] = other.get("targetHintMessageId")
+        if not chosen.get("createdAt") or (other.get("createdAt") and other.get("createdAt") < chosen.get("createdAt")):
+            chosen["createdAt"] = other.get("createdAt")
+        chosen["updatedAt"] = now_utc()
+        merged[key] = chosen
+    for key, item in merged.items():
+        entry = entries.get(key, {})
+        if entry:
+            item["channelId"] = entry.get("channelId")
+            item["relativePath"] = entry.get("relativePath", key)
+            item["type"] = entry.get("type")
+            item["cursorMessageId"] = newest_cursor(item.get("cursorMessageId"), entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
+    queue["items"] = passthrough + list(merged.values())
+
+
 def upsert_queue_item(queue: dict[str, Any], key: str, entry: dict[str, Any], status: str, reason: str | None = None, priority: int | None = None) -> dict[str, Any]:
     queue.setdefault("version", 1)
     queue.setdefault("items", [])
@@ -307,11 +360,13 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int) 
 
 
 def mark_queue(queue: dict[str, Any], key: str, **updates: Any) -> None:
+    matched = False
     for item in queue.get("items", []):
         if item.get("entryKey") == key:
             item.update(updates)
             item["updatedAt"] = now_utc()
-            return
+            matched = True
+    return None
 
 
 def main() -> int:
@@ -342,6 +397,7 @@ def main() -> int:
         if state_path.exists(): shutil.copy2(state_path, state_path.with_name(state_path.name + f".bak-backlog-v3-{stamp}"))
         if queue_path.exists(): shutil.copy2(queue_path, queue_path.with_name(queue_path.name + f".bak-backlog-v3-{stamp}"))
 
+    normalize_queue_items(queue, state)
     candidates = select_candidates(state, queue, args.max_entries)
     report = []
     total_batches = 0
