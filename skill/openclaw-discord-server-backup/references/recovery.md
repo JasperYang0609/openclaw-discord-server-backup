@@ -16,9 +16,9 @@ State without queue can still run, but partial work may be hidden. Rebuild queue
 Run:
 
 ```bash
-python3 skills/channel-backup-state-backlog/scripts/migrate_state_v3.py   --state memory/channel_backup_summary_state.json   --queue memory/channel_backup_backlog_queue.json   --backup
+python3 skills/openclaw-discord-server-backup/scripts/migrate_state_v3.py   --state memory/channel_backup_summary_state.json   --queue memory/channel_backup_backlog_queue.json   --backup
 
-python3 skills/channel-backup-state-backlog/scripts/select_backlog_candidates.py   --state memory/channel_backup_summary_state.json   --queue memory/channel_backup_backlog_queue.json   --today YYYY-MM-DD   --limit 4
+python3 skills/openclaw-discord-server-backup/scripts/select_backlog_candidates.py   --state memory/channel_backup_summary_state.json   --queue memory/channel_backup_backlog_queue.json   --today YYYY-MM-DD   --limit 4
 ```
 
 ## Health checks

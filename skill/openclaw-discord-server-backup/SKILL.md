@@ -5,6 +5,19 @@ description: OpenClaw-specific Discord server, channel, and thread backup skill 
 
 # OpenClaw Discord Server Backup
 
+## Layering
+
+This repo ships the merged customer version of a two-layer design:
+
+- Engine layer (single source of truth): the deterministic scripts under `scripts/`
+  (`run_backlog_worker_v3.py`, `migrate_state_v3.py`, `select_backlog_candidates.py`,
+  `audit_caught_up_v3.py`, `bootstrap_state.py`) plus the prompt templates under
+  `prompts/`. All state/queue transitions are defined here and only here.
+- Install layer: `scripts/install.py`, `scripts/init_config.py`, `examples/`, and any
+  rendered cron prompts. Install materials must be derived from the engine prompts and
+  scripts. Never hand-copy or fork engine logic into install materials; when the engine
+  changes, regenerate the install side from it.
+
 ## Non-negotiable guarantee
 
 Do not infer completion from dates. `lastBackup` is only a check/report date.
@@ -16,7 +29,7 @@ A channel/thread is caught up only when `read after=<lastWrittenMessageId>` retu
 1. Discovery registers channels/threads and creates folders. It does not read message content.
 2. Daily sync processes only healthy entries in small batches.
 3. If daily sync hits a page/message limit, it writes what it has, advances cursor only to written raw data, marks the entry partial, and enqueues backlog.
-4. Backlog worker processes queue-first using deterministic scripts.
+4. Backlog worker processes queue-first using deterministic scripts and emits `auditWarnings` for stuck active catch-ups (`attempts > 5` on active queue items, `consecutiveErrors > 3` on entries).
 5. Audit probes every registered entry and requeues false-healthy entries.
 6. Optional LanceDB indexing runs after backup so summaries/raw outputs become searchable knowledge.
 

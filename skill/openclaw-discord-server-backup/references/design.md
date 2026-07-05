@@ -97,9 +97,16 @@ A queue item is removed or marked `caught_up` only after a read after its cursor
 - keeps queue active until a zero-message after-cursor verification
 
 ### Audit/reconciliation
-- looks for impossible or suspicious states
-- probes selected healthy entries when needed
-- requeues false-healthy entries
+- the backlog worker emits `auditWarnings` every run: active queue items
+  (`status in [queued, catching_up, retry]`) with `attempts > 5`, and entries
+  with `consecutiveErrors > 3`
+- `attempts` counts the current catch-up cycle only: it is reset to 0 when an
+  item is marked `caught_up` and starts from 0 when a caught_up item is
+  reactivated, so historical attempts never keep the warning permanently on
+- a non-empty `auditWarnings` means an active catch-up is stuck or keeps
+  erroring; escalate for human attention
+- the standalone audit (`audit_caught_up_v3.py`) additionally probes every
+  registered entry live and requeues false-healthy entries
 
 ## Completion and partial semantics
 
