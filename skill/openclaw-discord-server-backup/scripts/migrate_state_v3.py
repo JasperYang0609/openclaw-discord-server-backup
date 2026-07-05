@@ -11,6 +11,13 @@ from typing import Any
 PARTIAL_MARKERS = (
     "partial",
     "deferred",
+    # syncStatus=catching_up / error also means unfinished backlog remains and
+    # must not be reset to healthy during migration.
+    "catching_up",
+    "error",
+    # syncStatus=queued (already enqueued for backlog) must not be reset to
+    # healthy during migration either.
+    "queued",
     "部分完成",
     "增量部分完成",
     "剩餘交給 backlog",
@@ -163,7 +170,9 @@ def main() -> int:
             entry["backlogReason"] = reason
             stats["bootstrap"] += 1
         elif reason:
-            entry["syncStatus"] = "partial"
+            # Entries already enqueued keep their queued marker; others become partial.
+            if entry.get("syncStatus") != "queued":
+                entry["syncStatus"] = "partial"
             entry["backlogReason"] = reason
             stats["partial"] += 1
         else:

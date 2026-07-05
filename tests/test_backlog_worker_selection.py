@@ -8,6 +8,8 @@ worker = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(worker)
 
+RUN_TODAY = "2026-06-09"
+
 
 def test_selects_healthy_stale_entry_not_in_queue():
     state = {
@@ -25,7 +27,7 @@ def test_selects_healthy_stale_entry_not_in_queue():
     }
     queue = {"version": 1, "items": []}
 
-    selected = worker.select_candidates(state, queue, 1)
+    selected = worker.select_candidates(state, queue, 1, RUN_TODAY)
 
     assert selected[0][0] == "quiet"
     item = selected[0][2]
@@ -64,7 +66,7 @@ def test_reactivated_queue_cursor_never_lags_state_cursor():
         ],
     }
 
-    selected = worker.select_candidates(state, queue, 1)
+    selected = worker.select_candidates(state, queue, 1, RUN_TODAY)
 
     item = selected[0][2]
     assert item["status"] == "queued"
@@ -102,7 +104,7 @@ def test_active_queue_cursor_is_advanced_to_state_cursor():
         ],
     }
 
-    selected = worker.select_candidates(state, queue, 1)
+    selected = worker.select_candidates(state, queue, 1, RUN_TODAY)
 
     assert selected[0][2]["cursorMessageId"] == "300"
 
@@ -124,7 +126,7 @@ def test_stale_probe_only_enqueues_selected_limit():
     }
     queue = {"version": 1, "items": []}
 
-    selected = worker.select_candidates(state, queue, 2)
+    selected = worker.select_candidates(state, queue, 2, RUN_TODAY)
 
     assert len(selected) == 2
     assert len(queue["items"]) == 2
@@ -145,7 +147,7 @@ def test_null_cursor_entry_is_selected_for_bounded_bootstrap():
     }
     queue = {"version": 1, "items": []}
 
-    selected = worker.select_candidates(state, queue, 1)
+    selected = worker.select_candidates(state, queue, 1, RUN_TODAY)
 
     assert selected[0][0] == "new-thread"
     item = selected[0][2]

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 ACTIVE_QUEUE = {"queued", "catching_up", "retry"}
+MAX_429_RETRIES = 8
 
 
 def load_json(path: Path, default: Any = None) -> Any:
@@ -45,6 +46,7 @@ def read_after(token: str, channel_id: str, cursor: str | None, limit: int) -> d
         qs["after"] = str(cursor)
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages?{urllib.parse.urlencode(qs)}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bot {token}", "User-Agent": "openclaw-discord-backup-audit/1.0"})
+    retries_429 = 0
     while True:
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -52,6 +54,11 @@ def read_after(token: str, channel_id: str, cursor: str | None, limit: int) -> d
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore")
             if e.code == 429:
+                # Bounded 429 retries: after the cap, report the entry as an
+                # error instead of blocking the audit run forever.
+                retries_429 += 1
+                if retries_429 > MAX_429_RETRIES:
+                    return {"ok": False, "error": f"429 rate limit persisted after {MAX_429_RETRIES} retries: {body[:200]}"}
                 try:
                     retry = float(json.loads(body).get("retry_after", 1.0))
                 except Exception:

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import shutil
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -17,6 +19,11 @@ from typing import Any
 
 ACTIVE = {"queued", "catching_up", "retry"}
 TZ_TAIPEI = timezone(timedelta(hours=8))
+MAX_429_RETRIES = 8
+
+# When load_json recovers from a .bak file, the recovery source is recorded here
+# and attached to the final output JSON as `recoveredFrom`.
+RECOVERED_SOURCES: list[dict[str, str]] = []
 
 
 def now_utc() -> str:
@@ -44,12 +51,82 @@ def newest_cursor(*values: Any) -> str | None:
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        # If the main file is corrupt, fall back to the newest parseable .bak.
+        # Exit non-zero only when both the main file and every .bak fail.
+        baks = sorted(path.parent.glob(path.name + ".bak*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for bak in baks:
+            try:
+                data = json.loads(bak.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            RECOVERED_SOURCES.append({"path": str(path), "recoveredFrom": str(bak)})
+            return data
+        raise SystemExit(f"FATAL: {path} failed to parse ({exc}) and no usable .bak was found")
 
 
 def save_json(path: Path, data: Any) -> None:
+    # Atomic write: write to .tmp then os.replace, so a crash mid-write never
+    # leaves a half-written JSON file behind.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def acquire_lock(lock_path: Path):
+    """Take a cross-job mutex with fcntl.flock; return None when already locked."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def merge_disk_state(state: dict[str, Any], state_path: Path) -> dict[str, Any]:
+    """Re-read the on-disk state before saving and merge cursors per entry.
+
+    Cursor fields (`lastWrittenMessageId` / `lastMessageId`) are monotonic: the
+    numerically larger snowflake wins, so a concurrent daily-sync job can never
+    be rolled back by this worker's older in-memory snapshot. Entries that only
+    exist on disk are preserved as-is.
+    """
+    try:
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return state
+    if not isinstance(disk, dict):
+        return state
+    disk_entries = disk.get("entries") or {}
+    entries = state.setdefault("entries", {})
+    for key, disk_entry in disk_entries.items():
+        if not isinstance(disk_entry, dict):
+            continue
+        entry = entries.get(key)
+        if entry is None:
+            entries[key] = disk_entry
+            continue
+        for field in ("lastWrittenMessageId", "lastMessageId"):
+            merged = newest_cursor(entry.get(field), disk_entry.get(field))
+            if merged:
+                entry[field] = merged
+    return state
+
+
+def save_state_merged(state: dict[str, Any], state_path: Path) -> None:
+    """Merge the on-disk state before every state save (including mid-loop saves).
+
+    This shrinks the lost-update window with concurrent LLM daily-sync jobs: even
+    if another job writes between two worker saves, its cursor progress is merged
+    back before the next save instead of being overwritten by an older snapshot.
+    """
+    merge_disk_state(state, state_path)
+    save_json(state_path, state)
 
 
 def load_discord_token(config_path: Path | None, env_name: str) -> str:
@@ -69,6 +146,7 @@ def discord_messages(token: str, channel_id: str, *, after: str | None, limit: i
         params["after"] = str(after)
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bot {token}", "User-Agent": "channel-backup-v3/1.0"})
+    retries_429 = 0
     while True:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -76,6 +154,11 @@ def discord_messages(token: str, channel_id: str, *, after: str | None, limit: i
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore")
             if e.code == 429:
+                # Bounded 429 retries: after the cap, raise so the entry takes
+                # the normal error path instead of blocking the run forever.
+                retries_429 += 1
+                if retries_429 > MAX_429_RETRIES:
+                    raise RuntimeError(f"Discord 429 rate limit persisted after {MAX_429_RETRIES} retries: {body[:200]}")
                 try:
                     retry = float(json.loads(body).get("retry_after", 1.0))
                 except Exception:
@@ -198,6 +281,14 @@ def normalize_queue_items(queue: dict[str, Any], state: dict[str, Any]) -> None:
         if not key:
             passthrough.append(item)
             continue
+        if key not in entries:
+            # Orphan item (its state entry no longer exists): mark it retired so
+            # it stops counting toward the active queue, but keep it for history.
+            if item.get("status") != "retired":
+                item["status"] = "retired"
+                item["updatedAt"] = now_utc()
+            passthrough.append(item)
+            continue
         entry = entries.get(key, {})
         item_cursor = newest_cursor(item.get("cursorMessageId"), entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
         item["cursorMessageId"] = item_cursor
@@ -242,6 +333,11 @@ def upsert_queue_item(queue: dict[str, Any], key: str, entry: dict[str, Any], st
     now = now_utc()
     for item in queue["items"]:
         if item.get("entryKey") == key:
+            # Reactivating a caught_up item starts a new catch-up cycle, so reset
+            # attempts to 0. Otherwise historical attempts would keep audit
+            # warnings permanently triggered (alert fatigue).
+            if item.get("status") == "caught_up" and status in ACTIVE:
+                item["attempts"] = 0
             # Reactivate stale/caught_up items safely and never let an old queue cursor
             # move work behind the durable state cursor. Re-reading behind state can
             # duplicate raw appends; reading from the newest cursor preserves monotonicity.
@@ -256,7 +352,9 @@ def upsert_queue_item(queue: dict[str, Any], key: str, entry: dict[str, Any], st
             elif not item.get("reason"):
                 item["reason"] = entry.get("backlogReason") or "state_partial"
             if priority is not None:
-                item["priority"] = priority
+                # Same rule as migrate_state_v3.merge_queue: keep the minimum
+                # priority number (smaller = more urgent), never downgrade.
+                item["priority"] = min(int(item.get("priority") or 99), int(priority))
             elif item.get("priority") is None:
                 item["priority"] = 50
             item["updatedAt"] = now
@@ -279,7 +377,7 @@ def upsert_queue_item(queue: dict[str, Any], key: str, entry: dict[str, Any], st
     return item
 
 
-def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, run_today: str) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
     entries = state.get("entries", {})
     selected: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     seen: set[str] = set()
@@ -328,7 +426,9 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int) 
             continue
         if not newest_cursor(entry.get("lastWrittenMessageId"), entry.get("lastMessageId")):
             continue
-        if entry.get("lastBackup") == today_tw():
+        # Use the same base date as the lastBackup value written on caught_up
+        # (args.today), so replayed runs for an older date stay consistent.
+        if entry.get("lastBackup") == run_today:
             continue
         stale_healthy.append((key, entry))
     stale_healthy.sort(key=lambda t: (t[1].get("lastBackup") or "0000-00-00", t[0]))
@@ -350,6 +450,11 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int) 
             continue
         if not entry.get("channelId"):
             continue
+        # Probe an empty channel at most once per day to avoid repeated daily
+        # bootstrap probes. The base date matches the lastBackup value written
+        # on caught_up (args.today), so replayed runs stay consistent.
+        if entry.get("lastBackup") == run_today:
+            continue
         bootstrap.append((key, entry))
     bootstrap.sort(key=lambda t: (t[1].get("lastBackup") or "0000-00-00", t[0]))
     for key, entry in bootstrap[: max(0, limit - len(selected))]:
@@ -360,13 +465,10 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int) 
 
 
 def mark_queue(queue: dict[str, Any], key: str, **updates: Any) -> None:
-    matched = False
     for item in queue.get("items", []):
         if item.get("entryKey") == key:
             item.update(updates)
             item["updatedAt"] = now_utc()
-            matched = True
-    return None
 
 
 def main() -> int:
@@ -387,6 +489,21 @@ def main() -> int:
     state_path = Path(args.state)
     queue_path = Path(args.queue)
     root = Path(args.root)
+
+    # A missing state file is a configuration error: exit non-zero instead of
+    # silently starting from an empty state.
+    if not state_path.exists():
+        print(f"ERROR: state file not found: {state_path}", file=sys.stderr)
+        return 1
+
+    # Cross-job lockfile (same directory as the state file). If another run
+    # holds the lock, report skipped and exit cleanly.
+    lock_path = state_path.parent / ".channel_backup.lock"
+    lock_handle = acquire_lock(lock_path)
+    if lock_handle is None:
+        print(json.dumps({"skipped": "locked", "lock": str(lock_path)}, ensure_ascii=False))
+        return 0
+
     state = load_json(state_path, {})
     queue = load_json(queue_path, {"version": 1, "items": []})
     token = "" if args.dry_run else load_discord_token(Path(args.openclaw_config), args.token_env)
@@ -396,9 +513,14 @@ def main() -> int:
     if not args.dry_run:
         if state_path.exists(): shutil.copy2(state_path, state_path.with_name(state_path.name + f".bak-backlog-v3-{stamp}"))
         if queue_path.exists(): shutil.copy2(queue_path, queue_path.with_name(queue_path.name + f".bak-backlog-v3-{stamp}"))
+        # Rotation: keep only the newest N backups per file to avoid unbounded .bak buildup
+        for base in (state_path, queue_path):
+            baks = sorted(base.parent.glob(base.name + ".bak*"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in baks[5:]:
+                old.unlink(missing_ok=True)
 
     normalize_queue_items(queue, state)
-    candidates = select_candidates(state, queue, args.max_entries)
+    candidates = select_candidates(state, queue, args.max_entries, args.today)
     report = []
     total_batches = 0
 
@@ -419,7 +541,7 @@ def main() -> int:
         qitem["cursorMessageId"] = cursor
         qitem["attempts"] = int(qitem.get("attempts") or 0) + 1
         qitem["updatedAt"] = now_utc()
-        save_json(state_path, state); save_json(queue_path, queue)
+        save_state_merged(state, state_path); save_json(queue_path, queue)
 
         added = 0
         batches = 0
@@ -434,7 +556,7 @@ def main() -> int:
                     entry["backlogReason"] = None
                     entry["lastBackup"] = args.today
                     entry["consecutiveErrors"] = 0
-                    mark_queue(queue, key, status="caught_up", cursorMessageId=cursor)
+                    mark_queue(queue, key, status="caught_up", cursorMessageId=cursor, attempts=0)
                     status = "caught_up"
                     break
                 msgs = sorted(msgs, key=lambda m: int(m["id"]))
@@ -447,7 +569,7 @@ def main() -> int:
                 entry["syncStatus"] = "partial"
                 entry["backlogReason"] = entry.get("backlogReason") or "page_limit_reached"
                 mark_queue(queue, key, status="queued", cursorMessageId=cursor)
-                save_json(state_path, state); save_json(queue_path, queue)
+                save_state_merged(state, state_path); save_json(queue_path, queue)
                 if len(msgs) < args.limit and total_batches < args.max_batches:
                     probe = discord_messages(token, entry["channelId"], after=cursor, limit=1)
                     total_batches += 1
@@ -456,7 +578,7 @@ def main() -> int:
                         entry["backlogReason"] = None
                         entry["lastBackup"] = args.today
                         entry["consecutiveErrors"] = 0
-                        mark_queue(queue, key, status="caught_up", cursorMessageId=cursor)
+                        mark_queue(queue, key, status="caught_up", cursorMessageId=cursor, attempts=0)
                         status = "caught_up"
                     else:
                         status = "still_queued"
@@ -470,11 +592,34 @@ def main() -> int:
         finally:
             state["updatedAt"] = now_utc()
             queue["updatedAt"] = now_utc()
-            save_json(state_path, state); save_json(queue_path, queue)
+            save_state_merged(state, state_path); save_json(queue_path, queue)
             report.append({"entry": key, "status": status, "added": added, "batches": batches, "cursor": cursor, "error": error})
 
+    # Final save also goes through merge-then-save so concurrent daily-sync
+    # progress is never overwritten.
+    if not args.dry_run:
+        state["updatedAt"] = now_utc()
+        queue["updatedAt"] = now_utc()
+        save_state_merged(state, state_path)
+        save_json(queue_path, queue)
+
+    # Built-in audit: list only currently ACTIVE queue items over the attempts
+    # threshold. caught_up items were reset to 0 attempts and are excluded, so
+    # historical attempts can never keep the warning permanently triggered.
+    audit_warnings: list[dict[str, Any]] = []
+    for item in queue.get("items", []):
+        if item.get("status") not in ACTIVE:
+            continue
+        if int(item.get("attempts") or 0) > 5:
+            audit_warnings.append({"entry": item.get("entryKey"), "kind": "attempts", "attempts": int(item.get("attempts") or 0), "status": item.get("status")})
+    for key, entry in (state.get("entries") or {}).items():
+        if int(entry.get("consecutiveErrors") or 0) > 3:
+            audit_warnings.append({"entry": key, "kind": "consecutiveErrors", "consecutiveErrors": int(entry.get("consecutiveErrors") or 0), "syncStatus": entry.get("syncStatus")})
+
     active_left = sum(1 for i in queue.get("items", []) if i.get("status") in ACTIVE)
-    result = {"ok": True, "today": args.today, "processed": len(report), "totalBatches": total_batches, "activeQueueLeft": active_left, "entries": report}
+    result = {"ok": True, "today": args.today, "processed": len(report), "totalBatches": total_batches, "activeQueueLeft": active_left, "auditWarnings": audit_warnings, "entries": report}
+    if RECOVERED_SOURCES:
+        result["recoveredFrom"] = RECOVERED_SOURCES
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
