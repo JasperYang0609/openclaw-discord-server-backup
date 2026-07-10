@@ -27,6 +27,16 @@ Install `openclaw-lancedb-knowledge` first if the customer wants searchable memo
 
 Do not commit tokens, OpenClaw config files, or customer backup data. Only commit templates, scripts, prompts, references, and tests.
 
+## Post-Run Self-Check
+
+After changing queue, cursor, audit, or backlog behavior, run:
+
+```bash
+python3 skill/openclaw-discord-server-backup/scripts/post_run_check.py
+```
+
+The check validates example JSON, selector behavior, backlog worker invariants, and the test suite when `pytest` is available. Treat failure as a backup correctness issue, because `lastBackup` alone is not proof that a channel/thread is caught up.
+
 ## Maintainer use of Codex
 
 This project is maintained as part of the OpenClaw ecosystem. We plan to use Codex to help review pull requests, reproduce backup edge cases, expand regression tests, and keep release notes accurate when OpenClaw channel, thread, or message APIs change.
