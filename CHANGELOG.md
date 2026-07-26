@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a customer-safe core workspace backup prompt with runtime Markdown discovery, full `memory/` backup, immutable daily snapshots, cron guidance, and package inclusion.
 - Cap Discord 429 retries at 8 in the backlog worker and audit probe, then fail the entry through the normal error path instead of blocking the run forever.
 - Write state/queue JSON atomically (`.tmp` + rename) and recover corrupt files from the newest parseable `.bak`, reporting the source as `recoveredFrom` in the worker output.
 - Add a cross-job `fcntl.flock` lockfile next to the state file; a second concurrent worker run exits cleanly with `{"skipped": "locked"}`.

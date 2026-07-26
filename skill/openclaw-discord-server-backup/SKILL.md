@@ -26,6 +26,7 @@ A channel/thread is caught up only when `read after=<lastWrittenMessageId>` retu
 
 ## Standard workflow
 
+0. Core workspace backup independently refreshes `核心文件/latest/` and creates one daily snapshot from root-level Markdown files plus `memory/`. Use `prompts/core-backup.md`; never hardcode customer filenames.
 1. Discovery registers channels/threads and creates folders. It does not read message content.
 2. Daily sync processes only healthy entries in small batches.
 3. If daily sync hits a page/message limit, it writes what it has, advances cursor only to written raw data, marks the entry partial, and enqueues backlog.
@@ -48,6 +49,7 @@ Use scripts for fragile operations. Do not manually invent state transitions.
 
 ## References
 
+- Use `prompts/core-backup.md` for the customer-safe core workspace backup cron prompt.
 - Read `references/architecture.md` for system design.
 - Read `references/state-schema.md` before editing state/queue format.
 - Read `references/customer-install.md` for installation and cron setup.

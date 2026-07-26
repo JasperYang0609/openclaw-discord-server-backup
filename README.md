@@ -2,7 +2,7 @@
 
 OpenClaw-specific skill for reliable Discord server/channel/thread backup.
 
-It uses V3 cursor state, explicit backlog queue, deterministic workers, and live audit probes so high-volume channels do not silently fall behind.
+It uses V3 cursor state, explicit backlog queue, deterministic workers, and live audit probes so high-volume channels do not silently fall behind. It also ships a customer-safe core workspace backup prompt for root-level Markdown files and `memory/`.
 
 ## Core guarantee
 

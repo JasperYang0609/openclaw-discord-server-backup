@@ -6,10 +6,11 @@
 1. Clone the GitHub repository.
 2. Run the installer with Python 3.
 3. Set the customer config values.
-4. Create OpenClaw cron jobs from the generated prompt files.
-5. Run backlog worker dry-run.
-6. Run audit dry-run.
-7. Enable cron jobs.
+4. Resolve `{{WORKSPACE_ROOT}}` and `{{BACKUP_ROOT}}` in `prompts/core-backup.md`.
+5. Create OpenClaw cron jobs from the prompt files and `examples/cron.examples.md`.
+6. Run backlog worker dry-run.
+7. Run audit dry-run.
+8. Enable cron jobs.
 
 ## Required config
 
