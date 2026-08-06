@@ -1,45 +1,59 @@
-# Core Backup Prompt
+# Core Workspace Backup Prompt
 
-Goal: back up the workspace core Markdown files and durable memory to the designated backup root.
+Goal: run the repository-owned deterministic backup engine for workspace core Markdown files and durable memory.
 
 ## Required placeholders
 
 - `{{WORKSPACE_ROOT}}`: the customer OpenClaw workspace
-- `{{BACKUP_ROOT}}`: the customer backup root
+- `{{BACKUP_ROOT}}`: a backup root that does not overlap the workspace
 
-Resolve both paths before copying. Do not continue while either placeholder is unresolved.
+Resolve and validate both paths before running. Do not continue while either placeholder is unresolved. Do not manually recreate the copy/state logic in this prompt.
 
-## What to back up
+## Run
 
-- Every `.md` file directly under `{{WORKSPACE_ROOT}}` (root level only; do not recurse)
-- The entire `{{WORKSPACE_ROOT}}/memory/` folder
+```bash
+python3 "{{WORKSPACE_ROOT}}/skills/openclaw-discord-server-backup/scripts/core_workspace_backup.py" backup \
+  --workspace "{{WORKSPACE_ROOT}}" \
+  --backup-root "{{BACKUP_ROOT}}"
+```
 
-Do not hardcode filenames. Discover the root-level Markdown files at runtime so customer-specific core files are included automatically.
+The engine is the source of truth. It:
 
-## Destinations
+- discovers every root-level `.md` file without hardcoded names;
+- includes the complete `memory/` tree, including empty directories;
+- rejects source symlinks, special files, unsafe dates, and overlapping source/destination paths;
+- stages and verifies `核心文件/latest/` before replacing the previous latest tree;
+- creates at most one immutable `核心文件/snapshots/YYYY-MM-DD/` tree per local calendar day;
+- emits `.backup-manifest.json` with exact paths, byte counts, and SHA-256 hashes;
+- fails closed when an existing daily snapshot is missing, extra, corrupted, or tampered.
 
-- Latest: `{{BACKUP_ROOT}}/核心文件/latest/` — refresh on every successful run
-- Daily snapshot: `{{BACKUP_ROOT}}/核心文件/snapshots/YYYY-MM-DD/` — create once per local calendar day
+A successful `backup` command already verifies both `latest/` and the selected daily snapshot. Do not report success from file counts or timestamps alone.
 
-Create destination folders when needed. If today's snapshot already exists, leave it unchanged and report `已存在（跳過）`.
+## Restore canary
 
-## Safe write order
+After backup, verify a temporary isolated restore of latest:
 
-1. Verify `{{WORKSPACE_ROOT}}` exists and `{{WORKSPACE_ROOT}}/memory/` is a readable directory.
-2. Discover the root-level `.md` source files and record the count as `N`.
-3. Copy the discovered `.md` files and `memory/` into `latest/`.
-4. If today's snapshot did not exist at run start, copy the same source set into that snapshot.
-5. Verify `latest/` contains all `N` root-level `.md` files and a readable `latest/memory/` directory.
-6. For a newly created snapshot, verify the same source set there.
-7. Retry each missing item once. If anything is still missing, report `❌ 失敗` and list only the missing relative paths.
+```bash
+python3 "{{WORKSPACE_ROOT}}/skills/openclaw-discord-server-backup/scripts/core_workspace_backup.py" restore-canary \
+  --backup-dir "{{BACKUP_ROOT}}/核心文件/latest"
+```
 
-Never delete unrelated files outside the two destination directories. Never upload, post, or commit backup contents; core files may contain private configuration.
+The canary uses an automatically removed temporary directory and never writes into the real workspace. If it fails, report the backup as unsafe for recovery.
+
+## Safety
+
+- Never delete or overwrite daily snapshots.
+- Never restore directly into the customer workspace from this job.
+- Never upload, post, or commit backup contents; core files may contain private configuration.
+- Never bypass a manifest, symlink, overlap, missing-file, extra-file, or hash failure.
 
 ## Report format
 
 ```text
-狀態：✅ 完整 / ⚠️ 補做後通過 / ❌ 失敗
-備份：根目錄 md N 個、memory/ 資料夾 1 個
-快照：已建立 / 已存在（跳過）/ ❌ 失敗
-缺漏：無 / <relative paths>
+狀態：✅ 完整 / ❌ 失敗
+備份：根目錄 md N 個、memory 檔案 N 個
+快照：已建立 / 已存在且驗證
+Manifest：✅ exact paths + SHA-256 / ❌ 失敗
+還原 canary：✅ 通過 / ❌ 失敗
+錯誤：無 / <redacted error summary>
 ```

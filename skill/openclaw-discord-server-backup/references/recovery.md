@@ -1,30 +1,55 @@
 # Recovery Reference — V3
 
+## Before any restore
+
+Core-workspace backups are trusted only after exact manifest verification and an isolated restore canary:
+
+```bash
+python3 skills/openclaw-discord-server-backup/scripts/core_workspace_backup.py verify \
+  --backup-dir "/path/to/backup/核心文件/latest"
+
+python3 skills/openclaw-discord-server-backup/scripts/core_workspace_backup.py restore-canary \
+  --backup-dir "/path/to/backup/核心文件/latest"
+```
+
+Both commands fail on missing, extra, symlinked, size-mismatched, or SHA-256-mismatched content. The canary restores only into an automatically removed temporary directory. This repository intentionally provides no command that overwrites a live workspace.
+
+For a real recovery, stop writers first, select a verified latest or dated snapshot, copy into a separate staging workspace, inspect the diff, and only then perform a human-approved replacement. Never merge an unverified tree directly into production.
+
 ## Restore order
 
-1. workspace core files
-2. `memory/`
-3. backup tree on disk
+1. verified workspace core files
+2. verified `memory/`
+3. Discord backup tree on disk
 4. `memory/channel_backup_summary_state.json`
 5. `memory/channel_backup_backlog_queue.json`
 6. cron definitions
 
 State without queue can still run, but partial work may be hidden. Rebuild queue from state with `migrate_state_v3.py`.
 
-## After restore
+## After staged restore
 
 Run:
 
 ```bash
-python3 skills/openclaw-discord-server-backup/scripts/migrate_state_v3.py   --state memory/channel_backup_summary_state.json   --queue memory/channel_backup_backlog_queue.json   --backup
+python3 skills/openclaw-discord-server-backup/scripts/migrate_state_v3.py \
+  --state memory/channel_backup_summary_state.json \
+  --queue memory/channel_backup_backlog_queue.json \
+  --backup
 
-python3 skills/openclaw-discord-server-backup/scripts/select_backlog_candidates.py   --state memory/channel_backup_summary_state.json   --queue memory/channel_backup_backlog_queue.json   --today YYYY-MM-DD   --limit 4
+python3 skills/openclaw-discord-server-backup/scripts/select_backlog_candidates.py \
+  --state memory/channel_backup_summary_state.json \
+  --queue memory/channel_backup_backlog_queue.json \
+  --today YYYY-MM-DD \
+  --limit 4
 ```
 
 ## Health checks
 
-- JSON loads cleanly
-- every entry has `lastWrittenMessageId`
+- core backup manifest verifies with exact file/directory sets and SHA-256
+- isolated restore canary passes
+- JSON state and queue load cleanly
+- every Discord entry has `lastWrittenMessageId`
 - `lastMessageId == lastWrittenMessageId`
 - partial/queued entries appear in queue
 - daily sync prompt mentions queue
@@ -32,7 +57,15 @@ python3 skills/openclaw-discord-server-backup/scripts/select_backlog_candidates.
 
 ## Common failure modes
 
-### `lastBackup` says today but messages remain
+### Core backup has a manifest mismatch
+
+Treat the tree as unsafe. Do not regenerate the manifest over damaged content. Use another verified daily snapshot or create a fresh backup from the source workspace.
+
+### Existing daily snapshot fails verification
+
+Daily snapshots are immutable. Do not overwrite or delete it automatically. Quarantine the backup root for review and use another verified date.
+
+### `lastBackup` says today but Discord messages remain
 
 Cause: daily sync hit a limit and updated `lastBackup` without active queue.
 
