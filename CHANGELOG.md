@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Replace prompt-only core workspace copying with a deterministic staged backup engine, exact SHA-256 manifests, immutable daily snapshots, tamper/extra/missing detection, and an isolated restore canary.
 - Add a customer-safe core workspace backup prompt with runtime Markdown discovery, full `memory/` backup, immutable daily snapshots, cron guidance, and package inclusion.
 - Cap Discord 429 retries at 8 in the backlog worker and audit probe, then fail the entry through the normal error path instead of blocking the run forever.
 - Write state/queue JSON atomically (`.tmp` + rename) and recover corrupt files from the newest parseable `.bak`, reporting the source as `recoveredFrom` in the worker output.

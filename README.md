@@ -2,7 +2,7 @@
 
 OpenClaw-specific skill for reliable Discord server/channel/thread backup.
 
-It uses V3 cursor state, explicit backlog queue, deterministic workers, and live audit probes so high-volume channels do not silently fall behind. It also ships a customer-safe core workspace backup prompt for root-level Markdown files and `memory/`.
+It uses V3 cursor state, explicit backlog queue, deterministic workers, and live audit probes so high-volume channels do not silently fall behind. It also ships a deterministic core-workspace backup engine for root-level Markdown files and `memory/`, with exact SHA-256 manifests and an isolated restore canary.
 
 ## Core guarantee
 
@@ -35,7 +35,7 @@ After changing queue, cursor, audit, or backlog behavior, run:
 python3 skill/openclaw-discord-server-backup/scripts/post_run_check.py
 ```
 
-The check validates example JSON, selector behavior, backlog worker invariants, and the test suite when `pytest` is available. Treat failure as a backup correctness issue, because `lastBackup` alone is not proof that a channel/thread is caught up.
+The check validates example JSON, selector behavior, backlog worker invariants, core-workspace backup/verify/restore-canary behavior, packaged source parity, and the test suite when `pytest` is available. Treat failure as a backup correctness issue, because `lastBackup` alone is not proof that a channel/thread is caught up.
 
 ## Maintainer use of Codex
 

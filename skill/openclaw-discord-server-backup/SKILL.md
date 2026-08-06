@@ -11,7 +11,7 @@ This repo ships the merged customer version of a two-layer design:
 
 - Engine layer (single source of truth): the deterministic scripts under `scripts/`
   (`run_backlog_worker_v3.py`, `migrate_state_v3.py`, `select_backlog_candidates.py`,
-  `audit_caught_up_v3.py`, `bootstrap_state.py`) plus the prompt templates under
+  `audit_caught_up_v3.py`, `bootstrap_state.py`, `core_workspace_backup.py`) plus the prompt templates under
   `prompts/`. All state/queue transitions are defined here and only here.
 - Install layer: `scripts/install.py`, `scripts/init_config.py`, `examples/`, and any
   rendered cron prompts. Install materials must be derived from the engine prompts and
@@ -26,7 +26,7 @@ A channel/thread is caught up only when `read after=<lastWrittenMessageId>` retu
 
 ## Standard workflow
 
-0. Core workspace backup independently refreshes `核心文件/latest/` and creates one daily snapshot from root-level Markdown files plus `memory/`. Use `prompts/core-backup.md`; never hardcode customer filenames.
+0. Core workspace backup runs `scripts/core_workspace_backup.py`: it stages and manifest-verifies `核心文件/latest/`, preserves one immutable daily snapshot, and supports an isolated restore canary for root-level Markdown files plus `memory/`. Use `prompts/core-backup.md`; never hardcode customer filenames or reimplement copy logic in a prompt.
 1. Discovery registers channels/threads and creates folders. It does not read message content.
 2. Daily sync processes only healthy entries in small batches.
 3. If daily sync hits a page/message limit, it writes what it has, advances cursor only to written raw data, marks the entry partial, and enqueues backlog.
@@ -38,6 +38,7 @@ A channel/thread is caught up only when `read after=<lastWrittenMessageId>` retu
 
 Use scripts for fragile operations. Do not manually invent state transitions.
 
+- `scripts/core_workspace_backup.py`: deterministic core backup, exact manifest verification, and temporary restore canary.
 - `scripts/install.py`: install/copy skill and create local config/state/queue scaffolding.
 - `scripts/bootstrap_state.py`: create/update entries from discovery inventory.
 - `scripts/migrate_state_v3.py`: upgrade existing state and build queue from partial entries.

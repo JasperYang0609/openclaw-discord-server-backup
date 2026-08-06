@@ -8,10 +8,7 @@ Schedule: daily 05:15, before Discord discovery and sync.
 
 Use `skill/openclaw-discord-server-backup/prompts/core-backup.md`. Replace
 `{{WORKSPACE_ROOT}}` and `{{BACKUP_ROOT}}` with customer-specific absolute paths.
-The job refreshes `核心文件/latest/` every run and creates at most one immutable
-`核心文件/snapshots/YYYY-MM-DD/` snapshot per local calendar day. It discovers
-root-level Markdown files dynamically and backs up the entire `memory/` folder; do
-not replace this with a hardcoded filename list.
+The job invokes `scripts/core_workspace_backup.py`, refreshes a staged and manifest-verified `核心文件/latest/` every run, creates at most one immutable `核心文件/snapshots/YYYY-MM-DD/` snapshot per local calendar day, and runs an isolated restore canary. It discovers root-level Markdown files dynamically and backs up the entire `memory/` folder; do not replace the engine with prompt-written copy logic or a hardcoded filename list.
 
 ## Discovery
 
