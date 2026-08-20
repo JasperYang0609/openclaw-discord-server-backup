@@ -48,3 +48,11 @@ API-assisted maintenance should focus on safe, auditable workflows: issue triage
 `caught_up` only proves that no message exists after the stored cursor. It does not prove the historical raw archive contains that cursor or earlier messages. Use `scripts/reconcile_raw_archive_v3.py` to audit raw Markdown against state and, when authorized, re-fetch full current Discord history while preserving existing files.
 
 For persistent protection, schedule a low-frequency `--apply --compact` run. The scan is intentionally heavier than the normal backlog worker because it starts from the oldest current Discord history and verifies every message ID.
+
+## Guild inventory integrity
+
+Raw reconciliation audits every entry already present in state. Use `scripts/audit_discord_inventory_v3.py` to independently enumerate visible text channels plus active and archived threads, then compare their stable IDs with state. A backup is not server-complete while `missingFromState` is non-zero.
+
+## Recovery assets
+
+The core backup intentionally covers root Markdown and `memory/`, not every workspace project. Use `scripts/backup_workspace_assets.py` to create a checksummed snapshot of explicitly selected recovery-critical folders such as records, scripts, skills, and a local LanceDB project. The tool refuses to overwrite an existing daily snapshot and excludes dependencies, Git internals, `.env`, and generated Python cache files by default.

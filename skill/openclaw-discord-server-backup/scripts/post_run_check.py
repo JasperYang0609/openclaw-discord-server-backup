@@ -145,6 +145,8 @@ def main() -> int:
         "skill/openclaw-discord-server-backup/SKILL.md",
         "skill/openclaw-discord-server-backup/scripts/run_backlog_worker_v3.py",
         "skill/openclaw-discord-server-backup/scripts/audit_caught_up_v3.py",
+        "skill/openclaw-discord-server-backup/scripts/audit_discord_inventory_v3.py",
+        "skill/openclaw-discord-server-backup/scripts/backup_workspace_assets.py",
         "skill/openclaw-discord-server-backup/scripts/select_backlog_candidates.py",
         "skill/openclaw-discord-server-backup/scripts/core_workspace_backup.py",
         "skill/openclaw-discord-server-backup/prompts/core-backup.md",

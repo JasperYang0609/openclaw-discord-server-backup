@@ -59,6 +59,18 @@ Run `scripts/reconcile_raw_archive_v3.py --apply --compact` with the customer st
 
 This job complements the normal backlog worker. `after=<cursor>` proves only that no newer message remains; the weekly reconcile proves the historical raw archive itself contains the current Discord history.
 
+## Full guild inventory audit
+
+Schedule: before the weekly raw reconcile, for example Sunday 13:50.
+
+Run `scripts/audit_discord_inventory_v3.py` with the guild ID and state path. The audit compares stable IDs for visible text channels plus active and archived threads. Treat `missingFromState > 0` as a backup coverage failure; register those entries before claiming the server is complete. Archived private-thread endpoints can return permission warnings, which must remain visible in the report.
+
+## Workspace recovery assets
+
+Schedule: weekly after LanceDB indexing and backup verification.
+
+Run `scripts/backup_workspace_assets.py --apply` with an explicit list of recovery-critical folders. Recommended examples are records, scripts, skills, hooks, reports, handoff files, and the local LanceDB project. Keep large media, model, build, dependency, log, and temporary directories outside this job unless the customer explicitly chooses their storage and retention policy.
+
 ## LanceDB incremental indexing
 
 Schedule: after backup and audit, for example daily 06:30.
@@ -66,3 +78,5 @@ Schedule: after backup and audit, for example daily 06:30.
 The prompt should run `scripts/run_lancedb_incremental.py` with the customer config.
 
 Recommended customer flow: install and baseline `openclaw-lancedb-knowledge` first, then enable this backup skill's LanceDB post-backup indexing.
+
+If exact Discord wording, examples, or chronology must be searchable, add a separate source-map entry for `**/raw/**/*.md`; the summary-only default intentionally does not index raw chat. Back up the LanceDB database, index state, configuration, metadata rules, and embedding cache as recovery assets because deterministic tags are stored on chunk rows inside the local database.

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add full guild inventory auditing for visible text channels and active/archived threads so entries missing from state cannot be mistaken for a complete server backup.
+- Add explicit-scope, checksummed workspace recovery snapshots for local LanceDB data, deterministic metadata/tag rules, records, and other selected operational assets.
 - Add a raw archive reconciliation tool that detects empty archives, cursor-ahead-of-raw state, duplicate raw message IDs, and missing current Discord history; authorized repair preserves existing files and appends only unarchived message IDs.
 
 - Replace prompt-only core workspace copying with a deterministic staged backup engine, exact SHA-256 manifests, immutable daily snapshots, tamper/extra/missing detection, and an isolated restore canary.
