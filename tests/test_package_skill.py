@@ -41,6 +41,25 @@ class PackageSkillTests(unittest.TestCase):
                     self.assertIn(archived, names)
                     self.assertEqual(archive.read(archived), source.read_bytes(), archived)
 
+    def test_packaged_post_run_check_passes_in_installed_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            package = self.build(base / "dist")
+            installed_root = base / "installed"
+            with ZipFile(package) as archive:
+                archive.extractall(installed_root)
+            skill = installed_root / "openclaw-discord-server-backup"
+            proc = subprocess.run(
+                [sys.executable, str(skill / "scripts/post_run_check.py")],
+                cwd=skill,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("PASS layout detected - installed", proc.stdout)
+            self.assertIn("PASS installed Python/CLI smoke", proc.stdout)
+            self.assertIn("post-run check passed", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

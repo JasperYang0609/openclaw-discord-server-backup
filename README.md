@@ -35,6 +35,8 @@ After changing queue, cursor, audit, or backlog behavior, run:
 python3 skill/openclaw-discord-server-backup/scripts/post_run_check.py
 ```
 
+The same script is safe to run from an installed or extracted `.skill` package. It auto-detects the layout: repository clones receive package parity plus the full test suite, while installed packages receive required-file, deterministic smoke, Python compile, and CLI entry-point checks without assuming `tests/` or `examples/` exist nearby.
+
 The check validates example JSON, selector behavior, backlog worker invariants, core-workspace backup/verify/restore-canary behavior, packaged source parity, and the test suite when `pytest` is available. Treat failure as a backup correctness issue, because `lastBackup` alone is not proof that a channel/thread is caught up.
 
 ## Maintainer use of Codex
@@ -51,7 +53,7 @@ For persistent protection, schedule a low-frequency `--apply --compact` run. The
 
 ## Guild inventory integrity
 
-Raw reconciliation audits every entry already present in state. Use `scripts/audit_discord_inventory_v3.py` to independently enumerate visible text channels plus active and archived threads, then compare their stable IDs with state. A backup is not server-complete while `missingFromState` is non-zero.
+Raw reconciliation audits every entry already present in state. Use `scripts/audit_discord_inventory_v3.py` to independently enumerate visible text channels plus active and archived threads, then compare their stable IDs with state. A backup is not server-complete while `missingFromState` is non-zero. The audit reports active and archived totals separately; if archived pagination or permissions are incomplete, the archived total is `null`, the enumeration status is `incomplete`, and the audit fails closed instead of reporting a misleading zero.
 
 ## Recovery assets
 

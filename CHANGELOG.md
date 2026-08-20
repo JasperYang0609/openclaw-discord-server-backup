@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make `post_run_check.py` layout-aware so it performs the full repository checks in a clone and real Python/CLI smoke checks when executed from an installed or extracted `.skill` package.
+- Report active and archived thread counts separately; fail the inventory completeness gate and return an unknown archived total when any archived endpoint is blocked or pagination is incomplete.
 - Add full guild inventory auditing for visible text channels and active/archived threads so entries missing from state cannot be mistaken for a complete server backup.
 - Add explicit-scope, checksummed workspace recovery snapshots for local LanceDB data, deterministic metadata/tag rules, records, and other selected operational assets.
 - Add a raw archive reconciliation tool that detects empty archives, cursor-ahead-of-raw state, duplicate raw message IDs, and missing current Discord history; authorized repair preserves existing files and appends only unarchived message IDs.

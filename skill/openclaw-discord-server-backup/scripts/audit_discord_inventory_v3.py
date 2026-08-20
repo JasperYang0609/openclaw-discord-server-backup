@@ -84,7 +84,7 @@ def archived_threads(
     endpoint: str,
     *,
     page_limit: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     before: str | None = None
     for _ in range(page_limit):
@@ -95,19 +95,19 @@ def archived_threads(
         threads = payload.get("threads") or []
         rows.extend(threads)
         if not payload.get("has_more") or not threads:
-            break
+            return rows, True
         timestamps = [
             ((thread.get("thread_metadata") or {}).get("archive_timestamp"))
             for thread in threads
         ]
         timestamps = [value for value in timestamps if value]
         if not timestamps:
-            break
+            return rows, False
         next_before = min(timestamps)
         if next_before == before:
-            break
+            return rows, False
         before = next_before
-    return rows
+    return rows, False
 
 
 def collect_inventory(
@@ -115,7 +115,7 @@ def collect_inventory(
     guild_id: str,
     *,
     archived_page_limit: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
     all_channels = client.get(f"/guilds/{guild_id}/channels")
     channels = [item for item in all_channels if int(item.get("type", -1)) in TEXT_CHANNEL_TYPES]
     parents = [item for item in all_channels if int(item.get("type", -1)) in THREAD_PARENT_TYPES]
@@ -123,7 +123,9 @@ def collect_inventory(
     warnings: list[dict[str, str]] = []
 
     active_payload = client.get(f"/guilds/{guild_id}/threads/active")
-    threads = list(active_payload.get("threads") or [])
+    active_threads = dedupe(list(active_payload.get("threads") or []))
+    archived_rows: list[dict[str, Any]] = []
+    archived_complete = True
     endpoints = (
         ("public", "/channels/{channel_id}/threads/archived/public"),
         ("private", "/channels/{channel_id}/threads/archived/private"),
@@ -133,24 +135,39 @@ def collect_inventory(
         channel_id = str(parent.get("id"))
         for kind, endpoint in endpoints:
             try:
-                threads.extend(
-                    archived_threads(
-                        client,
-                        channel_id,
-                        endpoint,
-                        page_limit=archived_page_limit,
-                    )
+                rows, complete = archived_threads(
+                    client,
+                    channel_id,
+                    endpoint,
+                    page_limit=archived_page_limit,
                 )
+                archived_rows.extend(rows)
+                if not complete:
+                    archived_complete = False
+                    warnings.append({
+                        "channelId": channel_id,
+                        "kind": kind,
+                        "error": f"archived thread enumeration incomplete at page limit {archived_page_limit}",
+                    })
             except RuntimeError as exc:
+                archived_complete = False
                 warnings.append({"channelId": channel_id, "kind": kind, "error": str(exc)})
 
+    archived_observed = dedupe(archived_rows)
+    threads = dedupe([*active_threads, *archived_observed])
     normalized_threads = []
     for thread in dedupe(threads):
         row = dict(thread)
         parent_id = str(row.get("parent_id") or "")
         row["parentName"] = parent_names.get(parent_id, parent_id or "unknown-parent")
         normalized_threads.append(row)
-    return dedupe(channels), normalized_threads, warnings
+    metrics = {
+        "activeThreads": len(active_threads),
+        "archivedThreads": len(archived_observed) if archived_complete else None,
+        "archivedThreadsObserved": len(archived_observed),
+        "archivedEnumerationStatus": "complete" if archived_complete else "incomplete",
+    }
+    return dedupe(channels), normalized_threads, warnings, metrics
 
 
 def compare_state(
@@ -297,12 +314,13 @@ def main() -> int:
 
     state = json.loads(Path(args.state).read_text(encoding="utf-8"))
     token = load_discord_token(Path(args.openclaw_config), args.token_env)
-    channels, threads, warnings = collect_inventory(
+    channels, threads, warnings, thread_metrics = collect_inventory(
         DiscordClient(token),
         args.guild_id,
         archived_page_limit=args.archived_page_limit,
     )
     coverage = compare_state(state, channels, threads)
+    coverage.update(thread_metrics)
     registered: list[dict[str, str]] = []
     if args.apply:
         if not args.root:
@@ -315,7 +333,11 @@ def main() -> int:
         )
     remaining_missing = max(0, len(coverage["missingFromState"]) - len(registered))
     result = {
-        "ok": remaining_missing == 0 and not coverage["typeMismatches"],
+        "ok": (
+            remaining_missing == 0
+            and not coverage["typeMismatches"]
+            and coverage["archivedEnumerationStatus"] == "complete"
+        ),
         "checkedAt": datetime.now(timezone.utc).isoformat(),
         "guildId": args.guild_id,
         "coverage": coverage,
@@ -331,7 +353,9 @@ def main() -> int:
     if args.compact:
         print(
             "[inventory-audit] "
-            f"liveChannels={coverage['liveChannels']} liveThreads={coverage['liveThreads']} "
+            f"liveChannels={coverage['liveChannels']} activeThreads={coverage['activeThreads']} "
+            f"archivedThreads={coverage['archivedThreads']} "
+            f"archivedEnumeration={coverage['archivedEnumerationStatus']} liveThreads={coverage['liveThreads']} "
             f"stateEntries={coverage['stateEntries']} missingFromState={len(coverage['missingFromState'])} "
             f"registered={len(registered)} remainingMissing={remaining_missing} "
             f"orphanedState={len(coverage['orphanedStateEntries'])} "

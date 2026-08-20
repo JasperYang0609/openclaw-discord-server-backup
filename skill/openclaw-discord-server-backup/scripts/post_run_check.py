@@ -9,8 +9,16 @@ from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
 
-ROOT = Path(__file__).resolve().parents[3]
-SKILL_DIR = ROOT / "skill" / "openclaw-discord-server-backup"
+SCRIPT_PATH = Path(__file__).resolve()
+SKILL_DIR = SCRIPT_PATH.parents[1]
+REPO_ROOT_CANDIDATE = SKILL_DIR.parents[1]
+IS_REPOSITORY_LAYOUT = (
+    (REPO_ROOT_CANDIDATE / "skill" / SKILL_DIR.name).resolve() == SKILL_DIR
+    and (REPO_ROOT_CANDIDATE / "tests").is_dir()
+    and (REPO_ROOT_CANDIDATE / "examples").is_dir()
+)
+ROOT = REPO_ROOT_CANDIDATE if IS_REPOSITORY_LAYOUT else SKILL_DIR
+LAYOUT = "repository" if IS_REPOSITORY_LAYOUT else "installed"
 
 
 def check(name: str, ok: bool, detail: str = "", results: list[tuple[str, bool, str]] | None = None) -> None:
@@ -20,6 +28,32 @@ def check(name: str, ok: bool, detail: str = "", results: list[tuple[str, bool, 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
+
+
+def installed_python_smoke() -> tuple[bool, str]:
+    scripts = sorted((SKILL_DIR / "scripts").glob("*.py"))
+    if not scripts:
+        return False, "no Python scripts found"
+    compile_proc = run([sys.executable, "-m", "py_compile", *[str(path) for path in scripts]])
+    if compile_proc.returncode != 0:
+        return False, (compile_proc.stderr or compile_proc.stdout).strip()
+
+    cli_scripts = (
+        "run_backlog_worker_v3.py",
+        "audit_caught_up_v3.py",
+        "audit_discord_inventory_v3.py",
+        "reconcile_raw_archive_v3.py",
+        "backup_workspace_assets.py",
+        "core_workspace_backup.py",
+    )
+    for name in cli_scripts:
+        script = SKILL_DIR / "scripts" / name
+        if not script.is_file():
+            return False, f"required CLI is missing: {name}"
+        proc = run([sys.executable, str(script), "--help"])
+        if proc.returncode != 0:
+            return False, f"{name} --help failed: {(proc.stderr or proc.stdout).strip()}"
+    return True, f"compiled={len(scripts)} cli_help={len(cli_scripts)}"
 
 
 def json_loads(path: Path) -> bool:
@@ -141,22 +175,24 @@ def package_matches_source() -> tuple[bool, str]:
 def main() -> int:
     results: list[tuple[str, bool, str]] = []
 
-    required = [
-        "skill/openclaw-discord-server-backup/SKILL.md",
-        "skill/openclaw-discord-server-backup/scripts/run_backlog_worker_v3.py",
-        "skill/openclaw-discord-server-backup/scripts/audit_caught_up_v3.py",
-        "skill/openclaw-discord-server-backup/scripts/audit_discord_inventory_v3.py",
-        "skill/openclaw-discord-server-backup/scripts/backup_workspace_assets.py",
-        "skill/openclaw-discord-server-backup/scripts/select_backlog_candidates.py",
-        "skill/openclaw-discord-server-backup/scripts/core_workspace_backup.py",
-        "skill/openclaw-discord-server-backup/prompts/core-backup.md",
-        "skill/openclaw-discord-server-backup/references/recovery.md",
-        "examples/config.example.json",
-        "examples/state.example.json",
-        "examples/queue.example.json",
+    skill_required = [
+        "SKILL.md",
+        "scripts/run_backlog_worker_v3.py",
+        "scripts/audit_caught_up_v3.py",
+        "scripts/audit_discord_inventory_v3.py",
+        "scripts/reconcile_raw_archive_v3.py",
+        "scripts/backup_workspace_assets.py",
+        "scripts/select_backlog_candidates.py",
+        "scripts/core_workspace_backup.py",
+        "prompts/core-backup.md",
+        "references/recovery.md",
     ]
-    check("required files exist", all((ROOT / rel).exists() for rel in required), results=results)
-    check("example JSON parses", all(json_loads(ROOT / rel) for rel in required if rel.endswith(".json")), results=results)
+    check("layout detected", LAYOUT in {"repository", "installed"}, LAYOUT, results)
+    check("required skill files exist", all((SKILL_DIR / rel).exists() for rel in skill_required), results=results)
+
+    if IS_REPOSITORY_LAYOUT:
+        examples = ["examples/config.example.json", "examples/state.example.json", "examples/queue.example.json"]
+        check("example JSON parses", all(json_loads(ROOT / rel) for rel in examples), results=results)
 
     ok, detail = queue_selector_smoke()
     check("queue selector smoke", ok, detail, results)
@@ -164,19 +200,23 @@ def main() -> int:
     ok, detail = core_backup_smoke()
     check("core backup verify/restore smoke", ok, detail, results)
 
-    ok, detail = package_matches_source()
-    check("packaged skill matches source", ok, detail, results)
+    if IS_REPOSITORY_LAYOUT:
+        ok, detail = package_matches_source()
+        check("packaged skill matches source", ok, detail, results)
 
-    direct = run([sys.executable, "tests/test_backlog_worker_selection.py"])
-    check("backlog worker direct tests", direct.returncode == 0, (direct.stderr or direct.stdout).strip()[-1200:], results)
+        direct = run([sys.executable, "tests/test_backlog_worker_selection.py"])
+        check("backlog worker direct tests", direct.returncode == 0, (direct.stderr or direct.stdout).strip()[-1200:], results)
 
-    pytest = run([sys.executable, "-m", "pytest", "tests"])
-    if pytest.returncode == 0:
-        check("pytest suite", True, results=results)
-    elif "No module named pytest" in (pytest.stderr + pytest.stdout):
-        check("pytest suite", True, "pytest unavailable; direct smoke tests passed", results)
+        pytest = run([sys.executable, "-m", "pytest", "tests"])
+        if pytest.returncode == 0:
+            check("pytest suite", True, results=results)
+        elif "No module named pytest" in (pytest.stderr + pytest.stdout):
+            check("pytest suite", True, "pytest unavailable; direct smoke tests passed", results)
+        else:
+            check("pytest suite", False, (pytest.stderr or pytest.stdout).strip()[-1200:], results)
     else:
-        check("pytest suite", False, (pytest.stderr or pytest.stdout).strip()[-1200:], results)
+        ok, detail = installed_python_smoke()
+        check("installed Python/CLI smoke", ok, detail, results)
 
     failed = [row for row in results if not row[1]]
     for name, ok, detail in results:

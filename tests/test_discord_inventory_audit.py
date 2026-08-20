@@ -20,6 +20,67 @@ def test_dedupe_keeps_one_thread_per_id():
     assert result[0]["name"] == "new"
 
 
+class FakeClient:
+    def __init__(self, responses, errors=None):
+        self.responses = responses
+        self.errors = errors or set()
+
+    def get(self, path, params=None):
+        if path in self.errors:
+            raise RuntimeError(f"blocked: {path}")
+        return self.responses.get(path, {"threads": [], "has_more": False})
+
+
+def test_archived_threads_reports_incomplete_when_page_limit_is_exhausted():
+    endpoint = "/channels/{channel_id}/threads/archived/public"
+    client = FakeClient({
+        "/channels/10/threads/archived/public": {
+            "threads": [{"id": "2", "thread_metadata": {"archive_timestamp": "2026-08-20T00:00:00Z"}}],
+            "has_more": True,
+        }
+    })
+    rows, complete = audit.archived_threads(client, "10", endpoint, page_limit=1)
+    assert [row["id"] for row in rows] == ["2"]
+    assert complete is False
+
+
+def test_collect_inventory_splits_active_and_archived_thread_counts():
+    client = FakeClient({
+        "/guilds/guild/channels": [{"id": "10", "name": "general", "type": 0}],
+        "/guilds/guild/threads/active": {"threads": [{"id": "1", "name": "active", "parent_id": "10"}]},
+        "/channels/10/threads/archived/public": {
+            "threads": [{"id": "2", "name": "archived", "parent_id": "10"}],
+            "has_more": False,
+        },
+    })
+    channels, threads, warnings, metrics = audit.collect_inventory(client, "guild", archived_page_limit=2)
+    assert len(channels) == 1
+    assert {row["id"] for row in threads} == {"1", "2"}
+    assert warnings == []
+    assert metrics == {
+        "activeThreads": 1,
+        "archivedThreads": 1,
+        "archivedThreadsObserved": 1,
+        "archivedEnumerationStatus": "complete",
+    }
+
+
+def test_collect_inventory_marks_archived_count_unknown_on_endpoint_error():
+    blocked = "/channels/10/threads/archived/private"
+    client = FakeClient(
+        {
+            "/guilds/guild/channels": [{"id": "10", "name": "general", "type": 0}],
+            "/guilds/guild/threads/active": {"threads": []},
+        },
+        errors={blocked},
+    )
+    _, _, warnings, metrics = audit.collect_inventory(client, "guild", archived_page_limit=2)
+    assert warnings and warnings[0]["channelId"] == "10"
+    assert metrics["archivedThreads"] is None
+    assert metrics["archivedThreadsObserved"] == 0
+    assert metrics["archivedEnumerationStatus"] == "incomplete"
+
+
 def test_compare_state_finds_missing_and_orphaned_entries():
     state = {
         "entries": {
