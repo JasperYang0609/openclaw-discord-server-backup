@@ -85,3 +85,9 @@ Unsafe. Roll state cursor back to latest verified raw message id and enqueue.
 ### Queue item keeps failing
 
 Set `status=retry`, increase `attempts`, and report after threshold. Do not delete the item until caught up or explicitly retired.
+
+### State says caught up but raw is empty or cannot prove the cursor
+
+This is not healthy. An `after=<cursor>` probe only proves there are no newer messages; it does not prove older messages were written.
+
+Run `scripts/reconcile_raw_archive_v3.py` in live dry-run mode first. If the report shows missing history, rerun with `--apply`. The repair scans full current Discord history from cursor `0`, preserves existing raw files, and appends only message IDs that are not already present in recognized raw message headers.

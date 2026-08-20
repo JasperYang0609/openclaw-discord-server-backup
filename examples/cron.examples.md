@@ -51,6 +51,14 @@ Schedule: daily 06:30 or 23:30.
 The prompt should run `scripts/audit_caught_up_v3.py` and report any false healthy entries.
 The backlog worker also emits `auditWarnings` every run for stuck active catch-ups.
 
+## Full raw integrity reconcile
+
+Schedule: weekly during a low-traffic window, for example Sunday 14:10.
+
+Run `scripts/reconcile_raw_archive_v3.py --apply --compact` with the customer state, queue, and channel archive root. This heavier scan starts from the oldest current Discord history, verifies message IDs against raw Markdown, preserves existing files, and appends only messages that are not already verifiably archived.
+
+This job complements the normal backlog worker. `after=<cursor>` proves only that no newer message remains; the weekly reconcile proves the historical raw archive itself contains the current Discord history.
+
 ## LanceDB incremental indexing
 
 Schedule: after backup and audit, for example daily 06:30.

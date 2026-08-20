@@ -42,3 +42,9 @@ The check validates example JSON, selector behavior, backlog worker invariants, 
 This project is maintained as part of the OpenClaw ecosystem. We plan to use Codex to help review pull requests, reproduce backup edge cases, expand regression tests, and keep release notes accurate when OpenClaw channel, thread, or message APIs change.
 
 API-assisted maintenance should focus on safe, auditable workflows: issue triage, test generation, compatibility checks, documentation updates, and release automation. Codex should not be used to process private Discord exports, customer secrets, or local backup data.
+
+## Raw archive integrity
+
+`caught_up` only proves that no message exists after the stored cursor. It does not prove the historical raw archive contains that cursor or earlier messages. Use `scripts/reconcile_raw_archive_v3.py` to audit raw Markdown against state and, when authorized, re-fetch full current Discord history while preserving existing files.
+
+For persistent protection, schedule a low-frequency `--apply --compact` run. The scan is intentionally heavier than the normal backlog worker because it starts from the oldest current Discord history and verifies every message ID.

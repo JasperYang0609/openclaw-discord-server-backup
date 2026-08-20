@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a raw archive reconciliation tool that detects empty archives, cursor-ahead-of-raw state, duplicate raw message IDs, and missing current Discord history; authorized repair preserves existing files and appends only unarchived message IDs.
+
 - Replace prompt-only core workspace copying with a deterministic staged backup engine, exact SHA-256 manifests, immutable daily snapshots, tamper/extra/missing detection, and an isolated restore canary.
 - Add a customer-safe core workspace backup prompt with runtime Markdown discovery, full `memory/` backup, immutable daily snapshots, cron guidance, and package inclusion.
 - Cap Discord 429 retries at 8 in the backlog worker and audit probe, then fail the entry through the normal error path instead of blocking the run forever.

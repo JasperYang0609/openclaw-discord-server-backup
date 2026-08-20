@@ -45,6 +45,7 @@ Use scripts for fragile operations. Do not manually invent state transitions.
 - `scripts/select_backlog_candidates.py`: choose queue-first backlog candidates.
 - `scripts/run_backlog_worker_v3.py`: deterministic Discord API backlog worker.
 - `scripts/audit_caught_up_v3.py`: full live probe and optional requeue.
+- `scripts/reconcile_raw_archive_v3.py`: compare every state entry with raw Markdown and optionally re-fetch full Discord history, appending only message IDs not already verifiably archived.
 - `scripts/package_skill.py`: build `.skill` artifact.
 - `scripts/run_lancedb_incremental.py`: run optional LanceDB incremental indexing after backup.
 
