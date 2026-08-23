@@ -24,6 +24,7 @@ For a real recovery, stop writers first, select a verified latest or dated snaps
 4. `memory/channel_backup_summary_state.json`
 5. `memory/channel_backup_backlog_queue.json`
 6. cron definitions
+7. customer adapter/wrapper, classification config, and stable-ID mapping ledger
 
 State without queue can still run, but partial work may be hidden. Rebuild queue from state with `migrate_state_v3.py`.
 
@@ -54,6 +55,9 @@ python3 skills/openclaw-discord-server-backup/scripts/select_backlog_candidates.
 - partial/queued entries appear in queue
 - daily sync prompt mentions queue
 - backlog prompt says completion requires `after cursor` returns 0
+- explicitly excluded/invalid entries are absent from candidates and their queue items are `invalid`
+- compatibility recovery bundle verifies and passes an isolated restore canary
+- cron JSON contains no `payload.toolsAllow`; shell jobs passed a temporary GPT/Codex isolated canary
 
 ## Common failure modes
 
@@ -90,4 +94,4 @@ Set `status=retry`, increase `attempts`, and report after threshold. Do not dele
 
 This is not healthy. An `after=<cursor>` probe only proves there are no newer messages; it does not prove older messages were written.
 
-Run `scripts/reconcile_raw_archive_v3.py` in live dry-run mode first. If the report shows missing history, rerun with `--apply`. The repair scans full current Discord history from cursor `0`, preserves existing raw files, and appends only message IDs that are not already present in recognized raw message headers.
+Run `scripts/weekly_raw_reconcile_v4.py`. It creates recovery evidence before append-only repair, repeats bounded closeout scans, classifies local-only IDs, and fails closed on unknown classifications or live errors. Do not emit status messages into an audited report channel during its final scan window.

@@ -21,6 +21,15 @@ ACTIVE = {"queued", "catching_up", "retry"}
 TZ_TAIPEI = timezone(timedelta(hours=8))
 MAX_429_RETRIES = 8
 
+
+def entry_is_excluded(entry: dict[str, Any]) -> bool:
+    """Excluded/invalid inventory rows are terminal and may not re-enter backlog."""
+    return bool(
+        entry.get("backupExcluded")
+        or entry.get("invalidChannel")
+        or entry.get("syncStatus") == "excluded"
+    )
+
 # When load_json recovers from a .bak file, the recovery source is recorded here
 # and attached to the final output JSON as `recoveredFrom`.
 RECOVERED_SOURCES: list[dict[str, str]] = []
@@ -290,6 +299,15 @@ def normalize_queue_items(queue: dict[str, Any], state: dict[str, Any]) -> None:
             passthrough.append(item)
             continue
         entry = entries.get(key, {})
+        if entry_is_excluded(entry):
+            item.update({
+                "status": "invalid",
+                "attempts": 0,
+                "retiredReason": "state_entry_excluded_or_invalid",
+                "updatedAt": now_utc(),
+            })
+            passthrough.append(item)
+            continue
         item_cursor = newest_cursor(item.get("cursorMessageId"), entry.get("lastWrittenMessageId"), entry.get("lastMessageId"))
         item["cursorMessageId"] = item_cursor
         current = merged.get(key)
@@ -393,7 +411,7 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
     items.sort(key=lambda i: (int(i.get("priority") or 50), i.get("createdAt") or "", i.get("relativePath") or ""))
     for item in items:
         key = item.get("entryKey")
-        if key in entries and key not in seen:
+        if key in entries and key not in seen and not entry_is_excluded(entries[key]):
             add(key, entries[key], item)
         if len(selected) >= limit:
             return selected
@@ -403,6 +421,8 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
     partials: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for key, entry in entries.items():
         if key in seen:
+            continue
+        if entry_is_excluded(entry):
             continue
         if entry.get("syncStatus") in {"partial", "queued", "catching_up", "error"} or entry.get("backlogReason"):
             item = upsert_queue_item(queue, key, entry, "queued", reason=entry.get("backlogReason") or "state_partial", priority=40)
@@ -421,6 +441,8 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
     stale_healthy: list[tuple[str, dict[str, Any]]] = []
     for key, entry in entries.items():
         if key in seen:
+            continue
+        if entry_is_excluded(entry):
             continue
         if entry.get("syncStatus", "healthy") != "healthy" or entry.get("backlogReason"):
             continue
@@ -445,6 +467,8 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
     bootstrap: list[tuple[str, dict[str, Any]]] = []
     for key, entry in entries.items():
         if key in seen:
+            continue
+        if entry_is_excluded(entry):
             continue
         if newest_cursor(entry.get("lastWrittenMessageId"), entry.get("lastMessageId")):
             continue
@@ -613,6 +637,8 @@ def main() -> int:
         if int(item.get("attempts") or 0) > 5:
             audit_warnings.append({"entry": item.get("entryKey"), "kind": "attempts", "attempts": int(item.get("attempts") or 0), "status": item.get("status")})
     for key, entry in (state.get("entries") or {}).items():
+        if entry_is_excluded(entry):
+            continue
         if int(entry.get("consecutiveErrors") or 0) > 3:
             audit_warnings.append({"entry": key, "kind": "consecutiveErrors", "consecutiveErrors": int(entry.get("consecutiveErrors") or 0), "syncStatus": entry.get("syncStatus")})
 

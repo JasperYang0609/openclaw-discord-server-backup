@@ -31,6 +31,14 @@ HEADER_ID_PATTERNS = (
 )
 
 
+def entry_is_excluded(entry: dict[str, Any]) -> bool:
+    return bool(
+        entry.get("backupExcluded")
+        or entry.get("invalidChannel")
+        or entry.get("syncStatus") == "excluded"
+    )
+
+
 def load_json(path: Path, default: Any = None) -> Any:
     if not path.exists():
         if default is not None:
@@ -182,7 +190,11 @@ def main() -> int:
     state = load_json(state_path)
     queue = load_json(queue_path, {"version": 1, "items": []})
     entries = state.get("entries") or {}
-    selected = [(key, entry) for key, entry in entries.items() if not args.only or key in args.only]
+    selected = [
+        (key, entry)
+        for key, entry in entries.items()
+        if (not args.only or key in args.only) and not entry_is_excluded(entry)
+    ]
     unknown = sorted(set(args.only) - set(entries))
     if unknown:
         raise SystemExit(f"Unknown entry keys: {unknown}")

@@ -16,6 +16,33 @@ ACTIVE_QUEUE = {"queued", "catching_up", "retry"}
 MAX_429_RETRIES = 8
 
 
+def entry_is_excluded(entry: dict[str, Any]) -> bool:
+    return bool(
+        entry.get("backupExcluded")
+        or entry.get("invalidChannel")
+        or entry.get("syncStatus") == "excluded"
+    )
+
+
+def invalidate_excluded_queue(queue: dict[str, Any], entries: dict[str, dict[str, Any]]) -> int:
+    """Retire active work that points at an explicitly excluded/invalid entry."""
+    changed = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for item in queue.get("items", []):
+        entry = entries.get(item.get("entryKey"))
+        if not entry or not entry_is_excluded(entry):
+            continue
+        if item.get("status") != "invalid" or int(item.get("attempts") or 0) != 0:
+            changed += 1
+        item.update({
+            "status": "invalid",
+            "attempts": 0,
+            "retiredReason": "state_entry_excluded_or_invalid",
+            "updatedAt": now,
+        })
+    return changed
+
+
 def load_json(path: Path, default: Any = None) -> Any:
     if not path.exists():
         if default is not None:
@@ -133,9 +160,14 @@ def main() -> int:
     not_healthy = []
     cursor_mismatch = []
     null_cursor = []
+    excluded = []
     entries = state.get("entries", {})
+    invalidated_queue_items = invalidate_excluded_queue(queue, entries)
 
     for key, entry in entries.items():
+        if entry_is_excluded(entry):
+            excluded.append(key)
+            continue
         cursor = entry.get("lastWrittenMessageId") or entry.get("lastMessageId")
         if not cursor:
             null_cursor.append(key)
@@ -157,11 +189,15 @@ def main() -> int:
         requeue(state, queue, live_new)
         save_json(state_path, state)
         save_json(queue_path, queue)
+    elif invalidated_queue_items:
+        save_json(queue_path, queue)
 
     result = {
         "checkedAt": datetime.now(timezone.utc).isoformat(),
         "entries": len(entries),
-        "probed": len(entries) - len(null_cursor),
+        "probed": len(entries) - len(null_cursor) - len(excluded),
+        "excluded": excluded,
+        "invalidatedQueueItems": invalidated_queue_items,
         "activeQueue": len(active_queue),
         "notHealthy": not_healthy,
         "cursorMismatch": cursor_mismatch,

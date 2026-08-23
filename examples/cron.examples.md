@@ -55,7 +55,9 @@ The backlog worker also emits `auditWarnings` every run for stuck active catch-u
 
 Schedule: weekly during a low-traffic window, for example Sunday 14:10.
 
-Run `scripts/reconcile_raw_archive_v3.py --apply --compact` with the customer state, queue, and channel archive root. This heavier scan starts from the oldest current Discord history, verifies message IDs against raw Markdown, preserves existing files, and appends only messages that are not already verifiably archived.
+Run `scripts/weekly_raw_reconcile_v4.py --compact` with the customer state, queue, channel archive root, and a new evidence directory. It performs a full comparison, creates recovery copies before the first append, applies only missing message IDs, repeats bounded closeout passes, and finishes with full-inventory/local-only classification. It never deletes or rewrites existing raw.
+
+If the report channel is part of inventory, pass `--report-entry-key`. Send progress before starting the command, then send nothing to that channel until the command exits and records `capturedAt`; otherwise the status message itself becomes new live-only drift.
 
 This job complements the normal backlog worker. `after=<cursor>` proves only that no newer message remains; the weekly reconcile proves the historical raw archive itself contains the current Discord history.
 
@@ -63,13 +65,19 @@ This job complements the normal backlog worker. `after=<cursor>` proves only tha
 
 Schedule: before the weekly raw reconcile, for example Sunday 13:50.
 
-Run `scripts/audit_discord_inventory_v3.py` with the guild ID and state path. The audit compares stable IDs for visible text channels plus active and archived threads. Treat `missingFromState > 0` as a backup coverage failure; register those entries before claiming the server is complete. Archived private-thread endpoints can return permission warnings, which must remain visible in the report.
+Run `scripts/audit_discord_inventory_v3.py` with the guild ID, state path, archive root, and `--mapping-ledger-out`. The audit compares stable IDs for visible text channels plus active and archived threads. Existing customer paths are preserved; new entries are planned with safe-path and collision gates. `--apply` is rejected unless a mapping ledger is written and contains no blocker. Treat `missingFromState > 0` as a backup coverage failure. Archived private-thread endpoint warnings must remain visible.
+
+## Cron tooling preflight
+
+Before enabling shell-dependent GPT/Codex cron jobs, pipe `openclaw cron list --all --json` into `scripts/audit_cron_tooling.py`. Any `payload.toolsAllow` field is a blocker, including `toolsAllow: []`. Remove the field with `openclaw cron edit <job-id> --clear-tools`, then run a temporary isolated canary that executes `pwd && echo TOOL_OK`; remove the canary after `TOOL_OK` is observed.
 
 ## Workspace recovery assets
 
 Schedule: weekly after LanceDB indexing and backup verification.
 
 Run `scripts/backup_workspace_assets.py --apply` with an explicit list of recovery-critical folders. Recommended examples are records, scripts, skills, hooks, reports, handoff files, and the local LanceDB project. Keep large media, model, build, dependency, log, and temporary directories outside this job unless the customer explicitly chooses their storage and retention policy.
+
+For customer compatibility migrations, also use `scripts/snapshot_deployment_assets.py` to capture the installed skill, inventory adapter, wrapper, classification configuration, and mapping ledger. Verify the bundle and run its isolated restore canary before apply.
 
 ## LanceDB incremental indexing
 

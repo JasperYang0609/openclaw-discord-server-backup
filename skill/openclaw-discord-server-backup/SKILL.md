@@ -47,6 +47,9 @@ Use scripts for fragile operations. Do not manually invent state transitions.
 - `scripts/audit_caught_up_v3.py`: full live probe and optional requeue.
 - `scripts/audit_discord_inventory_v3.py`: compare visible text channels plus active/archived threads against state by stable ID.
 - `scripts/reconcile_raw_archive_v3.py`: compare every state entry with raw Markdown and optionally re-fetch full Discord history, appending only message IDs not already verifiably archived.
+- `scripts/weekly_raw_reconcile_v4.py`: recovery-first weekly repair with targeted append-only writes, full-inventory closeout, local-only classification, and report-channel self-drift protection.
+- `scripts/audit_cron_tooling.py`: reject legacy `payload.toolsAllow`; shell jobs must remove the field with `--clear-tools` and pass an isolated GPT/Codex bash canary.
+- `scripts/snapshot_deployment_assets.py`: checksum customer adapters, wrappers, classification config, and mapping ledgers, then verify them with an isolated restore canary.
 - `scripts/package_skill.py`: build `.skill` artifact.
 - `scripts/run_lancedb_incremental.py`: run optional LanceDB incremental indexing after backup.
 - `scripts/backup_workspace_assets.py`: checksummed, explicit-scope snapshots for recovery-critical workspace folders and local knowledge indexes.
@@ -61,6 +64,12 @@ Use scripts for fragile operations. Do not manually invent state transitions.
 - Read `references/troubleshooting.md` for known failure modes.
 - Read `references/llm-handoff.md` when another model needs to operate this skill.
 - Read `references/lancedb-integration.md` when enabling knowledge indexing.
+
+## Exclusion and customer-path rules
+
+- `backupExcluded=true`, `invalidChannel=true`, or `syncStatus=excluded` is terminal. Selector, worker, audit, and raw reconcile skip the entry; active queue items become `invalid` with attempts reset to zero.
+- Stable Discord channel/thread ID is the mapping key. Preserve existing customer `relativePath` values. New registration requires a mapping ledger, safe-path validation, and collision resolution before apply.
+- Customer adapters and their mapping/classification evidence are recovery assets. Snapshot and restore-canary them before any compatibility migration.
 
 ## LLM compatibility rule
 

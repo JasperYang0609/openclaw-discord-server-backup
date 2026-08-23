@@ -129,3 +129,35 @@ def test_register_missing_creates_state_and_archive_directories(tmp_path: Path):
 def test_unique_key_preserves_same_name_with_different_id():
     entries = {"general/topic": {"channelId": "1"}}
     assert audit.unique_key(entries, "general/topic", "2") == "general/topic (2)"
+
+
+def test_mapping_ledger_preserves_existing_path_and_resolves_collision(tmp_path: Path):
+    state = {"entries": {
+        "custom/classification": {
+            "channelId": "1", "type": "channel", "relativePath": "custom/classification"
+        },
+        "general": {"channelId": "9", "type": "channel", "relativePath": "general"},
+    }}
+    channels = [
+        {"id": "1", "name": "renamed", "type": 0},
+        {"id": "2", "name": "general", "type": 0},
+    ]
+
+    ledger = audit.build_mapping_ledger(state, channels, [], tmp_path)
+    by_id = {row["channelId"]: row for row in ledger["entries"]}
+
+    assert by_id["1"]["decision"] == "preserve"
+    assert by_id["1"]["relativePath"] == "custom/classification"
+    assert by_id["2"]["decision"] == "register"
+    assert by_id["2"]["relativePath"] == "general (2)"
+    assert by_id["2"]["collisionResolvedWithStableId"] is True
+    assert ledger["applyAllowed"] is True
+
+
+def test_mapping_ledger_blocks_unsafe_existing_path(tmp_path: Path):
+    state = {"entries": {
+        "bad": {"channelId": "1", "type": "channel", "relativePath": "../outside"},
+    }}
+    ledger = audit.build_mapping_ledger(state, [{"id": "1", "name": "bad", "type": 0}], [], tmp_path)
+    assert ledger["applyAllowed"] is False
+    assert ledger["entries"][0]["decision"] == "blocked"

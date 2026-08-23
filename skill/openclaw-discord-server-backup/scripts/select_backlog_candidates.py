@@ -11,6 +11,15 @@ ACTIVE_QUEUE_STATUSES = {"queued", "catching_up", "retry"}
 PARTIAL_STATUSES = {"partial", "queued", "catching_up"}
 
 
+def entry_is_excluded(entry: dict[str, Any]) -> bool:
+    """Return True for entries that must never be probed or re-queued."""
+    return bool(
+        entry.get("backupExcluded")
+        or entry.get("invalidChannel")
+        or entry.get("syncStatus") == "excluded"
+    )
+
+
 def parse_day(value: str | None) -> date | None:
     if not value:
         return None
@@ -73,6 +82,8 @@ def main() -> int:
         if not key or key not in entries or key in seen:
             continue
         entry = entries[key]
+        if entry_is_excluded(entry):
+            continue
         payload = entry_payload(key, entry, item.get("reason") or entry.get("backlogReason") or "queued", int(item.get("priority") or 50))
         payload["queueStatus"] = item.get("status", "queued")
         selected.append(payload)
@@ -85,6 +96,8 @@ def main() -> int:
         for key, entry in entries.items():
             if key in seen:
                 continue
+            if entry_is_excluded(entry):
+                continue
             if entry.get("syncStatus") in PARTIAL_STATUSES or entry.get("backlogReason"):
                 partials.append(entry_payload(key, entry, entry.get("backlogReason") or "state_partial", 40))
         partials.sort(key=lambda i: (int(i.get("priority") or 50), i.get("lastBackup") or "9999-99-99", i.get("relativePath") or ""))
@@ -96,6 +109,8 @@ def main() -> int:
         stale: list[dict[str, Any]] = []
         for key, entry in entries.items():
             if key in seen:
+                continue
+            if entry_is_excluded(entry):
                 continue
             cursor = entry.get("lastWrittenMessageId") or entry.get("lastMessageId")
             last_backup = parse_day(entry.get("lastBackup"))
@@ -113,6 +128,8 @@ def main() -> int:
         bootstrap: list[dict[str, Any]] = []
         for key, entry in entries.items():
             if key in seen:
+                continue
+            if entry_is_excluded(entry):
                 continue
             cursor = entry.get("lastWrittenMessageId") or entry.get("lastMessageId")
             if not cursor:

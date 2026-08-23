@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -225,6 +226,101 @@ def safe_name(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def is_safe_relative_path(root: Path, relative_path: str) -> bool:
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    resolved_root = root.resolve()
+    resolved = (root / candidate).resolve()
+    return resolved == resolved_root or resolved_root in resolved.parents
+
+
+def live_inventory_rows(
+    channels: list[dict[str, Any]], threads: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for channel in channels:
+        rows.append({
+            "type": "channel",
+            "id": str(channel.get("id") or ""),
+            "name": str(channel.get("name") or channel.get("id") or ""),
+        })
+    for thread in threads:
+        rows.append({
+            "type": "thread",
+            "id": str(thread.get("id") or ""),
+            "name": str(thread.get("name") or thread.get("id") or ""),
+            "parentId": str(thread.get("parent_id") or ""),
+            "parentName": str(thread.get("parentName") or thread.get("parent_id") or "unknown-parent"),
+        })
+    return sorted((row for row in rows if row["id"]), key=lambda row: int(row["id"]))
+
+
+def build_mapping_ledger(
+    state: dict[str, Any],
+    channels: list[dict[str, Any]],
+    threads: list[dict[str, Any]],
+    root: Path,
+) -> dict[str, Any]:
+    """Plan stable-ID registration without moving existing customer paths."""
+    entries = state.get("entries") or {}
+    state_by_id = {
+        str(entry.get("channelId")): (key, entry)
+        for key, entry in entries.items()
+        if entry.get("channelId")
+    }
+    planned_keys = set(entries)
+    ledger: list[dict[str, Any]] = []
+    blockers: list[dict[str, str]] = []
+    for row in live_inventory_rows(channels, threads):
+        item_id = row["id"]
+        existing = state_by_id.get(item_id)
+        if existing:
+            key, entry = existing
+            relative_path = str(entry.get("relativePath") or key)
+            decision = "preserve"
+            collision = False
+        else:
+            name = safe_name(row["name"], item_id)
+            if row["type"] == "thread":
+                parent = safe_name(row.get("parentName") or "", row.get("parentId") or "unknown-parent")
+                preferred = f"{parent}/{name}"
+            else:
+                preferred = name
+            key = preferred
+            collision = key in planned_keys
+            if collision:
+                key = f"{preferred} ({item_id})"
+            relative_path = key
+            decision = "register"
+            planned_keys.add(key)
+        safe = is_safe_relative_path(root, relative_path)
+        if not safe:
+            decision = "blocked"
+            blockers.append({"channelId": item_id, "reason": "unsafe_relative_path"})
+        ledger.append({
+            "channelId": item_id,
+            "type": row["type"],
+            "decision": decision,
+            "stateKey": key,
+            "relativePath": relative_path,
+            "existingClassificationPreserved": existing is not None,
+            "collisionResolvedWithStableId": collision,
+            "safePath": safe,
+            "parentId": row.get("parentId"),
+            "parentName": row.get("parentName"),
+        })
+    counts = Counter(item["decision"] for item in ledger)
+    return {
+        "schema": "openclaw-discord-inventory-mapping-v1",
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "entries": ledger,
+        "counts": dict(sorted(counts.items())),
+        "blockers": blockers,
+        "applyAllowed": not blockers,
+    }
+
+
 def unique_key(entries: dict[str, Any], preferred: str, item_id: str) -> str:
     existing = entries.get(preferred)
     if not existing or str(existing.get("channelId") or "") == item_id:
@@ -310,6 +406,7 @@ def main() -> int:
     parser.add_argument("--out")
     parser.add_argument("--compact", action="store_true")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--mapping-ledger-out")
     args = parser.parse_args()
 
     state = json.loads(Path(args.state).read_text(encoding="utf-8"))
@@ -321,17 +418,43 @@ def main() -> int:
     )
     coverage = compare_state(state, channels, threads)
     coverage.update(thread_metrics)
+    mapping_root = Path(args.root) if args.root else Path.cwd()
+    mapping_ledger = build_mapping_ledger(state, channels, threads, mapping_root)
+    if args.mapping_ledger_out:
+        output_path = Path(args.mapping_ledger_out)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(mapping_ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     registered: list[dict[str, str]] = []
+    readback_pass: bool | None = None
     if args.apply:
         if not args.root:
             parser.error("--root is required with --apply")
+        if not args.mapping_ledger_out:
+            parser.error("--mapping-ledger-out is required with --apply")
+        if not mapping_ledger["applyAllowed"]:
+            parser.error("mapping ledger contains blocked entries; resolve them before --apply")
         registered = register_missing(
             Path(args.state),
             Path(args.root),
             args.guild_id,
             coverage["missingFromState"],
         )
-    remaining_missing = max(0, len(coverage["missingFromState"]) - len(registered))
+        readback_state = json.loads(Path(args.state).read_text(encoding="utf-8"))
+        readback = compare_state(readback_state, channels, threads)
+        readback_pass = not readback["missingFromState"] and not readback["typeMismatches"]
+        mapping_ledger["apply"] = {
+            "registered": registered,
+            "readbackPass": readback_pass,
+            "remainingMissing": len(readback["missingFromState"]),
+        }
+        Path(args.mapping_ledger_out).write_text(
+            json.dumps(mapping_ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    remaining_missing = (
+        int(mapping_ledger.get("apply", {}).get("remainingMissing", 0))
+        if args.apply
+        else len(coverage["missingFromState"])
+    )
     result = {
         "ok": (
             remaining_missing == 0
@@ -344,6 +467,13 @@ def main() -> int:
         "registered": registered,
         "remainingMissing": remaining_missing,
         "warnings": warnings,
+        "mapping": {
+            "path": args.mapping_ledger_out,
+            "counts": mapping_ledger["counts"],
+            "blockers": mapping_ledger["blockers"],
+            "applyAllowed": mapping_ledger["applyAllowed"],
+            "readbackPass": readback_pass,
+        },
         "channels": channels,
         "threads": threads,
     }
