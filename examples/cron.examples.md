@@ -27,7 +27,14 @@ write first, advance cursor only to written raw, mark `partial`, enqueue backlog
 
 ## Backlog worker
 
-Schedule: `10 0,1,2,3,4,6,11,17,23 * * *`.
+Schedule: `10 0,1,2,3,4,23 * * *` (Asia/Taipei).
+
+This is a night-only catch-up window: one bounded run at 23:10, then hourly from
+00:10 through 04:10. Do not add 06:10, 11:10, or 17:10 routine runs. Keeping
+backlog work out of daytime avoids competing with interactive OpenClaw tasks, and
+stopping before 05:00 leaves a clean buffer before core backup, discovery, daily
+sync, audit, and LanceDB jobs. If the queue remains active after 04:10, preserve it
+for the next night instead of increasing batch limits or starting a daytime worker.
 
 The prompt should run the deterministic worker with config-derived paths, including the queue path:
 
@@ -43,6 +50,9 @@ python3 scripts/run_backlog_worker_v3.py \
 Completion rule: a queue item becomes `caught_up` only when a read `after=<cursor>`
 returns 0 messages. Never use `lastBackup` to decide completion. Report
 `processed` / `totalBatches` / `activeQueueLeft` / `auditWarnings` from the worker JSON.
+
+An operator may run the same bounded worker manually for an incident, but routine
+customer cron definitions must keep the night-only schedule above.
 
 ## Audit
 

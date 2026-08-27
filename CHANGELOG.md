@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Move the default backlog worker to a night-only 23:10–04:10 window, removing
+  routine 06:10, 11:10, and 17:10 runs so catch-up work does not contend with
+  interactive or daily backup tasks; bounded limits and durable next-night resume
+  remain unchanged.
 - Harden excluded/invalid entries across selector, worker, audit, and raw reconciliation; active retry items are retired as `invalid` instead of returning to backlog.
 - Add recovery-first weekly full-inventory raw repair with bounded append-only closeout, local-only ID classification, and report-channel self-drift protection.
 - Add stable-ID mapping ledgers that preserve customer paths and block unsafe/colliding registration before apply.

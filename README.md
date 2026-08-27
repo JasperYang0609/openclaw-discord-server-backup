@@ -16,6 +16,11 @@ Clone this repo, then run the installer with Python 3:
 
 Install `openclaw-lancedb-knowledge` first if the customer wants searchable memory. Then edit the generated backup config and add the OpenClaw cron jobs from `examples/cron.examples.md`.
 
+The default backlog topology is night-only: bounded runs at 23:10 and hourly from
+00:10 through 04:10 (Asia/Taipei). It deliberately avoids daytime catch-up work and
+stops before the 05:15–06:30 daily backup pipeline. Remaining queue debt carries to
+the next night; operators should not raise worker limits to force one oversized run.
+
 ## Contents
 
 - `skill/openclaw-discord-server-backup/` - installable OpenClaw skill

@@ -30,7 +30,7 @@ A channel/thread is caught up only when `read after=<lastWrittenMessageId>` retu
 1. Discovery registers channels/threads and creates folders. It does not read message content.
 2. Daily sync processes only healthy entries in small batches.
 3. If daily sync hits a page/message limit, it writes what it has, advances cursor only to written raw data, marks the entry partial, and enqueues backlog.
-4. Backlog worker processes queue-first using deterministic scripts and emits `auditWarnings` for stuck active catch-ups (`attempts > 5` on active queue items, `consecutiveErrors > 3` on entries).
+4. Backlog worker processes queue-first using deterministic scripts and emits `auditWarnings` for stuck active catch-ups (`attempts > 5` on active queue items, `consecutiveErrors > 3` on entries). Schedule routine runs only at `10 0,1,2,3,4,23 * * *` in the customer timezone: 23:10 and 00:10–04:10. Do not add daytime runs; carry unfinished queue debt to the next night without increasing the bounded worker limits.
 5. Audit probes every registered entry and requeues false-healthy entries.
 6. Optional LanceDB indexing runs after backup so summaries/raw outputs become searchable knowledge.
 
@@ -80,3 +80,8 @@ Use plain explicit instructions, fixed status/reason enums, exact commands, and 
 ## Recommended install order
 
 For customers who need searchable project memory, install `openclaw-lancedb-knowledge` first, then install this backup skill. This backup skill can call the existing LanceDB incremental index after backup jobs finish.
+
+Keep core backup, discovery, daily sync, audit, and LanceDB outside the backlog
+window. The default 23:10–04:10 window ends before the 05:15 daily pipeline and is
+the production topology unless the customer explicitly approves another low-traffic
+window. Manual incident runs remain bounded and do not change the recurring cron.
