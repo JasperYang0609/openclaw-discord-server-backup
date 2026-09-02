@@ -189,6 +189,7 @@ def main() -> int:
         "scripts/snapshot_deployment_assets.py",
         "scripts/backup_workspace_assets.py",
         "scripts/select_backlog_candidates.py",
+        "scripts/backup_paths.py",
         "scripts/core_workspace_backup.py",
         "prompts/core-backup.md",
         "references/recovery.md",

@@ -5,18 +5,30 @@ import argparse
 import json
 from pathlib import Path
 
+from backup_paths import build_layout
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Create customer config for OpenClaw Discord backup skill.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--guild-id", default="CHANGE_ME")
-    ap.add_argument("--backup-root", default="~/OpenClawBackups/discord")
+    ap.add_argument("--server-name", help="Discord server display name used for <name>資料備份")
+    ap.add_argument("--backup-root", help="Explicit custom backup root")
+    ap.add_argument("--desktop-dir", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--report-channel", default="discord:channel:CHANGE_ME")
     ap.add_argument("--timezone", default="Asia/Taipei")
     args = ap.parse_args()
+    try:
+        layout = build_layout(
+            server_name=args.server_name,
+            backup_root=args.backup_root,
+            desktop_dir=args.desktop_dir,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     cfg = {
         "guildId": args.guild_id,
-        "backupRoot": args.backup_root,
+        "backupRoot": str(layout.discord_root),
         "statePath": "memory/channel_backup_summary_state.json",
         "queuePath": "memory/channel_backup_backlog_queue.json",
         "reportChannel": args.report_channel,

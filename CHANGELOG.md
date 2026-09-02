@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Make fresh macOS installs create one real Desktop directory named
+  `<Discord伺服器名稱>資料備份`, with `Discord資料/` for Discord archives and the
+  existing core-backup engine owning `核心文件/latest` and immutable daily
+  snapshots. Config/state paths now match, unsafe names and destinations fail
+  closed, custom roots remain supported, and existing trees are never moved silently.
+
 - Move the default backlog worker to a night-only 23:10–04:10 window, removing
   routine 06:10, 11:10, and 17:10 runs so catch-up work does not contend with
   interactive or daily backup tasks; bounded limits and durable next-night resume

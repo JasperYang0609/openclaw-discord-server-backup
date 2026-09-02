@@ -1,6 +1,6 @@
 {
   "guildId": "YOUR_DISCORD_GUILD_ID",
-  "backupRoot": "~/OpenClawBackups/discord",
+  "backupRoot": "/Users/CUSTOMER/Desktop/DISCORD_SERVER_NAME資料備份/Discord資料",
   "statePath": "memory/channel_backup_summary_state.json",
   "queuePath": "memory/channel_backup_backlog_queue.json",
   "reportChannel": "discord:channel:YOUR_REPORT_CHANNEL_OR_THREAD_ID",
