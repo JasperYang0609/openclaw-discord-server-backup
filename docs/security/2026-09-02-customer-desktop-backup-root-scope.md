@@ -21,15 +21,32 @@ Target: local Python installer and deterministic backup scripts
 
 ## OWASP Top 10:2025 verification register
 
-- A01 Broken Access Control: local path containment and no customer cron/API mutation.
-- A02 Security Misconfiguration: deterministic absolute paths and config/state parity.
-- A03 Software Supply Chain Failures: package parity, source inventory, dependency audit.
-- A04 Cryptographic Failures: existing SHA-256 manifest verification retained.
-- A05 Injection: reject control characters, NUL, separators, traversal names.
-- A06 Insecure Design: fail before writes; no automatic migration or deletion.
-- A07 Authentication Failures: not applicable; installer handles no credentials.
-- A08 Software/Data Integrity Failures: immutable daily snapshots and restore canary retained.
-- A09 Logging and Alerting Failures: structured non-secret install output and explicit blockers.
-- A10 Exceptional Conditions: file/symlink/overlap/existing-root failures are tested fail-closed.
+- A01 Broken Access Control — PASS: workspace containment and non-overlap tests pass;
+  no customer cron or Discord API mutation is implemented.
+- A02 Security Misconfiguration — PASS: installer integration test proves absolute
+  config/state parity and the expected Desktop layout.
+- A03 Software Supply Chain Failures — PASS: deterministic package parity and forbidden
+  package-entry scan pass; this change adds no third-party dependency.
+- A04 Cryptographic Failures — PASS: existing SHA-256 manifest verification runs in the
+  full post-run check and core integration test.
+- A05 Injection — PASS: empty, traversal, separator, NUL/control-shaped names are rejected
+  before writes.
+- A06 Insecure Design — PASS: existing-root mismatch stops with an explicit migration
+  requirement; no automatic move, overwrite, or deletion exists.
+- A07 Authentication Failures — NOT_APPLICABLE_WITH_EVIDENCE: installer accepts and emits
+  no credentials and performs no authentication.
+- A08 Software/Data Integrity Failures — PASS: package parity, immutable daily snapshot,
+  exact manifest verification, and isolated restore canary pass.
+- A09 Logging and Alerting Failures — PASS: structured install output contains only paths
+  and next steps; blockers are explicit; changed-content secret-shape scan passes.
+- A10 Exceptional Conditions — PASS: file, symlink, overlap, unsafe name, rerun, custom
+  root, and existing-root mismatch cases are covered by fail-closed tests.
 
-Final PASS/BLOCKED/N/A evidence is recorded after implementation tests.
+## Verification evidence
+
+- Full suite: 70 tests passed.
+- Repository post-run check: PASS, including package parity and core restore canary.
+- Python compile and diff hygiene: PASS.
+- Release package secret/forbidden-entry scans: PASS.
+- Package SHA-256: `9eb67d5679c6aa97174bf25d49817247b5542e4a6aa96a287fc58c090685ff8e`.
+- P0/P1 blockers: none.

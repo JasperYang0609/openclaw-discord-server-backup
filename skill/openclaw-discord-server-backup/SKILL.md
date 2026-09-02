@@ -39,7 +39,9 @@ A channel/thread is caught up only when `read after=<lastWrittenMessageId>` retu
 Use scripts for fragile operations. Do not manually invent state transitions.
 
 - `scripts/core_workspace_backup.py`: deterministic core backup, exact manifest verification, and temporary restore canary.
-- `scripts/install.py`: install/copy skill and create local config/state/queue scaffolding.
+- `scripts/install.py`: install/copy the skill; for fresh macOS installs, require the
+  Discord server display name and create the real Desktop root
+  `<伺服器名稱>資料備份/Discord資料`, with matching absolute config/state paths.
 - `scripts/bootstrap_state.py`: create/update entries from discovery inventory.
 - `scripts/migrate_state_v3.py`: upgrade existing state and build queue from partial entries.
 - `scripts/select_backlog_candidates.py`: choose queue-first backlog candidates.
@@ -85,3 +87,14 @@ Keep core backup, discovery, daily sync, audit, and LanceDB outside the backlog
 window. The default 23:10–04:10 window ends before the 05:15 daily pipeline and is
 the production topology unless the customer explicitly approves another low-traffic
 window. Manual incident runs remain bounded and do not change the recurring cron.
+
+## Customer backup root rule
+
+- Fresh default install: `~/Desktop/<Discord伺服器名稱>資料備份`.
+- Discord archive/config root: `<backup root>/Discord資料`.
+- Core workspace root passed to `core_workspace_backup.py`: `<backup root>`; the
+  existing engine creates `核心文件/latest` and `核心文件/snapshots` beneath it.
+- The Desktop directory is real, not a symlink or Finder alias.
+- A supplied `--backup-root` wins and prevents a second Desktop root.
+- Never move an existing configured root automatically. Report that migration is
+  required and leave customer data unchanged.

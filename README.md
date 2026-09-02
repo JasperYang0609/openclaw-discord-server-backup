@@ -12,9 +12,29 @@ A channel/thread is caught up only when `read after=<cursor>` returns 0 messages
 
 Clone this repo, then run the installer with Python 3:
 
-`skill/openclaw-discord-server-backup/scripts/install.py --workspace ~/.openclaw/workspace`
+`python3 skill/openclaw-discord-server-backup/scripts/install.py --workspace ~/.openclaw/workspace --server-name "南方"`
 
-Install `openclaw-lancedb-knowledge` first if the customer wants searchable memory. Then edit the generated backup config and add the OpenClaw cron jobs from `examples/cron.examples.md`.
+For a fresh default macOS installation, `--server-name` is required. The installer
+creates one real Desktop folder named `<Discord伺服器名稱>資料備份`, for example:
+
+```text
+~/Desktop/南方資料備份/
+├── Discord資料/
+└── 核心文件/          # created/populated by the core-backup job
+    ├── latest/
+    └── snapshots/
+```
+
+The Discord config and state both point to the absolute `Discord資料/` path. The
+existing deterministic core-backup engine receives the parent backup root and owns
+`核心文件/`. Use `--backup-root /absolute/custom/path` only when the customer has
+explicitly chosen a non-Desktop location; a custom root disables automatic Desktop
+folder creation. Existing backup trees are never moved automatically.
+
+Install `openclaw-lancedb-knowledge` first if the customer wants searchable memory.
+Then edit the generated backup config and add both the Discord and core-backup
+OpenClaw cron jobs from `examples/cron.examples.md`. The folder alone is scaffolding;
+`核心文件/latest/` appears after the core-backup job runs successfully.
 
 The default backlog topology is night-only: bounded runs at 23:10 and hourly from
 00:10 through 04:10 (Asia/Taipei). It deliberately avoids daytime catch-up work and

@@ -2,7 +2,7 @@
   "version": 3,
   "schema": "channel-backup-state-v3",
   "guildId": "YOUR_DISCORD_GUILD_ID",
-  "rootPath": "~/OpenClawBackups/discord",
+  "rootPath": "/Users/CUSTOMER/Desktop/DISCORD_SERVER_NAME資料備份/Discord資料",
   "queuePath": "memory/channel_backup_backlog_queue.json",
   "cursorPolicy": {
     "sourceOfTruth": "lastWrittenMessageId",

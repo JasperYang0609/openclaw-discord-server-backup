@@ -7,6 +7,10 @@ Goal: run the repository-owned deterministic backup engine for workspace core Ma
 - `{{WORKSPACE_ROOT}}`: the customer OpenClaw workspace
 - `{{BACKUP_ROOT}}`: a backup root that does not overlap the workspace
 
+For the default customer layout, `{{BACKUP_ROOT}}` is the real Desktop directory
+`~/Desktop/<Discord伺服器名稱>資料備份` reported by the installer. Do not use its
+`Discord資料/` child here; the core engine owns the sibling `核心文件/` tree.
+
 Resolve and validate both paths before running. Do not continue while either placeholder is unresolved. Do not manually recreate the copy/state logic in this prompt.
 
 ## Run
