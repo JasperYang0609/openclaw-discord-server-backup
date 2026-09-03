@@ -28,6 +28,11 @@ The prompt should follow `prompts/daily-sync-v3.md` with the V3 hard limits (30/
 per entry per run, at most 4 entries written per run (at most 6 checked). On any cap:
 write first, advance cursor only to written raw, mark `partial`, enqueue backlog.
 
+All daily-sync slots for one install must share one custom session key. Before entry
+selection, run `scripts/check_daily_sync_gate.py` against the state and today's
+deterministic inventory report. A busy shared lock or stale/incomplete inventory is a
+safe `skipped` run: do not read messages, write files, or advance cursors.
+
 ## Backlog worker
 
 Schedule: `10 0,1,2,3,4,23 * * *` (Asia/Taipei).

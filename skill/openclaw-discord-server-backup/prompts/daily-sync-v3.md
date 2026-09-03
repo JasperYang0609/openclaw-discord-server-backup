@@ -6,6 +6,7 @@ Concurrency contract:
 - All daily-sync cron slots for one backup installation must use the same OpenClaw custom session key so normal runs and restart catch-up runs serialize.
 - At the start of every slot, reload the current state and queue from disk. Never reuse a candidate list or cursor from an earlier slot or earlier conversation context.
 - If another slot has already advanced an entry, use the newer durable cursor and select the next eligible entry instead of appending the same batch twice.
+- Before selecting entries, run `scripts/check_daily_sync_gate.py` against the current state and the latest deterministic inventory report. If the shared lock is busy or today's inventory is missing/incomplete, report `skipped` and make no changes.
 
 Rules:
 - Do not process entries already in active queue.

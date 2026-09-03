@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Serialize daily-sync cron slots through one custom session and require every slot to reload durable state/queue before candidate selection, preventing restart catch-up races and duplicate batch selection.
+- Add a deterministic daily-sync preflight gate that skips safely while another backup job holds the shared lock or today's inventory audit is missing/incomplete.
 - Freeze the audited report entry at a message-ID cutoff during weekly V4 reconciliation so progress cards belong to the next incremental scope instead of causing closeout drift.
 - Share remaining backlog safety-net slots between stale probes and null-cursor bootstrap entries while keeping excluded/invalid entries terminal.
 

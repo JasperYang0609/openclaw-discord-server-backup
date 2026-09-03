@@ -59,6 +59,7 @@ Run healthcheck and confirm:
 - no recurring backlog cron runs after 04:10 or during daytime; unfinished debt is
   preserved for the next night's bounded runs
 - audit can probe entries
+- daily-sync preflight passes with today's deterministic inventory and an available shared lock
 - guild inventory reports zero missing state entries (or documents permission warnings)
 - raw reconciliation reports zero missing current Discord messages
 - LanceDB source map matches the required search depth: summary-only or summary + raw
