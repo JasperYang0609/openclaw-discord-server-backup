@@ -22,6 +22,21 @@ Repair production backup automation issues found during a full local audit witho
 - Keep old Gemini assets for rollback while creating a separate Qwen snapshot root.
 - Run regression tests, self-checks, state/queue validation, deterministic inventory, and remote parity checks before closeout.
 
+## Security scope (OWASP Top 10:2025)
+
+- A01 PASS: archive paths remain containment-checked and excluded/invalid entries are terminal.
+- A02 PASS: pre-repair recovery evidence and packaged artifacts are checksum-verified.
+- A03 PASS: deterministic cron commands use fixed arguments; message IDs are handled as numeric snowflakes.
+- A04 PASS: bounded workloads, fair selection, frozen report cutoff, and append-only repair cover abuse and moving-target cases.
+- A05 PASS: daily jobs share one session key, reload durable state, and fail closed on unsafe or incomplete results.
+- A06 PASS: no new dependency was added; existing dependency and package checks remain green.
+- A07 NOT_APPLICABLE_WITH_EVIDENCE: authentication and identity flows are unchanged.
+- A08 PASS: Raw is written before cursors advance; immutable snapshots and recovery evidence are not overwritten.
+- A09 PASS: enabled backup jobs have explicit redacted failure alerts and bounded diagnostics.
+- A10 PASS: no new outbound integration is introduced; Discord data remains in the configured local archive.
+
+Web/API ASVS register: NOT_APPLICABLE_WITH_EVIDENCE. This change is a local CLI and cron automation repair and exposes no web or API endpoint.
+
 ## Completion evidence
 
 - Repo test suites pass and implementation commits exist.
