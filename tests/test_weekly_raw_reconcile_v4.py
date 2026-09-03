@@ -21,6 +21,50 @@ def test_ordered_entries_excludes_invalid_and_scans_report_entry_last():
     assert [key for key, _ in rows] == ["normal", "report"]
 
 
+def test_capture_report_cutoff_uses_latest_message(monkeypatch):
+    entries = [("report", {"channelId": "3", "relativePath": "report"})]
+    calls = []
+    monkeypatch.setattr(
+        weekly.worker,
+        "discord_messages",
+        lambda token, channel_id, *, after, limit: (
+            calls.append((token, channel_id, after, limit))
+            or [{"id": "20"}]
+        ),
+    )
+
+    assert weekly.capture_report_cutoff(entries, "report", "token") == "20"
+    assert calls == [("token", "3", None, 1)]
+
+
+def test_scan_freezes_report_entry_and_excludes_newer_raw_and_live_ids(
+    tmp_path: Path, monkeypatch
+):
+    entries = [("report", {"channelId": "3", "relativePath": "report"})]
+    monkeypatch.setattr(
+        weekly.reconcile,
+        "archive_message_ids",
+        lambda raw_dir: ({"10": 1, "20": 1, "30": 1}, []),
+    )
+    monkeypatch.setattr(
+        weekly.reconcile,
+        "fetch_all_messages",
+        lambda token, channel_id, page_limit: [
+            {"id": "10"}, {"id": "20"}, {"id": "30"}
+        ],
+    )
+
+    rows, messages, raw_ids = weekly.scan(
+        entries, tmp_path, "token", 100, "report", "20"
+    )
+
+    assert [message["id"] for message in messages["report"]] == ["10", "20"]
+    assert raw_ids["report"] == {"10", "20"}
+    assert rows[0]["liveMessages"] == 2
+    assert rows[0]["liveOnly"] == 0
+    assert rows[0]["localOnly"] == 0
+
+
 def test_safe_entry_dir_rejects_path_escape(tmp_path: Path):
     try:
         weekly.safe_entry_dir(tmp_path, "../outside")

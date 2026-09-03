@@ -72,11 +72,39 @@ def ordered_entries(
     return rows
 
 
+def capture_report_cutoff(
+    entries: list[tuple[str, dict[str, Any]]],
+    report_entry_key: str | None,
+    token: str,
+) -> str | None:
+    """Freeze the report entry at its latest message before closeout starts.
+
+    Progress cards sent while a long reconcile is running are intentionally left
+    for the next incremental scope instead of creating an endless moving target.
+    """
+    if report_entry_key is None:
+        return None
+    entry = next((row for key, row in entries if key == report_entry_key), None)
+    if entry is None:
+        raise RuntimeError(f"report entry is not registered: {report_entry_key}")
+    channel_id = entry.get("channelId")
+    if not channel_id:
+        raise RuntimeError(f"report entry has no channelId: {report_entry_key}")
+    latest = worker.discord_messages(token, str(channel_id), after=None, limit=1)
+    return max((str(message["id"]) for message in latest), key=int, default="0")
+
+
+def within_cutoff(message_id: str, cutoff: str | None) -> bool:
+    return cutoff is None or int(message_id) <= int(cutoff)
+
+
 def scan(
     entries: list[tuple[str, dict[str, Any]]],
     root: Path,
     token: str,
     page_limit: int,
+    report_entry_key: str | None = None,
+    report_cutoff_message_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, set[str]]]:
     rows: list[dict[str, Any]] = []
     messages_by_key: dict[str, list[dict[str, Any]]] = {}
@@ -85,21 +113,35 @@ def scan(
         relative_path = str(entry.get("relativePath") or key)
         raw_dir = safe_entry_dir(root, relative_path) / "raw"
         raw_counts, _ = reconcile.archive_message_ids(raw_dir)
-        raw_ids = set(raw_counts)
+        cutoff = report_cutoff_message_id if key == report_entry_key else None
+        raw_ids = {
+            message_id for message_id in raw_counts
+            if within_cutoff(message_id, cutoff)
+        }
         raw_ids_by_key[key] = raw_ids
         row: dict[str, Any] = {
             "key": key,
             "channelId": entry.get("channelId"),
             "relativePath": relative_path,
             "rawMessageIds": len(raw_ids),
-            "duplicateRawIds": sum(count - 1 for count in raw_counts.values() if count > 1),
+            "duplicateRawIds": sum(
+                count - 1
+                for message_id, count in raw_counts.items()
+                if message_id in raw_ids and count > 1
+            ),
         }
         if not entry.get("channelId"):
             row["liveError"] = "missing_channel_id"
             rows.append(row)
             continue
         try:
-            messages = reconcile.fetch_all_messages(token, str(entry["channelId"]), page_limit)
+            messages = [
+                message
+                for message in reconcile.fetch_all_messages(
+                    token, str(entry["channelId"]), page_limit
+                )
+                if within_cutoff(str(message["id"]), cutoff)
+            ]
             messages_by_key[key] = messages
             live_ids = {str(message["id"]) for message in messages}
             missing = [message for message in messages if str(message["id"]) not in raw_ids]
@@ -276,8 +318,18 @@ def main() -> int:
     passes: list[dict[str, Any]] = []
     total_appended = 0
     try:
+        report_cutoff_message_id = capture_report_cutoff(
+            entries, args.report_entry_key, token
+        )
         for pass_number in range(1, args.max_closeout_passes + 1):
-            rows, messages_by_key, raw_ids_by_key = scan(entries, root, token, args.page_limit)
+            rows, messages_by_key, raw_ids_by_key = scan(
+                entries,
+                root,
+                token,
+                args.page_limit,
+                args.report_entry_key,
+                report_cutoff_message_id,
+            )
             live_errors = sum(bool(row.get("liveError")) for row in rows)
             live_only = sum(int(row.get("liveOnly") or 0) for row in rows)
             pass_result = {
@@ -300,7 +352,14 @@ def main() -> int:
             if live_only == 0:
                 break
 
-        final_rows, final_messages, final_raw_ids = scan(entries, root, token, args.page_limit)
+        final_rows, final_messages, final_raw_ids = scan(
+            entries,
+            root,
+            token,
+            args.page_limit,
+            args.report_entry_key,
+            report_cutoff_message_id,
+        )
         final_live_errors = sum(bool(row.get("liveError")) for row in final_rows)
         final_live_only = sum(int(row.get("liveOnly") or 0) for row in final_rows)
         classification = classify_local_only(final_rows, final_messages, final_raw_ids)
@@ -329,9 +388,11 @@ def main() -> int:
             "finalLiveOnly": final_live_only,
             "finalLiveErrors": final_live_errors,
             "activeQueue": active_queue,
+            "reportEntryKey": args.report_entry_key,
+            "reportEntryCutoffMessageId": report_cutoff_message_id,
             "localOnlyClassification": classification,
             "recoveryPath": str(evidence_dir / "pre-repair") if copied else None,
-            "selfDriftGuard": "Do not send report-channel messages between final scan start and capturedAt.",
+            "selfDriftGuard": "Report-entry messages newer than the frozen cutoff belong to the next incremental scope.",
         }
         atomic_json(evidence_dir / "weekly-reconciliation-summary.json", result)
         atomic_json(evidence_dir / "local-only-id-classification.json", classification)

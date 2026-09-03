@@ -107,24 +107,6 @@ def main() -> int:
 
     if len(selected) < args.limit:
         stale: list[dict[str, Any]] = []
-        for key, entry in entries.items():
-            if key in seen:
-                continue
-            if entry_is_excluded(entry):
-                continue
-            cursor = entry.get("lastWrittenMessageId") or entry.get("lastMessageId")
-            last_backup = parse_day(entry.get("lastBackup"))
-            if cursor and (last_backup is None or last_backup <= cutoff):
-                payload = entry_payload(key, entry, "stale_incremental", 70)
-                payload["sortDate"] = last_backup.isoformat() if last_backup else "0000-00-00"
-                stale.append(payload)
-        stale.sort(key=lambda item: (item["sortDate"], item["relativePath"]))
-        for item in stale[: args.limit - len(selected)]:
-            item.pop("sortDate", None)
-            selected.append(item)
-            seen.add(item["key"])
-
-    if len(selected) < args.limit:
         bootstrap: list[dict[str, Any]] = []
         for key, entry in entries.items():
             if key in seen:
@@ -132,10 +114,39 @@ def main() -> int:
             if entry_is_excluded(entry):
                 continue
             cursor = entry.get("lastWrittenMessageId") or entry.get("lastMessageId")
-            if not cursor:
+            if cursor:
+                last_backup = parse_day(entry.get("lastBackup"))
+                if last_backup is None or last_backup <= cutoff:
+                    payload = entry_payload(key, entry, "stale_incremental", 70)
+                    payload["sortDate"] = last_backup.isoformat() if last_backup else "0000-00-00"
+                    stale.append(payload)
+            elif entry.get("channelId"):
                 bootstrap.append(entry_payload(key, entry, "bootstrap_needed", 90))
+        stale.sort(key=lambda item: (item["sortDate"], item["relativePath"]))
         bootstrap.sort(key=lambda item: item["relativePath"])
-        selected.extend(bootstrap[: args.limit - len(selected)])
+
+        remaining = args.limit - len(selected)
+        bootstrap_slots = 0
+        stale_slots = 0
+        if bootstrap and stale:
+            bootstrap_slots = min(len(bootstrap), (remaining + 1) // 2)
+            stale_slots = min(len(stale), remaining - bootstrap_slots)
+            leftover = remaining - bootstrap_slots - stale_slots
+            if leftover:
+                extra_bootstrap = min(len(bootstrap) - bootstrap_slots, leftover)
+                bootstrap_slots += extra_bootstrap
+                leftover -= extra_bootstrap
+            if leftover:
+                stale_slots += min(len(stale) - stale_slots, leftover)
+        elif bootstrap:
+            bootstrap_slots = min(len(bootstrap), remaining)
+        else:
+            stale_slots = min(len(stale), remaining)
+
+        selected.extend(bootstrap[:bootstrap_slots])
+        for item in stale[:stale_slots]:
+            item.pop("sortDate", None)
+            selected.append(item)
 
     print(json.dumps({
         "today": args.today,

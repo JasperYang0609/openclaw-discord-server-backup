@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Serialize daily-sync cron slots through one custom session and require every slot to reload durable state/queue before candidate selection, preventing restart catch-up races and duplicate batch selection.
+- Freeze the audited report entry at a message-ID cutoff during weekly V4 reconciliation so progress cards belong to the next incremental scope instead of causing closeout drift.
+- Share remaining backlog safety-net slots between stale probes and null-cursor bootstrap entries while keeping excluded/invalid entries terminal.
+
 - Make fresh macOS installs create one real Desktop directory named
   `<Discord伺服器名稱>資料備份`, with `Discord資料/` for Discord archives and the
   existing core-backup engine owning `核心文件/latest` and immutable daily

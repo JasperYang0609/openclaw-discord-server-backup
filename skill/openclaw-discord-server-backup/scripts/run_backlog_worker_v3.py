@@ -433,11 +433,12 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
     if len(selected) >= limit:
         return selected
 
-    # 3) Safety net for quiet channels/threads that became active again. Daily sync
-    # intentionally skips old healthy entries and delegates them to backlog. If the
-    # backlog worker does not probe healthy-stale entries, they can stay invisible
-    # forever. A zero-message probe marks them checked/today; any messages are
-    # appended normally from the durable cursor.
+    # 3) Build the two safety-net pools together, then share remaining slots.
+    # Active queue and state-marked incomplete entries already won above. Among
+    # the lower-priority safety nets, reserve at least half (rounded up) for
+    # bootstrap when both pools are non-empty. This prevents null-cursor entries
+    # from being starved forever by a large stale-healthy population, while stale
+    # probes still make progress whenever at least two slots remain.
     stale_healthy: list[tuple[str, dict[str, Any]]] = []
     for key, entry in entries.items():
         if key in seen:
@@ -448,22 +449,11 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
             continue
         if not newest_cursor(entry.get("lastWrittenMessageId"), entry.get("lastMessageId")):
             continue
-        # Use the same base date as the lastBackup value written on caught_up
-        # (args.today), so replayed runs for an older date stay consistent.
         if entry.get("lastBackup") == run_today:
             continue
         stale_healthy.append((key, entry))
     stale_healthy.sort(key=lambda t: (t[1].get("lastBackup") or "0000-00-00", t[0]))
-    for key, entry in stale_healthy[: max(0, limit - len(selected))]:
-        item = upsert_queue_item(queue, key, entry, "queued", reason="healthy_stale_probe", priority=60)
-        add(key, entry, item)
-    if len(selected) >= limit:
-        return selected
 
-    # 4) Bootstrap entries with no durable cursor. Use a synthetic cursor of "0"
-    # so the normal after-cursor loop can establish the first real written cursor.
-    # This is bounded by the same worker limits and prevents null-cursor entries
-    # from being skipped forever.
     bootstrap: list[tuple[str, dict[str, Any]]] = []
     for key, entry in entries.items():
         if key in seen:
@@ -474,16 +464,39 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
             continue
         if not entry.get("channelId"):
             continue
-        # Probe an empty channel at most once per day to avoid repeated daily
-        # bootstrap probes. The base date matches the lastBackup value written
-        # on caught_up (args.today), so replayed runs stay consistent.
+        # Probe an empty channel at most once per run_today date. Empty channels
+        # keep a null cursor, so lastBackup is the bounded-probe guardrail.
         if entry.get("lastBackup") == run_today:
             continue
         bootstrap.append((key, entry))
     bootstrap.sort(key=lambda t: (t[1].get("lastBackup") or "0000-00-00", t[0]))
-    for key, entry in bootstrap[: max(0, limit - len(selected))]:
+
+    remaining = max(0, limit - len(selected))
+    bootstrap_slots = 0
+    stale_slots = 0
+    if bootstrap and stale_healthy:
+        bootstrap_slots = min(len(bootstrap), (remaining + 1) // 2)
+        stale_slots = min(len(stale_healthy), remaining - bootstrap_slots)
+        leftover = remaining - bootstrap_slots - stale_slots
+        if leftover:
+            extra_bootstrap = min(len(bootstrap) - bootstrap_slots, leftover)
+            bootstrap_slots += extra_bootstrap
+            leftover -= extra_bootstrap
+        if leftover:
+            stale_slots += min(len(stale_healthy) - stale_slots, leftover)
+    elif bootstrap:
+        bootstrap_slots = min(len(bootstrap), remaining)
+    else:
+        stale_slots = min(len(stale_healthy), remaining)
+
+    # Bootstrap first within this run so a later timeout cannot repeatedly finish
+    # only stale probes while leaving the newly discovered entries untouched.
+    for key, entry in bootstrap[:bootstrap_slots]:
         item = upsert_queue_item(queue, key, entry, "queued", reason="bootstrap_needed", priority=90)
         item["cursorMessageId"] = item.get("cursorMessageId") or "0"
+        add(key, entry, item)
+    for key, entry in stale_healthy[:stale_slots]:
+        item = upsert_queue_item(queue, key, entry, "queued", reason="healthy_stale_probe", priority=60)
         add(key, entry, item)
     return selected
 

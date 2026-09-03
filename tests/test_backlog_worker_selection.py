@@ -133,6 +133,58 @@ def test_stale_probe_only_enqueues_selected_limit():
     assert all(item["reason"] == "healthy_stale_probe" for item in queue["items"])
 
 
+def test_bootstrap_is_not_starved_by_stale_probes_and_exclusions_stay_terminal():
+    entries = {
+        f"stale-{i}": {
+            "type": "channel",
+            "channelId": f"s{i}",
+            "relativePath": f"stale-{i}",
+            "lastWrittenMessageId": str(100 + i),
+            "lastMessageId": str(100 + i),
+            "lastBackup": "2026-05-17",
+            "syncStatus": "healthy",
+        }
+        for i in range(8)
+    }
+    entries.update({
+        f"new-{i}": {
+            "type": "thread",
+            "channelId": f"n{i}",
+            "relativePath": f"parent/new-{i}",
+            "lastBackup": None,
+            "syncStatus": "healthy",
+        }
+        for i in range(4)
+    })
+    entries["excluded-stale"] = {
+        "type": "channel",
+        "channelId": "excluded-s",
+        "relativePath": "000-excluded-stale",
+        "lastWrittenMessageId": "50",
+        "lastBackup": "2026-01-01",
+        "syncStatus": "excluded",
+    }
+    entries["excluded-bootstrap"] = {
+        "type": "thread",
+        "channelId": "excluded-b",
+        "relativePath": "000-excluded-bootstrap",
+        "lastBackup": None,
+        "backupExcluded": True,
+    }
+    state = {"entries": entries}
+    queue = {"version": 1, "items": []}
+
+    selected = worker.select_candidates(state, queue, 4, RUN_TODAY)
+
+    reasons = [item[2]["reason"] for item in selected]
+    keys = [item[0] for item in selected]
+    assert reasons.count("bootstrap_needed") == 2
+    assert reasons.count("healthy_stale_probe") == 2
+    assert all(item[2]["cursorMessageId"] == "0" for item in selected[:2])
+    assert "excluded-stale" not in keys
+    assert "excluded-bootstrap" not in keys
+
+
 def test_null_cursor_entry_is_selected_for_bounded_bootstrap():
     state = {
         "entries": {
@@ -188,6 +240,7 @@ if __name__ == "__main__":
     test_reactivated_queue_cursor_never_lags_state_cursor()
     test_active_queue_cursor_is_advanced_to_state_cursor()
     test_stale_probe_only_enqueues_selected_limit()
+    test_bootstrap_is_not_starved_by_stale_probes_and_exclusions_stay_terminal()
     test_null_cursor_entry_is_selected_for_bounded_bootstrap()
     test_normalize_queue_collapses_stale_duplicate_active_item()
     print("backlog worker selection tests passed")

@@ -2,6 +2,11 @@
 
 Goal: run bounded daily sync for healthy Discord backup entries.
 
+Concurrency contract:
+- All daily-sync cron slots for one backup installation must use the same OpenClaw custom session key so normal runs and restart catch-up runs serialize.
+- At the start of every slot, reload the current state and queue from disk. Never reuse a candidate list or cursor from an earlier slot or earlier conversation context.
+- If another slot has already advanced an entry, use the newer durable cursor and select the next eligible entry instead of appending the same batch twice.
+
 Rules:
 - Do not process entries already in active queue.
 - Do not process entries with `syncStatus` partial, queued, catching_up, retry, or error.
