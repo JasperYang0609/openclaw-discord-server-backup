@@ -10,9 +10,17 @@ A channel/thread is caught up only when `read after=<cursor>` returns 0 messages
 
 ## Install
 
-Clone this repo, then run the installer with Python 3:
+Clone this repo, then run the transactional installer with Python 3:
 
-`python3 skill/openclaw-discord-server-backup/scripts/install.py --workspace ~/.openclaw/workspace --server-name "南方"`
+```bash
+python3 skill/openclaw-discord-server-backup/scripts/install.py \
+  --workspace ~/.openclaw/workspace \
+  --server-name "南方" \
+  --guild-id "DISCORD_GUILD_ID" \
+  --report-to "channel:REPORT_CHANNEL_ID" \
+  --agent main \
+  --timezone Asia/Taipei
+```
 
 For a fresh default macOS installation, `--server-name` is required. The installer
 creates one real Desktop folder named `<Discord伺服器名稱>資料備份`, for example:
@@ -31,14 +39,20 @@ existing deterministic core-backup engine receives the parent backup root and ow
 explicitly chosen a non-Desktop location; a custom root disables automatic Desktop
 folder creation. Existing backup trees are never moved automatically.
 
-Install `openclaw-lancedb-knowledge` first if the customer wants searchable memory.
-Then edit the generated backup config and add both the Discord and core-backup
-OpenClaw cron jobs from `examples/cron.examples.md`. The folder alone is scaffolding;
-`核心文件/latest/` appears after the core-backup job runs successfully.
+The installer owns the full cron topology. It performs complete-inventory checks,
+stages jobs disabled, runs command and shared-session canaries, enables the complete
+set last, verifies exact contracts, and rolls back on failure. A byte-identical rerun
+is a no-op. Unknown or look-alike jobs are reported and left untouched; legacy
+adoption requires an explicit ID plus SHA-256 fingerprint map.
+
+Use `--offline-scaffold` only when the gateway is intentionally unavailable. This
+returns `PARTIAL_MANUAL_ACTION`, not a ready install. Install the separate local Qwen
+knowledge product first when searchable memory is required, and pass only its
+explicit receipt path; this installer never guesses another product's files or jobs.
 
 The default backlog topology is night-only: bounded runs at 23:10 and hourly from
 00:10 through 04:10 (Asia/Taipei). It deliberately avoids daytime catch-up work and
-stops before the 05:15–06:30 daily backup pipeline. Remaining queue debt carries to
+stops before the 05:10–07:05 daily backup pipeline. Remaining queue debt carries to
 the next night; operators should not raise worker limits to force one oversized run.
 
 ## Contents
@@ -62,7 +76,18 @@ python3 skill/openclaw-discord-server-backup/scripts/post_run_check.py
 
 The same script is safe to run from an installed or extracted `.skill` package. It auto-detects the layout: repository clones receive package parity plus the full test suite, while installed packages receive required-file, deterministic smoke, Python compile, and CLI entry-point checks without assuming `tests/` or `examples/` exist nearby.
 
-The check validates example JSON, selector behavior, backlog worker invariants, core-workspace backup/verify/restore-canary behavior, packaged source parity, and the test suite when `pytest` is available. Treat failure as a backup correctness issue, because `lastBackup` alone is not proof that a channel/thread is caught up.
+The check validates example JSON, the owned cron manifest, daily-sync gate, selector
+and worker invariants, immutable weekly evidence, core/workspace snapshot verification
+and restore canaries, installed CLI entry points, packaged source parity, and the test
+suite when `pytest` is available. Treat failure as a backup correctness issue.
+
+## Operator reporting
+
+Routine jobs write private structured receipts and stay silent. At 07:05 the health
+job verifies the topology and emits one Traditional Chinese, plain-language report.
+It never treats yesterday's daily or Qwen receipt as today's proof, and it never
+claims weekly/monthly verification before the first scheduled evidence exists.
+Technical fields such as cursors, batch counts, and log paths remain in local logs.
 
 ## Maintainer use of Codex
 

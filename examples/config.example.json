@@ -5,6 +5,14 @@
   "queuePath": "memory/channel_backup_backlog_queue.json",
   "reportChannel": "discord:channel:YOUR_REPORT_CHANNEL_OR_THREAD_ID",
   "timezone": "Asia/Taipei",
+  "agentId": "main",
+  "receiptDir": "memory/openclaw_discord_backup_health",
+  "workspaceSnapshot": {
+    "includes": [
+      "memory",
+      "skills"
+    ]
+  },
   "limits": {
     "dailyEntryLimit": 6,
     "dailyMessageLimitPerEntry": 60,
@@ -17,12 +25,7 @@
     "openclaw-lancedb-knowledge",
     "openclaw-discord-server-backup"
   ],
-  "lancedb": {
-    "enabled": true,
-    "projectPath": "knowledge-lancedb",
-    "incrementalCommand": "npm run incremental",
-    "latestManifest": "knowledge-lancedb/reports/incremental-manifest.latest.json",
-    "runAfterBackup": true,
-    "externalEmbeddingsRequireApproval": true
+  "health": {
+    "qwenReceiptPath": null
   }
 }

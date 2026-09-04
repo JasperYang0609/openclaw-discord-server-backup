@@ -25,6 +25,7 @@ For a real recovery, stop writers first, select a verified latest or dated snaps
 5. `memory/channel_backup_backlog_queue.json`
 6. cron definitions
 7. customer adapter/wrapper, classification config, and stable-ID mapping ledger
+8. verified owned-cron transaction receipt and topology
 
 State without queue can still run, but partial work may be hidden. Rebuild queue from state with `migrate_state_v3.py`.
 
@@ -58,6 +59,13 @@ python3 skills/openclaw-discord-server-backup/scripts/select_backlog_candidates.
 - explicitly excluded/invalid entries are absent from candidates and their queue items are `invalid`
 - compatibility recovery bundle verifies and passes an isolated restore canary
 - cron JSON contains no `payload.toolsAllow`; shell jobs passed a temporary GPT/Codex isolated canary
+- weekly pre-repair evidence verifies before any append:
+  `python3 scripts/weekly_raw_reconcile_v4.py --verify-evidence /path/to/pre-repair`
+- workspace recovery snapshots pass both:
+  `python3 scripts/backup_workspace_assets.py verify --snapshot /path/to/snapshot`
+  and `python3 scripts/backup_workspace_assets.py restore-canary --snapshot /path/to/snapshot`
+- cron transaction receipts verify with
+  `python3 scripts/manage_cron_topology.py verify-receipt --receipt /path/to/transaction`
 
 ## Common failure modes
 
@@ -95,3 +103,24 @@ Set `status=retry`, increase `attempts`, and report after threshold. Do not dele
 This is not healthy. An `after=<cursor>` probe only proves there are no newer messages; it does not prove older messages were written.
 
 Run `scripts/weekly_raw_reconcile_v4.py`. It creates recovery evidence before append-only repair, repeats bounded closeout scans, classifies local-only IDs, and fails closed on unknown classifications or live errors. Do not emit status messages into an audited report channel during its final scan window.
+
+### Cron upgrade failed after jobs were enabled
+
+Do not reconstruct the old topology from memory. The installer automatically invokes
+receipt-backed rollback. For an operator-authorized repeat, use
+`manage_cron_topology.py rollback-receipt --receipt <transaction-directory>` and
+then verify the exact restored inventory. Unknown jobs are outside product ownership
+and must never be deleted as part of rollback.
+
+### A weekly evidence bundle fails verification
+
+Stop repair. Do not regenerate a manifest over the bundle or append any raw data.
+The evidence directory is immutable and binds state, queue, and every affected raw
+file by exact path, byte count, and SHA-256. Create a new uniquely named evidence
+bundle only after the underlying cause is understood.
+
+### A workspace snapshot restore canary fails
+
+Do not advance `latest` and do not use that snapshot for recovery. Select another
+verified immutable snapshot. Restore canaries always use temporary directories and
+never overwrite the live workspace.

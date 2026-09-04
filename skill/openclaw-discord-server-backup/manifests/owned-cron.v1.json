@@ -1,0 +1,144 @@
+{
+  "schema": "openclaw-owned-cron-manifest.v1",
+  "product": "openclaw-discord-server-backup",
+  "contractVersion": "v1",
+  "timezoneDefault": "Asia/Taipei",
+  "failureAlert": {
+    "after": 1,
+    "cooldown": "1h",
+    "includeSkipped": false,
+    "mode": "announce",
+    "channel": "discord"
+  },
+  "jobs": [
+    {
+      "role": "core-backup",
+      "name": "Discord 備份｜核心文件",
+      "description": "Backup and verify workspace core files without exposing routine technical output.",
+      "schedule": "10 5 * * *",
+      "kind": "command",
+      "runnerRole": "core-backup",
+      "timeoutSeconds": 900,
+      "noOutputTimeoutSeconds": 300,
+      "outputMaxBytes": 65536,
+      "delivery": "none"
+    },
+    {
+      "role": "discovery",
+      "name": "Discord 備份｜完整頻道探索",
+      "description": "Deterministically enumerate channels and active/archived threads before daily sync.",
+      "schedule": "25 5 * * *",
+      "kind": "command",
+      "runnerRole": "discovery",
+      "timeoutSeconds": 1800,
+      "noOutputTimeoutSeconds": 300,
+      "outputMaxBytes": 65536,
+      "delivery": "none"
+    },
+    {
+      "role": "daily-sync-1",
+      "name": "Discord 備份｜日常同步 1/3",
+      "description": "Bounded daily sync slot using the shared serialized session and fail-closed gate.",
+      "schedule": "30 5 * * *",
+      "kind": "agent",
+      "promptFile": "prompts/daily-sync-v3.md",
+      "timeoutSeconds": 1500,
+      "delivery": "none",
+      "sharedSession": "daily-sync"
+    },
+    {
+      "role": "daily-sync-2",
+      "name": "Discord 備份｜日常同步 2/3",
+      "description": "Bounded daily sync slot using the shared serialized session and fail-closed gate.",
+      "schedule": "40 5 * * *",
+      "kind": "agent",
+      "promptFile": "prompts/daily-sync-v3.md",
+      "timeoutSeconds": 1500,
+      "delivery": "none",
+      "sharedSession": "daily-sync"
+    },
+    {
+      "role": "daily-sync-3",
+      "name": "Discord 備份｜日常同步 3/3",
+      "description": "Bounded daily sync slot using the shared serialized session and fail-closed gate.",
+      "schedule": "50 5 * * *",
+      "kind": "agent",
+      "promptFile": "prompts/daily-sync-v3.md",
+      "timeoutSeconds": 1500,
+      "delivery": "none",
+      "sharedSession": "daily-sync"
+    },
+    {
+      "role": "caught-up-audit",
+      "name": "Discord 備份｜追平稽核",
+      "description": "Probe every registered entry and requeue false-healthy entries.",
+      "schedule": "10 6 * * *",
+      "kind": "command",
+      "runnerRole": "caught-up-audit",
+      "timeoutSeconds": 1800,
+      "noOutputTimeoutSeconds": 300,
+      "outputMaxBytes": 65536,
+      "delivery": "none"
+    },
+    {
+      "role": "health-report",
+      "name": "Discord 備份｜每日健康報告",
+      "description": "Emit one plain-language health report after backup and optional local-index snapshots.",
+      "schedule": "5 7 * * *",
+      "kind": "command",
+      "runnerRole": "health-report",
+      "timeoutSeconds": 180,
+      "noOutputTimeoutSeconds": 60,
+      "outputMaxBytes": 32768,
+      "delivery": "announce"
+    },
+    {
+      "role": "backlog",
+      "name": "Discord 備份｜夜間 backlog",
+      "description": "Bounded night-only catch-up at 23:10 and 00:10 through 04:10.",
+      "schedule": "10 23,0,1,2,3,4 * * *",
+      "kind": "command",
+      "runnerRole": "backlog",
+      "timeoutSeconds": 3600,
+      "noOutputTimeoutSeconds": 600,
+      "outputMaxBytes": 131072,
+      "delivery": "none"
+    },
+    {
+      "role": "weekly-inventory",
+      "name": "Discord 備份｜每週完整清單稽核",
+      "description": "Verify complete guild inventory before weekly raw reconciliation.",
+      "schedule": "50 13 * * 0",
+      "kind": "command",
+      "runnerRole": "weekly-inventory",
+      "timeoutSeconds": 3600,
+      "noOutputTimeoutSeconds": 600,
+      "outputMaxBytes": 131072,
+      "delivery": "none"
+    },
+    {
+      "role": "weekly-raw",
+      "name": "Discord 備份｜每週 Raw 完整性修復",
+      "description": "Create verified pre-repair evidence and append only missing Discord messages.",
+      "schedule": "10 14 * * 0",
+      "kind": "command",
+      "runnerRole": "weekly-raw",
+      "timeoutSeconds": 7200,
+      "noOutputTimeoutSeconds": 900,
+      "outputMaxBytes": 131072,
+      "delivery": "none"
+    },
+    {
+      "role": "workspace-snapshot",
+      "name": "Discord 備份｜工作區復原快照",
+      "description": "Create, verify, and restore-canary selected workspace recovery assets.",
+      "schedule": "0 7 1 * *",
+      "kind": "command",
+      "runnerRole": "workspace-snapshot",
+      "timeoutSeconds": 3600,
+      "noOutputTimeoutSeconds": 600,
+      "outputMaxBytes": 65536,
+      "delivery": "none"
+    }
+  ]
+}

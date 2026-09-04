@@ -1,0 +1,11 @@
+{
+  "schema": "openclaw-cron-adoption-map.v1",
+  "guildId": "CUSTOMER_GUILD_ID",
+  "entries": [
+    {
+      "role": "workspace-snapshot",
+      "jobId": "EXACT_LEGACY_JOB_ID",
+      "jobSha256": "REPLACE_WITH_FINGERPRINT_JOB_OUTPUT"
+    }
+  ]
+}

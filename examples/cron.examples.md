@@ -1,10 +1,17 @@
 # OpenClaw Cron Examples
 
-Use these as templates. Replace paths and report targets with customer config.
+This file documents the installer-owned topology. For a normal installation, run
+`scripts/install.py`; do not hand-create these jobs. The canonical machine-readable
+source is `manifests/owned-cron.v1.json`, shipped inside the `.skill` package.
+
+The installer validates the full cron inventory, stages all desired jobs disabled,
+runs an isolated command canary and a two-job shared-session serialization canary,
+then enables and verifies the complete set. Exact reruns are no-ops. Unknown jobs
+are never deleted; adoption requires an explicit checksummed map.
 
 ## Core workspace backup
 
-Schedule: daily 05:15, before Discord discovery and sync.
+Schedule: daily 05:10, before Discord discovery and sync.
 
 Use `skill/openclaw-discord-server-backup/prompts/core-backup.md`. Replace
 `{{WORKSPACE_ROOT}}` and `{{BACKUP_ROOT}}` with customer-specific absolute paths.
@@ -21,7 +28,7 @@ Discovery only registers channels/threads and creates folders. It must not read 
 
 ## Daily sync
 
-Schedule: daily 05:30.
+Schedules: daily 05:30, 05:40, and 05:50.
 
 The prompt should follow `prompts/daily-sync-v3.md` with the V3 hard limits (30/60/4):
 `limit=30` per read (exactly 30 allows one extra page), at most 60 messages written
@@ -64,7 +71,7 @@ customer cron definitions must keep the night-only schedule above.
 
 ## Audit
 
-Schedule: daily 06:30 or 23:30.
+Schedule: daily 06:10.
 
 The prompt should run `scripts/audit_caught_up_v3.py` and report any false healthy entries.
 The backlog worker also emits `auditWarnings` every run for stuck active catch-ups.
@@ -89,9 +96,19 @@ Run `scripts/audit_discord_inventory_v3.py` with the guild ID, state path, archi
 
 Before enabling shell-dependent GPT/Codex cron jobs, pipe `openclaw cron list --all --json` into `scripts/audit_cron_tooling.py`. Any `payload.toolsAllow` field is a blocker, including `toolsAllow: []`. Remove the field with `openclaw cron edit <job-id> --clear-tools`, then run a temporary isolated canary that executes `pwd && echo TOOL_OK`; remove the canary after `TOOL_OK` is observed.
 
+## Daily consolidated health report
+
+Schedule: daily 07:05.
+
+Routine components use silent delivery and write owner-only structured receipts.
+The health job first verifies the owned topology, then announces one Traditional
+Chinese report. Current-day daily and Qwen evidence is required; weekly and monthly
+evidence uses its own cadence. A newly installed job that has not reached its first
+scheduled run is shown as `需注意／已安裝，尚未到首次驗證`, never as passed.
+
 ## Workspace recovery assets
 
-Schedule: weekly after LanceDB indexing and backup verification.
+Schedule: day 1 of each month at 07:00.
 
 Run `scripts/backup_workspace_assets.py --apply` with an explicit list of recovery-critical folders. Recommended examples are records, scripts, skills, hooks, reports, handoff files, and the local LanceDB project. Keep large media, model, build, dependency, log, and temporary directories outside this job unless the customer explicitly chooses their storage and retention policy.
 
@@ -103,6 +120,8 @@ Schedule: after backup and audit, for example daily 06:30.
 
 The prompt should run `scripts/run_lancedb_incremental.py` with the customer config.
 
-Recommended customer flow: install and baseline `openclaw-lancedb-knowledge` first, then enable this backup skill's LanceDB post-backup indexing.
+Recommended customer flow: install and baseline the separate local knowledge product
+first, then pass its explicit receipt path to this installer. This backup product
+does not create, remove, or guess Qwen-owned cron jobs or paths.
 
 If exact Discord wording, examples, or chronology must be searchable, add a separate source-map entry for `**/raw/**/*.md`; the summary-only default intentionally does not index raw chat. Back up the LanceDB database, index state, configuration, metadata rules, and embedding cache as recovery assets because deterministic tags are stored on chunk rows inside the local database.

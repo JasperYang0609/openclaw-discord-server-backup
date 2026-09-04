@@ -27,7 +27,7 @@ class InstallerDesktopBackupTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def install(self, *extra: str, force: bool = False) -> subprocess.CompletedProcess[str]:
+    def install(self, *extra: str, force: bool = False, offline: bool = True) -> subprocess.CompletedProcess[str]:
         command = [
             sys.executable,
             str(INSTALLER),
@@ -37,6 +37,8 @@ class InstallerDesktopBackupTests(unittest.TestCase):
             str(self.desktop),
             *extra,
         ]
+        if offline:
+            command.append("--offline-scaffold")
         if force:
             command.append("--force")
         return subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
@@ -45,6 +47,7 @@ class InstallerDesktopBackupTests(unittest.TestCase):
         proc = self.install("--server-name", "  南方  ")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         result = json.loads(proc.stdout)
+        self.assertEqual(result["status"], "PARTIAL_MANUAL_ACTION")
         backup_root = self.desktop / "南方資料備份"
         discord_root = backup_root / "Discord資料"
 
@@ -97,6 +100,20 @@ class InstallerDesktopBackupTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
 
+    def test_identical_rerun_does_not_rewrite_config_state_or_queue(self):
+        first = self.install("--server-name", "南方")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        paths = [
+            self.workspace / "memory/openclaw_discord_backup_config.json",
+            self.workspace / "memory/channel_backup_summary_state.json",
+            self.workspace / "memory/channel_backup_backlog_queue.json",
+        ]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        second = self.install("--server-name", "南方", force=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        after = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        self.assertEqual(before, after)
+
     def test_unsafe_server_names_fail_before_writes(self):
         for name in ("", ".", "..", "a/b", "a\\b", "bad\x01name"):
             with self.subTest(name=repr(name)):
@@ -148,11 +165,76 @@ class InstallerDesktopBackupTests(unittest.TestCase):
         (memory / "openclaw_discord_backup_config.json").write_text(
             json.dumps(config), encoding="utf-8"
         )
-        proc = self.install("--server-name", "南方")
+        proc = self.install("--backup-root", str(self.desktop / "南方資料備份"))
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("migration is required", proc.stderr)
         self.assertFalse((self.desktop / "南方資料備份").exists())
         self.assertFalse((self.workspace / "skills").exists())
+
+    def test_ready_install_requires_explicit_customer_identity(self):
+        proc = self.install("--server-name", "南方", offline=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("guild-id", proc.stderr)
+
+    def test_legacy_frequency_root_is_preserved_on_upgrade(self):
+        legacy_customer_root = self.desktop / "舊客戶資料備份"
+        legacy_discord_root = legacy_customer_root / "頻道紀錄"
+        legacy_discord_root.mkdir(parents=True)
+        sentinel = legacy_discord_root / "raw.md"
+        sentinel.write_text("keep\n", encoding="utf-8")
+        memory = self.workspace / "memory"
+        memory.mkdir()
+        config = {
+            **json.loads(json.dumps({
+                "guildId": "CHANGE_ME",
+                "statePath": "memory/channel_backup_summary_state.json",
+                "queuePath": "memory/channel_backup_backlog_queue.json",
+                "reportChannel": "discord:channel:CHANGE_ME",
+                "timezone": "Asia/Taipei",
+            })),
+            "backupRoot": str(legacy_discord_root),
+        }
+        (memory / "openclaw_discord_backup_config.json").write_text(json.dumps(config), encoding="utf-8")
+        (memory / "channel_backup_summary_state.json").write_text(json.dumps({
+            "version": 3, "schema": "channel-backup-state-v3", "guildId": "CHANGE_ME",
+            "rootPath": str(legacy_discord_root), "queuePath": "memory/channel_backup_backlog_queue.json", "entries": {},
+        }), encoding="utf-8")
+        (memory / "channel_backup_backlog_queue.json").write_text(json.dumps({"version": 1, "items": []}), encoding="utf-8")
+
+        proc = self.install(offline=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(Path(result["discordDataRoot"]), legacy_discord_root)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_qwen_receipt_symlink_is_rejected_before_writes(self):
+        target = self.base / "qwen.json"
+        target.write_text("{}", encoding="utf-8")
+        link = self.base / "qwen-link.json"
+        link.symlink_to(target)
+        proc = self.install("--server-name", "南方", "--qwen-receipt", str(link))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("symlink", proc.stderr)
+        self.assertFalse((self.desktop / "南方資料備份").exists())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_broken_qwen_receipt_symlink_is_rejected(self):
+        link = self.base / "broken-qwen.json"
+        link.symlink_to(self.base / "missing.json")
+        proc = self.install("--server-name", "南方", "--qwen-receipt", str(link))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("symlink", proc.stderr)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_symlinked_config_parent_is_rejected(self):
+        external = self.base / "external-memory"
+        external.mkdir()
+        (self.workspace / "memory").symlink_to(external, target_is_directory=True)
+        proc = self.install("--server-name", "南方")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("symlink", proc.stderr)
+        self.assertEqual(list(external.iterdir()), [])
 
 
 if __name__ == "__main__":

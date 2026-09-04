@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Add a transactional, idempotent fresh-install/upgrade workflow for all 11 owned
+  jobs: complete-inventory and duplicate-key gates, disabled staging, isolated
+  command and shared-session canaries, enable-last commit, exact verification,
+  checksummed receipts, and receipt-backed rollback. Unknown jobs are never deleted;
+  allowlisted legacy adoption requires exact ID, fingerprint, role, schedule,
+  timezone, declaration key, and payload kind.
+- Verify rollback by reading the durable cron inventory back: every pre-change owned
+  and adopted contract must be restored, temporary declaration keys must be absent,
+  and pre-existing unknown jobs must remain unchanged. A CLI command that returns
+  success without changing state now fails closed as an incomplete rollback.
+- Replace per-job engineering chatter with private component receipts and one 07:05
+  Traditional Chinese health report. Wrong-date, stale, malformed, oversized,
+  wrong-owner/producer/declaration receipts and missing current-day Qwen evidence can
+  never render green; first weekly/monthly cycles remain explicitly pending.
+- Harden weekly pre-repair evidence with immutable exact SHA-256 inventories, and
+  require workspace/core snapshots to pass verify plus isolated restore canaries
+  before being trusted.
+
 - Serialize daily-sync cron slots through one custom session and require every slot to reload durable state/queue before candidate selection, preventing restart catch-up races and duplicate batch selection.
 - Add a deterministic daily-sync preflight gate that skips safely while another backup job holds the shared lock or today's inventory audit is missing/incomplete.
 - Freeze the audited report entry at a message-ID cutoff during weekly V4 reconciliation so progress cards belong to the next incremental scope instead of causing closeout drift.

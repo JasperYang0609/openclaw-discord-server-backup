@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
 import shutil
+import stat
+import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 
 HERE = Path(__file__).resolve().parent
@@ -44,17 +48,409 @@ CLASSIFICATIONS = {
     "unknown",
 }
 
+EVIDENCE_SCHEMA = "openclaw-weekly-raw-pre-repair-evidence.v1"
+
 
 def atomic_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp-weekly-v4")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    reject_any_symlink_components(path.parent)
+    if os.path.lexists(path) and path.is_symlink():
+        raise RuntimeError(f"managed JSON target may not be a symlink: {path}")
+    encoded = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp-weekly-v4", dir=path.parent
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
+def stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_nlink)
+
+
+def secure_copy_regular(source: Path, destination: Path) -> None:
+    """Copy one stable, unlinked regular file without following symlinks.
+
+    The source path is rebound to the opened inode after the copy. A rename,
+    replacement, write, truncation, or hard-link change during capture fails the
+    evidence transaction before publication.
+    """
+    reject_any_symlink_components(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    reject_any_symlink_components(destination.parent)
+    if os.path.lexists(destination):
+        raise RuntimeError(f"evidence destination already exists: {destination}")
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    temp_name: str | None = None
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise RuntimeError(f"evidence source must be a single-link regular file: {source}")
+        output_fd, temp_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".copy", dir=destination.parent
+        )
+        try:
+            os.fchmod(output_fd, 0o600)
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(output_fd, view)
+                    view = view[written:]
+            os.fsync(output_fd)
+        finally:
+            os.close(output_fd)
+        after = os.fstat(source_fd)
+        try:
+            rebound = os.lstat(source)
+        except OSError as exc:
+            raise RuntimeError(f"evidence source changed during copy: {source}") from exc
+        if stat_identity(before) != stat_identity(after) or stat_identity(after) != stat_identity(rebound):
+            raise RuntimeError(f"evidence source changed during copy: {source}")
+        os.replace(temp_name, destination)
+        temp_name = None
+        copied = destination.lstat()
+        if not stat.S_ISREG(copied.st_mode) or copied.st_nlink != 1:
+            raise RuntimeError(f"evidence copy is not a single-link regular file: {destination}")
+    finally:
+        os.close(source_fd)
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def safe_manifest_path(value: Any, *, field: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise RuntimeError(f"invalid evidence {field}")
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        raise RuntimeError(f"unsafe evidence {field}: {value}")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise RuntimeError(f"unsafe evidence {field}: {value}")
+    return path
+
+
+def reject_any_symlink_components(path: Path) -> None:
+    absolute = path.absolute()
+    parts = absolute.parts
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current = current / part
+        if current.exists() or current.is_symlink():
+            if current.is_symlink():
+                raise RuntimeError(f"symlinked managed path is not allowed: {current}")
+
+
+def reject_symlink_components(root: Path, path: Path) -> None:
+    root = root.absolute()
+    path = path.absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"path outside managed root: {path}") from exc
+    current = root
+    if current.is_symlink():
+        raise RuntimeError(f"symlinked managed root is not allowed: {root}")
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(f"symlink in managed path is not allowed: {current}")
+
+
+def copy_tree_exact(source: Path, destination: Path) -> None:
+    """Copy regular files and directories without following or accepting symlinks."""
+    if not source.exists():
+        destination.mkdir(parents=True, exist_ok=False)
+        return
+    if source.is_symlink() or not source.is_dir():
+        raise RuntimeError(f"raw evidence source must be a regular directory: {source}")
+    destination.mkdir(parents=True, exist_ok=False)
+    for current, dirnames, filenames in os.walk(source, followlinks=False):
+        current_path = Path(current)
+        relative = current_path.relative_to(source)
+        target_dir = destination / relative
+        for dirname in sorted(dirnames):
+            source_dir = current_path / dirname
+            if source_dir.is_symlink():
+                raise RuntimeError(f"symlink in raw evidence source: {source_dir}")
+            if not source_dir.is_dir():
+                raise RuntimeError(f"non-directory in raw evidence source: {source_dir}")
+            (target_dir / dirname).mkdir()
+        for filename in sorted(filenames):
+            source_file = current_path / filename
+            secure_copy_regular(source_file, target_dir / filename)
+
+
+def harden_read_only_tree(root: Path, *, harden_root: bool = True) -> None:
+    """Make a finalized evidence tree owner-readable but non-writable."""
+    for current, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for filename in filenames:
+            path = current_path / filename
+            file_stat = path.lstat()
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_nlink != 1
+            ):
+                raise RuntimeError(f"cannot harden non-regular evidence file: {path}")
+            path.chmod(0o400)
+        for dirname in dirnames:
+            path = current_path / dirname
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError(f"cannot harden invalid evidence directory: {path}")
+            path.chmod(0o500)
+    root.chmod(0o500 if harden_root else 0o700)
+
+
+def make_tree_writable_for_cleanup(root: Path) -> None:
+    if not root.exists() or root.is_symlink():
+        return
+    for current, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        current_path.chmod(0o700)
+        for filename in filenames:
+            path = current_path / filename
+            if not path.is_symlink():
+                path.chmod(0o600)
+        for dirname in dirnames:
+            path = current_path / dirname
+            if not path.is_symlink():
+                path.chmod(0o700)
+
+
+def inventory_evidence_tree(
+    bundle: Path, *, require_non_writable: bool = True
+) -> tuple[list[str], list[dict[str, Any]]]:
+    directories: list[str] = []
+    files: list[dict[str, Any]] = []
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise RuntimeError(f"evidence bundle must be a regular directory: {bundle}")
+    if require_non_writable and bundle.lstat().st_mode & 0o222:
+        raise RuntimeError(f"evidence bundle must be non-writable: {bundle}")
+    for current, dirnames, filenames in os.walk(bundle, followlinks=False):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(bundle)
+        if relative_dir != Path("."):
+            directories.append(relative_dir.as_posix())
+        if require_non_writable and current_path.lstat().st_mode & 0o222:
+            raise RuntimeError(f"evidence directory must be non-writable: {current_path}")
+        for dirname in dirnames:
+            path = current_path / dirname
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError(f"invalid evidence directory: {path}")
+        for filename in filenames:
+            path = current_path / filename
+            relative = path.relative_to(bundle).as_posix()
+            if relative == "evidence-manifest.json":
+                continue
+            file_stat = path.lstat()
+            mode = file_stat.st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or file_stat.st_nlink != 1:
+                raise RuntimeError(f"invalid evidence file: {path}")
+            if require_non_writable and mode & 0o222:
+                raise RuntimeError(f"evidence file must be non-writable: {path}")
+            files.append({
+                "path": relative,
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            })
+    directories.sort()
+    files.sort(key=lambda row: row["path"])
+    return directories, files
+
+
+def evidence_entry_dir(key: str) -> str:
+    encoded = quote(key, safe="")
+    if not encoded:
+        raise RuntimeError("empty entry key is not allowed in evidence")
+    return f"raw/{encoded}"
+
+
+def create_pre_repair_evidence(
+    recovery_root: Path,
+    state_path: Path,
+    queue_path: Path,
+    archive_root: Path,
+    entries: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Atomically create and immediately verify an immutable pre-repair bundle."""
+    recovery_root = recovery_root.absolute()
+    recovery_root.parent.mkdir(parents=True, exist_ok=True)
+    reject_any_symlink_components(recovery_root.parent)
+    reject_any_symlink_components(state_path)
+    if queue_path.exists() or queue_path.is_symlink():
+        reject_any_symlink_components(queue_path)
+    reject_any_symlink_components(archive_root)
+    if recovery_root.exists() or recovery_root.is_symlink():
+        raise FileExistsError(f"pre-repair evidence already exists: {recovery_root}")
+    stage = Path(tempfile.mkdtemp(prefix=f".{recovery_root.name}-stage-", dir=recovery_root.parent))
+    try:
+        for source, target_name in ((state_path, "state.json"), (queue_path, "queue.json")):
+            if not source.exists():
+                raise RuntimeError(f"required pre-repair evidence source is missing: {target_name}")
+            secure_copy_regular(source, stage / target_name)
+
+        manifest_entries: list[dict[str, str]] = []
+        seen_keys: set[str] = set()
+        seen_targets: set[str] = set()
+        for key, entry in entries:
+            if key in seen_keys:
+                raise RuntimeError(f"duplicate evidence entry key: {key}")
+            seen_keys.add(key)
+            relative_value = entry.get("relativePath") or key
+            if not isinstance(relative_value, str):
+                raise RuntimeError(f"invalid relativePath for evidence entry: {key}")
+            relative_path = relative_value
+            entry_dir = safe_entry_dir(archive_root, relative_path)
+            reject_symlink_components(archive_root, entry_dir)
+            source = entry_dir / "raw"
+            reject_symlink_components(archive_root, source)
+            bundle_path = evidence_entry_dir(key)
+            if bundle_path in seen_targets:
+                raise RuntimeError(f"duplicate evidence bundle path: {bundle_path}")
+            seen_targets.add(bundle_path)
+            copy_tree_exact(source, stage / Path(bundle_path))
+            manifest_entries.append({
+                "entryKey": key,
+                "sourceRelativePath": relative_path,
+                "bundleRawPath": bundle_path,
+            })
+
+        directories, files = inventory_evidence_tree(stage, require_non_writable=False)
+        manifest = {
+            "schema": EVIDENCE_SCHEMA,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "entries": manifest_entries,
+            "directories": directories,
+            "files": files,
+            "fileCount": len(files),
+            "bytes": sum(int(row["bytes"]) for row in files),
+        }
+        atomic_json(stage / "evidence-manifest.json", manifest)
+        # Keep only the staging directory itself writable long enough for an
+        # atomic rename on platforms that require it. The published directory
+        # is made non-writable before any verifier or repair can observe it.
+        harden_read_only_tree(stage, harden_root=False)
+        os.replace(stage, recovery_root)
+        recovery_root.chmod(0o500)
+        return verify_evidence_bundle(recovery_root)
+    except Exception:
+        make_tree_writable_for_cleanup(stage)
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def verify_evidence_bundle(recovery_root: Path) -> dict[str, Any]:
+    recovery_root = recovery_root.absolute()
+    reject_any_symlink_components(recovery_root)
+    if recovery_root.is_symlink() or not recovery_root.is_dir():
+        raise RuntimeError(f"evidence bundle is missing or symlinked: {recovery_root}")
+    manifest_path = recovery_root / "evidence-manifest.json"
+    manifest_stat = manifest_path.lstat() if manifest_path.exists() else None
+    mode = manifest_stat.st_mode if manifest_stat else 0
+    if (
+        stat.S_ISLNK(mode)
+        or not stat.S_ISREG(mode)
+        or manifest_stat is None
+        or manifest_stat.st_nlink != 1
+    ):
+        raise RuntimeError("evidence manifest is missing, symlinked, or non-regular")
+    if mode & 0o222:
+        raise RuntimeError("evidence manifest must be non-writable")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("evidence manifest is unreadable") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema") != EVIDENCE_SCHEMA:
+        raise RuntimeError("unsupported evidence manifest schema")
+    expected_dirs = manifest.get("directories")
+    expected_files = manifest.get("files")
+    expected_entries = manifest.get("entries")
+    if not isinstance(expected_dirs, list) or not isinstance(expected_files, list) or not isinstance(expected_entries, list):
+        raise RuntimeError("evidence manifest inventory is malformed")
+
+    normalized_dirs: list[str] = []
+    for value in expected_dirs:
+        normalized_dirs.append(safe_manifest_path(value, field="directory path").as_posix())
+    if len(normalized_dirs) != len(set(normalized_dirs)):
+        raise RuntimeError("duplicate directory in evidence manifest")
+
+    normalized_files: list[dict[str, Any]] = []
+    seen_files: set[str] = set()
+    for row in expected_files:
+        if not isinstance(row, dict):
+            raise RuntimeError("malformed evidence file row")
+        relative = safe_manifest_path(row.get("path"), field="file path").as_posix()
+        if relative == "evidence-manifest.json" or relative in seen_files:
+            raise RuntimeError(f"duplicate or reserved evidence file path: {relative}")
+        seen_files.add(relative)
+        if not isinstance(row.get("bytes"), int) or row["bytes"] < 0:
+            raise RuntimeError(f"invalid evidence byte count: {relative}")
+        digest = row.get("sha256")
+        if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise RuntimeError(f"invalid evidence digest: {relative}")
+        normalized_files.append({"path": relative, "bytes": row["bytes"], "sha256": digest})
+
+    entry_keys: set[str] = set()
+    entry_paths: set[str] = set()
+    for row in expected_entries:
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("entryKey"), str)
+            or not row["entryKey"]
+        ):
+            raise RuntimeError("malformed evidence entry row")
+        safe_manifest_path(row.get("sourceRelativePath"), field="entry source relativePath")
+        bundle_path = safe_manifest_path(row.get("bundleRawPath"), field="entry bundle path").as_posix()
+        if not bundle_path.startswith("raw/") or bundle_path not in normalized_dirs:
+            raise RuntimeError(f"invalid evidence entry bundle path: {bundle_path}")
+        if row["entryKey"] in entry_keys or bundle_path in entry_paths:
+            raise RuntimeError("duplicate evidence entry identity")
+        entry_keys.add(row["entryKey"])
+        entry_paths.add(bundle_path)
+
+    actual_dirs, actual_files = inventory_evidence_tree(recovery_root)
+    if sorted(normalized_dirs) != actual_dirs:
+        raise RuntimeError("evidence directory inventory mismatch")
+    if sorted(normalized_files, key=lambda row: row["path"]) != actual_files:
+        raise RuntimeError("evidence file inventory, size, or SHA-256 mismatch")
+    if manifest.get("fileCount") != len(actual_files):
+        raise RuntimeError("evidence fileCount mismatch")
+    if manifest.get("bytes") != sum(int(row["bytes"]) for row in actual_files):
+        raise RuntimeError("evidence byte total mismatch")
+    if "state.json" not in seen_files:
+        raise RuntimeError("evidence state copy is missing from manifest")
+    return manifest
 
 
 def safe_entry_dir(root: Path, relative_path: str) -> Path:
+    relative = safe_manifest_path(relative_path, field="archive relativePath")
     root_resolved = root.resolve()
-    candidate = (root / relative_path).resolve()
+    candidate = (root / Path(*relative.parts)).resolve()
     if candidate != root_resolved and root_resolved not in candidate.parents:
         raise RuntimeError(f"unsafe relativePath outside archive root: {relative_path}")
     return candidate
@@ -156,31 +552,6 @@ def scan(
     return rows, messages_by_key, raw_ids_by_key
 
 
-def ensure_recovery_copy(
-    recovery_root: Path,
-    state_path: Path,
-    queue_path: Path,
-    archive_root: Path,
-    key: str,
-    entry: dict[str, Any],
-    copied: set[str],
-) -> None:
-    recovery_root.mkdir(parents=True, exist_ok=True)
-    if not copied:
-        shutil.copy2(state_path, recovery_root / "state.json")
-        if queue_path.exists():
-            shutil.copy2(queue_path, recovery_root / "queue.json")
-    if key in copied:
-        return
-    source = safe_entry_dir(archive_root, str(entry.get("relativePath") or key)) / "raw"
-    destination = recovery_root / "raw" / key.replace("/", "__")
-    if source.exists():
-        shutil.copytree(source, destination, dirs_exist_ok=True)
-    else:
-        destination.mkdir(parents=True, exist_ok=True)
-    copied.add(key)
-
-
 def apply_missing(
     state: dict[str, Any],
     queue: dict[str, Any],
@@ -197,12 +568,30 @@ def apply_missing(
     appended = 0
     affected: list[str] = []
     now = datetime.now(timezone.utc).isoformat()
+    missing_by_key = {
+        key: [
+            message
+            for message in (messages_by_key.get(key) or [])
+            if str(message["id"]) not in raw_ids_by_key.get(key, set())
+        ]
+        for key, _entry in entries
+    }
+    if any(missing_by_key.values()):
+        if not copied:
+            create_pre_repair_evidence(
+                recovery_root, state_path, queue_path, root, entries
+            )
+            copied.update(key for key, _entry in entries)
+        else:
+            verify_evidence_bundle(recovery_root)
     for key, entry in entries:
         messages = messages_by_key.get(key) or []
-        missing = [message for message in messages if str(message["id"]) not in raw_ids_by_key.get(key, set())]
+        missing = missing_by_key[key]
         if not missing:
             continue
-        ensure_recovery_copy(recovery_root, state_path, queue_path, root, key, entry, copied)
+        # Verification immediately precedes every append. If evidence is missing,
+        # extra, symlinked, traversing, or changed, no repair write is attempted.
+        verify_evidence_bundle(recovery_root)
         worker.append_batch(root, entry, missing, f"weekly full-inventory repair {now}")
         latest = max((str(message["id"]) for message in messages), key=int)
         entry.update({
@@ -277,11 +666,15 @@ def classify_local_only(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run recovery-first weekly raw reconcile and full closeout.")
-    parser.add_argument("--state", required=True)
-    parser.add_argument("--queue", required=True)
-    parser.add_argument("--root", required=True)
-    parser.add_argument("--today", required=True)
-    parser.add_argument("--evidence-dir", required=True)
+    parser.add_argument("--state")
+    parser.add_argument("--queue")
+    parser.add_argument("--root")
+    parser.add_argument("--today")
+    parser.add_argument("--evidence-dir")
+    parser.add_argument(
+        "--verify-evidence",
+        help="Verify one immutable pre-repair bundle and exit without Discord or archive writes.",
+    )
     parser.add_argument("--openclaw-config", default=str(Path.home() / ".openclaw/openclaw.json"))
     parser.add_argument("--token-env", default="DISCORD_BOT_TOKEN")
     parser.add_argument("--page-limit", type=int, default=100)
@@ -289,6 +682,18 @@ def main() -> int:
     parser.add_argument("--report-entry-key")
     parser.add_argument("--compact", action="store_true")
     args = parser.parse_args()
+    if args.verify_evidence:
+        manifest = verify_evidence_bundle(Path(args.verify_evidence))
+        print(json.dumps({
+            "ok": True,
+            "schema": manifest["schema"],
+            "fileCount": manifest["fileCount"],
+            "bytes": manifest["bytes"],
+        }, ensure_ascii=False, indent=2))
+        return 0
+    for field in ("state", "queue", "root", "today", "evidence_dir"):
+        if getattr(args, field) is None:
+            parser.error(f"--{field.replace('_', '-')} is required unless --verify-evidence is used")
     if not 1 <= args.page_limit <= 100:
         parser.error("--page-limit must be between 1 and 100")
     if not 1 <= args.max_closeout_passes <= 10:

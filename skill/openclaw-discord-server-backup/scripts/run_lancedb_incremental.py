@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,18 @@ def resolve_path(base: Path, value: str) -> Path:
     if not p.is_absolute():
         p = base / p
     return p.resolve()
+
+
+def command_argv(value: Any) -> list[str]:
+    if isinstance(value, str):
+        argv = shlex.split(value)
+    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        argv = list(value)
+    else:
+        raise ValueError("lancedb.incrementalCommand must be a string or string array")
+    if not argv or any(not item for item in argv):
+        raise ValueError("lancedb.incrementalCommand must not be empty")
+    return argv
 
 
 def main() -> int:
@@ -34,14 +47,14 @@ def main() -> int:
         return 0
 
     project = resolve_path(workspace, lancedb.get("projectPath", "knowledge-lancedb"))
-    command = lancedb.get("incrementalCommand") or "npm run incremental"
+    command = command_argv(lancedb.get("incrementalCommand") or ["npm", "run", "incremental"])
     report = resolve_path(workspace, lancedb.get("latestManifest", "knowledge-lancedb/reports/incremental-manifest.latest.json"))
 
     if args.dry_run:
         print(json.dumps({"ok": True, "dryRun": True, "projectPath": str(project), "command": command, "latestManifest": str(report)}, ensure_ascii=False, indent=2))
         return 0
 
-    proc = subprocess.run(command, cwd=project, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    proc = subprocess.run(command, cwd=project, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     manifest = None
     if report.exists():
         try:

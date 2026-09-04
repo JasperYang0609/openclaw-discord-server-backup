@@ -13,7 +13,8 @@ This repo ships the merged customer version of a two-layer design:
   (`run_backlog_worker_v3.py`, `migrate_state_v3.py`, `select_backlog_candidates.py`,
   `audit_caught_up_v3.py`, `bootstrap_state.py`, `core_workspace_backup.py`) plus the prompt templates under
   `prompts/`. All state/queue transitions are defined here and only here.
-- Install layer: `scripts/install.py`, `scripts/init_config.py`, `examples/`, and any
+- Install layer: `scripts/install.py`, `scripts/manage_cron_topology.py`, the owned
+  manifest, `examples/`, and any
   rendered cron prompts. Install materials must be derived from the engine prompts and
   scripts. Never hand-copy or fork engine logic into install materials; when the engine
   changes, regenerate the install side from it.
@@ -26,20 +27,22 @@ A channel/thread is caught up only when `read after=<lastWrittenMessageId>` retu
 
 ## Standard workflow
 
-0. Core workspace backup runs `scripts/core_workspace_backup.py`: it stages and manifest-verifies `核心文件/latest/`, preserves one immutable daily snapshot, and supports an isolated restore canary for root-level Markdown files plus `memory/`. Use `prompts/core-backup.md`; never hardcode customer filenames or reimplement copy logic in a prompt.
-1. Discovery registers channels/threads and creates folders. It does not read message content.
-2. Daily sync processes only healthy entries in small batches.
+0. At 05:10, core workspace backup stages and manifest-verifies `核心文件/latest/`, preserves one immutable daily snapshot, and runs isolated restore canaries for latest and today's snapshot.
+1. At 05:25, deterministic discovery registers the complete channel/thread inventory and creates folders. It does not read message content.
+2. At 05:30, 05:40, and 05:50, daily sync runs in one shared persistent session and processes only healthy entries after the lock/inventory gate passes.
 3. If daily sync hits a page/message limit, it writes what it has, advances cursor only to written raw data, marks the entry partial, and enqueues backlog.
 4. Backlog worker processes queue-first using deterministic scripts and emits `auditWarnings` for stuck active catch-ups (`attempts > 5` on active queue items, `consecutiveErrors > 3` on entries). Schedule routine runs only at `10 0,1,2,3,4,23 * * *` in the customer timezone: 23:10 and 00:10–04:10. Do not add daytime runs; carry unfinished queue debt to the next night without increasing the bounded worker limits.
-5. Audit probes every registered entry and requeues false-healthy entries.
-6. Optional LanceDB indexing runs after backup so summaries/raw outputs become searchable knowledge.
+5. At 06:10, audit probes every registered entry and requeues false-healthy entries.
+6. At 07:05, one health job refreshes topology evidence and publishes one plain-language report; routine technical jobs remain silent.
+7. Sunday inventory/raw jobs create immutable pre-repair evidence, and the monthly workspace snapshot runs verify plus restore-canary before becoming trusted.
+8. Optional local knowledge indexing remains a separately owned product and is trusted only through an explicit current-day receipt.
 
 ## Scripts
 
 Use scripts for fragile operations. Do not manually invent state transitions.
 
 - `scripts/core_workspace_backup.py`: deterministic core backup, exact manifest verification, and temporary restore canary.
-- `scripts/install.py`: install/copy the skill; for fresh macOS installs, require the
+- `scripts/install.py`: transactionally install/upgrade the skill and its complete owned cron topology; for fresh macOS installs, require the
   Discord server display name and create the real Desktop root
   `<伺服器名稱>資料備份/Discord資料`, with matching absolute config/state paths.
 - `scripts/bootstrap_state.py`: create/update entries from discovery inventory.
@@ -56,6 +59,9 @@ Use scripts for fragile operations. Do not manually invent state transitions.
 - `scripts/package_skill.py`: build `.skill` artifact.
 - `scripts/run_lancedb_incremental.py`: run optional LanceDB incremental indexing after backup.
 - `scripts/backup_workspace_assets.py`: checksummed, explicit-scope snapshots for recovery-critical workspace folders and local knowledge indexes.
+- `scripts/manage_cron_topology.py`: validate, plan, apply, verify, and receipt-roll back the complete owned cron topology.
+- `scripts/run_managed_component.py`: execute deterministic command roles and write private health receipts.
+- `scripts/backup_health_report.py`: validate trusted current-period receipts and render one human-readable daily report.
 
 ## References
 
@@ -84,8 +90,8 @@ Use plain explicit instructions, fixed status/reason enums, exact commands, and 
 
 For customers who need searchable project memory, install `openclaw-lancedb-knowledge` first, then install this backup skill. This backup skill can call the existing LanceDB incremental index after backup jobs finish.
 
-Keep core backup, discovery, daily sync, audit, and LanceDB outside the backlog
-window. The default 23:10–04:10 window ends before the 05:15 daily pipeline and is
+Keep core backup, discovery, daily sync, audit, health reporting, and local indexing outside the backlog
+window. The default 23:10–04:10 window ends before the 05:10 daily pipeline and is
 the production topology unless the customer explicitly approves another low-traffic
 window. Manual incident runs remain bounded and do not change the recurring cron.
 
@@ -99,3 +105,12 @@ window. Manual incident runs remain bounded and do not change the recurring cron
 - A supplied `--backup-root` wins and prevents a second Desktop root.
 - Never move an existing configured root automatically. Report that migration is
   required and leave customer data unchanged.
+
+## Installer ownership and reporting rules
+
+- Normal installs must run `install.py` with valid guild, report target, agent, and timezone. Do not hand-create cron jobs.
+- Exact identical reruns are no-ops. A changed install is staged disabled, canary-tested, enabled as a complete set, and exactly verified.
+- Unknown or look-alike jobs are never deleted. Legacy adoption is opt-in and requires exact job ID, fingerprint, role, schedule, timezone, and kind.
+- Every real failure alerts after one error; safe lock skips are recorded as delayed work, not job failures.
+- Technical jobs use `delivery=none`. Only the 07:05 health report announces.
+- A missing, stale, wrong-owner, wrong-producer, malformed, oversized, or wrong-date receipt can never produce a green report.
