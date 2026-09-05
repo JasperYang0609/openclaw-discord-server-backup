@@ -289,6 +289,23 @@ def test_following_empty_page_is_terminal_and_caps_are_honored():
     assert terminal is True and requests == 2
 
 
+def test_short_nonempty_page_is_not_terminal_until_explicit_empty():
+    pages = [[message("101")], []]
+
+    def fetch(_token, _channel, *, after, limit, rate_limit_budget):
+        assert rate_limit_budget is budget
+        return pages.pop(0)
+
+    budget = {"waited": 0.0}
+    rows, terminal, requests = daily.fetch_new_messages(
+        fetch, "token", CHANNEL, "100", page_size=2, max_pages=2,
+        max_messages=4, remaining_messages=4, rate_limit_budget=budget,
+    )
+    assert [row["id"] for row in rows] == ["101"]
+    assert terminal is True
+    assert requests == 2
+
+
 def test_mutable_window_filters_to_canonical_ids():
     plan = daily.MutableRefreshPlan("20", "20", False)
 
@@ -580,7 +597,7 @@ def test_verified_empty_head_read_detects_first_message_on_next_day():
     )
     assert first == [] and first_complete is True and first_requests == 1
     assert [row["id"] for row in second] == ["101"]
-    assert second_complete is True and second_requests == 1
+    assert second_complete is False and second_requests == 1
 
 
 def test_verified_empty_head_exact_limit_is_not_complete():
@@ -644,6 +661,9 @@ def test_merge_readback_contract_binds_raw_source_current_and_operation_context(
     )
     ids = ["10", "20"]
     raw_hashes = {message_id: "d" * 64 for message_id in ids}
+    pre_current = current_snapshot(["5"])
+    pre_current["generationId"] = "generation-before"
+    pre_current["generationSha256"] = "e" * 64
     commit = {
         "schemaVersion": daily.MERGE_COMMIT_SCHEMA,
         "entryBindingSha256": entry["entryBindingSha256"],
@@ -669,6 +689,10 @@ def test_merge_readback_contract_binds_raw_source_current_and_operation_context(
         current_snapshot(ids),
         entry_binding=entry,
         expected_raw_sha256_by_id=raw_hashes,
+        expected_pre_current=pre_current,
+        expected_run_context_id="run-context-20260905",
+        expected_lock_receipt_sha256="f" * 64,
+        expected_budget_receipt_sha256="1" * 64,
         inventory_digest=binding()["inventoryDigest"],
         inventory_observed_at=binding()["observedAt"],
         verified_cutoff="2026-09-05T00:00:00+00:00",
@@ -683,6 +707,10 @@ def test_merge_readback_contract_binds_raw_source_current_and_operation_context(
             current_snapshot(ids),
             entry_binding=entry,
             expected_raw_sha256_by_id=raw_hashes,
+            expected_pre_current=pre_current,
+            expected_run_context_id="run-context-20260905",
+            expected_lock_receipt_sha256="f" * 64,
+            expected_budget_receipt_sha256="1" * 64,
             inventory_digest=binding()["inventoryDigest"],
             inventory_observed_at=binding()["observedAt"],
             verified_cutoff="2026-09-05T00:00:00+00:00",
@@ -696,10 +724,39 @@ def test_merge_readback_contract_binds_raw_source_current_and_operation_context(
             stale_current,
             entry_binding=entry,
             expected_raw_sha256_by_id=raw_hashes,
+            expected_pre_current=pre_current,
+            expected_run_context_id="run-context-20260905",
+            expected_lock_receipt_sha256="f" * 64,
+            expected_budget_receipt_sha256="1" * 64,
             inventory_digest=binding()["inventoryDigest"],
             inventory_observed_at=binding()["observedAt"],
             verified_cutoff="2026-09-05T00:00:00+00:00",
         )
+
+    forged_fields = {
+        "preCurrentGenerationId": "forged-generation",
+        "preCurrentGenerationSha256": "2" * 64,
+        "runContextId": "forged-run-context",
+        "lockReceiptSha256": "3" * 64,
+        "budgetReceiptSha256": "4" * 64,
+    }
+    for field, forged_value in forged_fields.items():
+        forged = dict(commit)
+        forged[field] = forged_value
+        with pytest.raises(daily.DailySyncError, match="rich_archive_readback_failed"):
+            daily.validate_merge_readback(
+                forged,
+                current_snapshot(ids),
+                entry_binding=entry,
+                expected_raw_sha256_by_id=raw_hashes,
+                expected_pre_current=pre_current,
+                expected_run_context_id="run-context-20260905",
+                expected_lock_receipt_sha256="f" * 64,
+                expected_budget_receipt_sha256="1" * 64,
+                inventory_digest=binding()["inventoryDigest"],
+                inventory_observed_at=binding()["observedAt"],
+                verified_cutoff="2026-09-05T00:00:00+00:00",
+            )
 
 
 def test_error_reason_constructor_never_exposes_arbitrary_text():

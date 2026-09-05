@@ -713,6 +713,10 @@ def validate_merge_readback(
     *,
     entry_binding: Mapping[str, Any],
     expected_raw_sha256_by_id: Mapping[str, str],
+    expected_pre_current: Mapping[str, Any],
+    expected_run_context_id: str,
+    expected_lock_receipt_sha256: str,
+    expected_budget_receipt_sha256: str,
     inventory_digest: str,
     inventory_observed_at: str,
     verified_cutoff: str,
@@ -724,6 +728,15 @@ def validate_merge_readback(
     digests fail closed before any caller may advance canonical state.
     """
     if not isinstance(commit, Mapping) or set(commit) != MERGE_COMMIT_KEYS:
+        raise DailySyncError("rich_archive_readback_failed")
+    pre_current = validate_current_snapshot(expected_pre_current, entry_binding)
+    if (
+        not _safe_receipt_identifier(expected_run_context_id)
+        or not isinstance(expected_lock_receipt_sha256, str)
+        or not HASH_RE.fullmatch(expected_lock_receipt_sha256)
+        or not isinstance(expected_budget_receipt_sha256, str)
+        or not HASH_RE.fullmatch(expected_budget_receipt_sha256)
+    ):
         raise DailySyncError("rich_archive_readback_failed")
     fetched_ids = commit.get("fetchedMessageIds")
     if not isinstance(fetched_ids, list):
@@ -765,9 +778,13 @@ def validate_merge_readback(
         or commit.get("inventoryDigest") != inventory_digest
         or commit.get("inventoryObservedAt") != inventory_observed_at
         or commit.get("verifiedCutoff") != verified_cutoff
-        or not _safe_receipt_identifier(commit.get("preCurrentGenerationId"))
+        or commit.get("preCurrentGenerationId") != pre_current["generationId"]
+        or commit.get("preCurrentGenerationSha256")
+        != pre_current["generationSha256"]
         or not _safe_receipt_identifier(commit.get("committedGenerationId"))
-        or not _safe_receipt_identifier(commit.get("runContextId"))
+        or commit.get("runContextId") != expected_run_context_id
+        or commit.get("lockReceiptSha256") != expected_lock_receipt_sha256
+        or commit.get("budgetReceiptSha256") != expected_budget_receipt_sha256
         or any(
             not isinstance(commit.get(key), str)
             or not HASH_RE.fullmatch(commit[key])
@@ -1089,9 +1106,6 @@ def fetch_new_messages(
             raise DailySyncError("discord_duplicate_conflict")
         rows = combined
         after = str(rows[-1]["id"])
-        if len(page) < budget:
-            terminal = True
-            break
     return rows, terminal, requests
 
 
@@ -1127,9 +1141,9 @@ def fetch_verified_empty_head(
 ) -> tuple[list[dict[str, Any]], bool, int]:
     """Bounded first-message probe authorized only by a verified empty CURRENT.
 
-    Discord's cursor-less endpoint returns a bounded head page.  A page exactly
-    equal to the cap is deliberately incomplete because older messages may
-    exist; fewer rows (including zero) prove this bounded bootstrap is complete.
+    Discord's cursor-less endpoint returns a bounded head page.  Only an
+    explicit empty response proves completion; a non-empty response is retained
+    but remains partial regardless of its length.
     """
     current = validate_quiet_current(snapshot, entry_binding, cursor=None)
     if current["verifiedEmpty"] is not True or current["canonicalMessageIds"]:
@@ -1148,7 +1162,7 @@ def fetch_verified_empty_head(
         str(row.get("channel_id") or channel_id) != channel_id for row in rows
     ):
         raise DailySyncError("discord_response_invalid")
-    return rows, len(rows) < limit, 1
+    return rows, not rows, 1
 
 
 def load_discord_token(config_path: Path, env_name: str) -> str:
