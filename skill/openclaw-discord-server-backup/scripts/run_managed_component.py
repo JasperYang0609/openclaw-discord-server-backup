@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 ROLES = {
-    "core-backup", "discovery", "caught-up-audit", "backlog",
+    "core-backup", "discovery", "daily-sync-1", "daily-sync-2", "daily-sync-3",
+    "caught-up-audit", "backlog",
     "weekly-inventory", "weekly-raw", "workspace-snapshot", "health-report",
 }
 
@@ -83,6 +84,17 @@ def safe_stamp() -> str:
     return datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f%z")
 
 
+def bounded_config_int(value: Any, *, default: int, maximum: int, label: str) -> int:
+    candidate = default if value is None else value
+    if (
+        isinstance(candidate, bool)
+        or not isinstance(candidate, int)
+        or not 1 <= candidate <= maximum
+    ):
+        raise RuntimeError(f"{label} is outside the reviewed bound")
+    return candidate
+
+
 def command_for(
     role: str,
     *,
@@ -127,6 +139,40 @@ def command_for(
     if role == "weekly-inventory":
         weekly_dir = receipt_dir / "reports" / "weekly" / today
         return [[*base_inventory, "--out", str(weekly_dir / "inventory.json"), "--mapping-ledger-out", str(weekly_dir / "mapping.json")]]
+    if role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}:
+        limits = config.get("limits") if isinstance(config.get("limits"), dict) else {}
+        max_entries = bounded_config_int(
+            limits.get("dailyEntryLimit"), default=6, maximum=6,
+            label="daily entry limit",
+        )
+        max_messages = bounded_config_int(
+            limits.get("dailyMessageLimit"), default=60, maximum=60,
+            label="daily message limit",
+        )
+        mutable_limit = bounded_config_int(
+            limits.get("dailyMutableRefreshLimit"), default=10, maximum=30,
+            label="daily mutable refresh limit",
+        )
+        return [[
+            python, str(HERE / "run_daily_sync_v3.py"),
+            "--role", role,
+            "--state", str(state),
+            "--queue", str(queue),
+            "--root", str(discord_root),
+            "--inventory", str(inventory),
+            "--mapping-ledger", str(mapping),
+            "--guild-id", str(config["guildId"]),
+            "--today", today,
+            "--timezone", str(config.get("timezone") or "Asia/Taipei"),
+            "--openclaw-config", str(openclaw_config),
+            "--max-entries", str(max_entries),
+            "--max-write-entries", "4",
+            "--page-size", "30",
+            "--max-pages-per-entry", "2",
+            "--max-messages-per-entry", str(max_messages),
+            "--max-read-messages", "180",
+            "--mutable-refresh-limit", str(mutable_limit),
+        ]]
     if role == "caught-up-audit":
         return [[
             python, str(HERE / "audit_caught_up_v3.py"), "--state", str(state),
@@ -213,6 +259,9 @@ def success_summary(role: str, metrics: dict[str, Any]) -> tuple[str, str, list[
         return "ok", "核心文件已完成備份與還原驗證", []
     if role == "discovery":
         return "ok", "頻道與討論串完整清單已更新", []
+    if role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}:
+        pending = ["本輪達到安全上限，已交由 rich queue 從驗證游標續做"] if int(metrics.get("queued", 0)) else []
+        return ("pending" if pending else "ok"), (pending[0] if pending else "本輪日常同步已完成"), pending
     if role == "caught-up-audit":
         pending = ["尚有頻道待追趕"] if int(metrics.get("activeQueue", 0)) else []
         return ("pending" if pending else "ok"), ("尚有頻道待追趕" if pending else "追平稽核通過"), pending
@@ -287,7 +336,11 @@ def run_role(args: argparse.Namespace) -> int:
         }]
     health.write_component(
         receipt_dir, args.role, status, summary, args.declaration_key,
-        producer="openclaw-discord-server-backup/run-managed-component.v1",
+        producer=(
+            "openclaw-discord-server-backup/daily-sync-v2"
+            if args.role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}
+            else "openclaw-discord-server-backup/run-managed-component.v1"
+        ),
         checks=[{
             "key": "command_exit",
             "status": "warning" if safe_skip else ("ok" if returncode == 0 else "error"),

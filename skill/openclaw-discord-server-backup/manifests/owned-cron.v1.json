@@ -38,35 +38,41 @@
     {
       "role": "daily-sync-1",
       "name": "Discord 備份｜日常同步 1/3",
-      "description": "Bounded daily sync slot using the shared serialized session and fail-closed gate.",
+      "description": "Bounded deterministic rich-archive sync using the shared backup ownership contract.",
       "schedule": "30 5 * * *",
-      "kind": "agent",
-      "promptFile": "prompts/daily-sync-v3.md",
+      "kind": "command",
+      "runnerRole": "daily-sync-1",
       "timeoutSeconds": 1500,
+      "noOutputTimeoutSeconds": 300,
+      "outputMaxBytes": 65536,
       "delivery": "none",
-      "sharedSession": "daily-sync"
+      "sharedLock": "state-parent-channel-backup"
     },
     {
       "role": "daily-sync-2",
       "name": "Discord 備份｜日常同步 2/3",
-      "description": "Bounded daily sync slot using the shared serialized session and fail-closed gate.",
+      "description": "Bounded deterministic rich-archive sync using the shared backup ownership contract.",
       "schedule": "40 5 * * *",
-      "kind": "agent",
-      "promptFile": "prompts/daily-sync-v3.md",
+      "kind": "command",
+      "runnerRole": "daily-sync-2",
       "timeoutSeconds": 1500,
+      "noOutputTimeoutSeconds": 300,
+      "outputMaxBytes": 65536,
       "delivery": "none",
-      "sharedSession": "daily-sync"
+      "sharedLock": "state-parent-channel-backup"
     },
     {
       "role": "daily-sync-3",
       "name": "Discord 備份｜日常同步 3/3",
-      "description": "Bounded daily sync slot using the shared serialized session and fail-closed gate.",
+      "description": "Bounded deterministic rich-archive sync using the shared backup ownership contract.",
       "schedule": "50 5 * * *",
-      "kind": "agent",
-      "promptFile": "prompts/daily-sync-v3.md",
+      "kind": "command",
+      "runnerRole": "daily-sync-3",
       "timeoutSeconds": 1500,
+      "noOutputTimeoutSeconds": 300,
+      "outputMaxBytes": 65536,
       "delivery": "none",
-      "sharedSession": "daily-sync"
+      "sharedLock": "state-parent-channel-backup"
     },
     {
       "role": "caught-up-audit",

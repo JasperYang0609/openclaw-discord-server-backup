@@ -38,7 +38,7 @@ LOCAL_PRODUCERS = {
         "core-backup", "discovery", "caught-up-audit", "backlog",
         "weekly-inventory", "weekly-raw", "workspace-snapshot",
     )},
-    **{f"daily-sync-{index}": {"openclaw-discord-server-backup/daily-sync-v1"} for index in (1, 2, 3)},
+    **{f"daily-sync-{index}": {"openclaw-discord-server-backup/daily-sync-v2"} for index in (1, 2, 3)},
     "cron-topology": {
         "openclaw-discord-server-backup/cron-manager.v1",
         "openclaw-discord-server-backup/health-topology-verify.v1",

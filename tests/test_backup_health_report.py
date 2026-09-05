@@ -22,7 +22,7 @@ NOW = datetime.fromisoformat("2026-09-04T07:05:00+08:00")
 
 def write_ok(receipt_dir: Path, component: str, *, checked_at: datetime = NOW):
     producer = (
-        "openclaw-discord-server-backup/daily-sync-v1" if component.startswith("daily-sync-")
+        "openclaw-discord-server-backup/daily-sync-v2" if component.startswith("daily-sync-")
         else "openclaw-discord-server-backup/cron-manager.v1" if component == "cron-topology"
         else "openclaw-discord-server-backup/run-managed-component.v1"
     )
@@ -84,7 +84,7 @@ def test_all_three_lock_skips_without_later_audit_are_never_green(tmp_path):
         health.write_component(
             tmp_path, f"daily-sync-{index}", "warning", "本輪已安全略過",
             f"openclaw-discord-server-backup:123456789012345678:daily-sync-{index}:v1",
-            producer="openclaw-discord-server-backup/daily-sync-v1",
+            producer="openclaw-discord-server-backup/daily-sync-v2",
             anomalies=[{
                 "code": "backup_lock_busy", "summary": "本輪已安全略過",
                 "impact": "新訊息備份延後", "dataLoss": "no", "repairStatus": "等待續做",

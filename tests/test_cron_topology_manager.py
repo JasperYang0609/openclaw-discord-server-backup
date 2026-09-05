@@ -95,8 +95,8 @@ class FakeClient:
     def canary(self, workspace):
         self.events.append(("canary",))
 
-    def persistent_session_canary(self, workspace, target, agent):
-        self.events.append(("persistent", target, agent))
+    def daily_lock_canary(self, workspace, lock_path):
+        self.events.append(("daily-lock", str(lock_path)))
 
 
 class MutateThenFailClient(FakeClient):
@@ -156,7 +156,20 @@ def with_ids(desired):
     return rows
 
 
-def test_manifest_contract_and_rendered_prompts(tmp_path):
+def legacy_daily_agent(expected):
+    row = copy.deepcopy(expected)
+    row["sessionTarget"] = "session:legacy-discord-daily-sync"
+    row["agentId"] = "main"
+    row["payload"] = {
+        "kind": "agentTurn",
+        "message": "run prompts/daily-sync-v3.md with check_daily_sync_gate.py",
+        "timeoutSeconds": expected["payload"]["timeoutSeconds"],
+        "lightContext": True,
+    }
+    return row
+
+
+def test_manifest_contract_and_rendered_commands(tmp_path):
     desired, _ = render(tmp_path)
     by_role = {row["role"]: row for row in desired}
     assert len(desired) == 11
@@ -165,12 +178,11 @@ def test_manifest_contract_and_rendered_prompts(tmp_path):
     assert by_role["workspace-snapshot"]["schedule"]["expr"] == "0 7 1 * *"
     assert by_role["health-report"]["schedule"]["expr"] == "5 7 * * *"
     daily = [by_role[f"daily-sync-{index}"] for index in (1, 2, 3)]
-    assert len({row["sessionTarget"] for row in daily}) == 1
-    assert daily[0]["sessionTarget"].startswith("session:")
+    assert {row["sessionTarget"] for row in daily} == {"isolated"}
     for row in daily:
-        assert "{{" not in row["payload"]["message"]
-        assert row["declarationKey"] in row["payload"]["message"]
-        assert "check_daily_sync_gate.py" in row["payload"]["message"]
+        assert row["payload"]["kind"] == "command"
+        assert "run_managed_component.py" in row["payload"]["argv"][1]
+        assert row["role"] == row["payload"]["argv"][row["payload"]["argv"].index("--role") + 1]
     assert all(row["failureAlert"]["after"] == 1 and not row["failureAlert"]["includeSkipped"] for row in desired)
     assert [row["role"] for row in desired if row["delivery"]["mode"] == "announce"] == ["health-report"]
 
@@ -221,7 +233,7 @@ def test_allowlisted_keyed_adoption_requires_exact_id_and_fingerprint(tmp_path):
 def test_daily_adoption_rejects_a_swapped_slot(tmp_path):
     desired, context = render(tmp_path)
     expected = next(row for row in desired if row["role"] == "daily-sync-1")
-    legacy = copy.deepcopy(expected)
+    legacy = legacy_daily_agent(expected)
     legacy.pop("declarationKey")
     legacy["id"] = "legacy-sync-two"
     legacy["schedule"]["expr"] = "40 5 * * *"
@@ -278,10 +290,17 @@ def test_fresh_transaction_enables_only_after_canaries(tmp_path):
     assert len(client.jobs) == len(desired)
     assert all(row["enabled"] for row in client.jobs)
     canary_index = client.events.index(("canary",))
-    persistent_index = next(index for index, event in enumerate(client.events) if event[0] == "persistent")
+    lock_index = next(index for index, event in enumerate(client.events) if event[0] == "daily-lock")
     enable_indices = [index for index, event in enumerate(client.events) if event[0] == "enabled" and event[2] is True]
-    assert enable_indices and min(enable_indices) > max(canary_index, persistent_index)
+    assert enable_indices and min(enable_indices) > max(canary_index, lock_index)
     assert manager.verify_receipt(Path(result["transaction"]))
+
+
+def test_daily_lock_canary_proves_non_overlapping_processes(tmp_path):
+    workspace = tmp_path / "workspace"
+    (workspace / "memory").mkdir(parents=True)
+    client = manager.OpenClawCronClient("unused-for-local-lock-canary")
+    client.daily_lock_canary(workspace, workspace / "memory/.channel_backup.lock")
 
 
 def test_noop_does_not_mutate_or_run_canary(tmp_path):
@@ -467,7 +486,7 @@ def test_existing_owned_jobs_are_all_disabled_before_first_mutation(tmp_path):
     assert {event[1] for event in disabled_before} == {row["id"] for row in current}
 
 
-def test_cron_add_uses_persistent_session_target_for_agent(tmp_path):
+def test_cron_add_uses_isolated_session_target_for_daily_command(tmp_path):
     desired, _ = render(tmp_path)
     row = next(item for item in desired if item["role"] == "daily-sync-1")
     args = manager.cron_add_args(row, disabled=True)
@@ -491,8 +510,7 @@ def test_command_post_add_never_sends_unsupported_tools_patch(tmp_path, monkeypa
 
 
 def test_agent_post_add_still_clears_legacy_tools_policy(tmp_path, monkeypatch):
-    desired, _ = render(tmp_path)
-    row = next(item for item in desired if item["payload"]["kind"] == "agentTurn")
+    row = {"payload": {"kind": "agentTurn"}}
     client = manager.OpenClawCronClient("openclaw")
     calls = []
     monkeypatch.setattr(client, "run", lambda args, **_kwargs: calls.append(list(args)))
@@ -504,9 +522,7 @@ def test_agent_post_add_still_clears_legacy_tools_policy(tmp_path, monkeypatch):
 
 
 def test_agent_post_add_can_restore_tools_policy(tmp_path, monkeypatch):
-    desired, _ = render(tmp_path)
-    row = next(item for item in desired if item["payload"]["kind"] == "agentTurn")
-    row["payload"]["toolsAllow"] = ["message", "exec"]
+    row = {"payload": {"kind": "agentTurn", "toolsAllow": ["message", "exec"]}}
     client = manager.OpenClawCronClient("openclaw")
     calls = []
     monkeypatch.setattr(client, "run", lambda args, **_kwargs: calls.append(list(args)))
@@ -670,7 +686,9 @@ def test_unrestorable_env_blocks_before_any_mutation(tmp_path):
 def test_tools_allow_is_restored_exactly_after_failed_upgrade(tmp_path, monkeypatch):
     desired, context = render(tmp_path)
     current = with_ids(desired)
-    agent = next(row for row in current if row["role"] == "daily-sync-1")
+    agent_index = next(index for index, row in enumerate(current) if row["role"] == "daily-sync-1")
+    agent = legacy_daily_agent(current[agent_index])
+    current[agent_index] = agent
     agent["payload"]["toolsAllow"] = ["message", "exec"]
     client = FakeClient(current)
     monkeypatch.setattr(

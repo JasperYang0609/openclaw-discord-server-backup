@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skill/openclaw-discord-server-backup"
@@ -130,6 +132,55 @@ def test_runtime_config_cannot_redirect_python_or_openclaw_executables(tmp_path)
     assert "/tmp/untrusted-openclaw" not in flattened
 
 
+def test_daily_role_builds_bounded_deterministic_command(tmp_path):
+    args, workspace, customer = make_args(tmp_path, "daily-sync-2")
+    config_path = workspace / "memory/config.json"
+    config = runner.read_config(config_path)
+    commands = runner.command_for(
+        args.role, workspace=workspace, config_path=config_path, config=config,
+        backup_root=customer, receipt_dir=workspace / "memory/health",
+        today="2026-09-05",
+    )
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert command[1].endswith("run_daily_sync_v3.py")
+    assert command[command.index("--role") + 1] == "daily-sync-2"
+    assert command[command.index("--mapping-ledger") + 1].endswith("inventory-mapping.json")
+    assert command[command.index("--guild-id") + 1] == config["guildId"]
+    assert command[command.index("--max-entries") + 1] == "6"
+    assert command[command.index("--max-write-entries") + 1] == "4"
+    assert command[command.index("--max-read-messages") + 1] == "180"
+
+
+def test_daily_role_rejects_runtime_bounds_above_reviewed_caps(tmp_path):
+    args, workspace, customer = make_args(tmp_path, "daily-sync-1")
+    config_path = workspace / "memory/config.json"
+    config = runner.read_config(config_path)
+    config["limits"] = {"dailyEntryLimit": 7}
+
+    with pytest.raises(RuntimeError, match="outside the reviewed bound"):
+        runner.command_for(
+            args.role, workspace=workspace, config_path=config_path, config=config,
+            backup_root=customer, receipt_dir=workspace / "memory/health",
+            today="2026-09-05",
+        )
+
+
+def test_daily_role_writes_v2_health_receipt(monkeypatch, tmp_path):
+    args, workspace, _ = make_args(tmp_path, "daily-sync-3")
+    monkeypatch.setattr(runner, "command_for", lambda *a, **kw: [[
+        sys.executable, "-c", "import json; print(json.dumps({'queued': 0, 'checked': 1}))"
+    ]])
+
+    assert runner.run_role(args) == 0
+    receipt = json.loads(
+        (workspace / "memory/health/components/daily-sync-3.json").read_text(encoding="utf-8")
+    )
+    assert receipt["producer"] == "openclaw-discord-server-backup/daily-sync-v2"
+    assert receipt["status"] == "ok"
+
+
 def test_health_report_runs_topology_verify_before_render(monkeypatch, tmp_path, capsys):
     args, workspace, customer = make_args(tmp_path, "health-report")
     receipt_dir = workspace / "memory/health"
@@ -138,7 +189,7 @@ def test_health_report_runs_topology_verify_before_render(monkeypatch, tmp_path,
         if component == "cron-topology":
             continue
         producer = (
-            "openclaw-discord-server-backup/daily-sync-v1" if component.startswith("daily-sync-")
+            "openclaw-discord-server-backup/daily-sync-v2" if component.startswith("daily-sync-")
             else "openclaw-discord-server-backup/run-managed-component.v1"
         )
         runner.health.write_component(
@@ -183,7 +234,7 @@ def test_health_topology_verify_preserves_legacy_configured_discord_root(monkeyp
         if component == "cron-topology":
             continue
         producer = (
-            "openclaw-discord-server-backup/daily-sync-v1" if component.startswith("daily-sync-")
+            "openclaw-discord-server-backup/daily-sync-v2" if component.startswith("daily-sync-")
             else "openclaw-discord-server-backup/run-managed-component.v1"
         )
         runner.health.write_component(
