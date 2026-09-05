@@ -56,14 +56,16 @@ Out of scope:
    two-day daily freshness window, are not excluded, and have no active queue
    item. Null-cursor, stale, partial, queued, retry, and error entries remain
    owned by backlog.
-5. Read at most 30 messages per page, 60 per entry, 180 for the slot, and write
-   at most four entries. A second page is allowed only when the first page has
-   exactly 30 messages.
+5. Refresh at most ten recent messages around the durable cursor, then read at
+   most 30 new messages per page, 60 new messages per entry, 180 total API
+   messages for the slot, and write at most four entries. A second new-message
+   page is allowed only when the first page has exactly 30 messages.
 6. For a non-empty entry, instantiate
-   `RichArchiveStore(entry_root, lock_path)` and call:
+   `RichArchiveStore(entry_root, lock_path=lock_path)`, construct the reviewed
+   `AssetDownloader`, and call:
 
    `merge_messages(messages, channel_id=..., observed_at=..., generation_id=...,
-   lock_already_held=True)`.
+   downloader=downloader, lock_already_held=True)`.
 
    The call must return a mapping with a non-empty `generationId` and a positive
    verification result. `resolve_current()` must select that same generation.
@@ -75,8 +77,9 @@ Out of scope:
 8. An entry that reaches a page/message/read cap is marked `partial` and
    upserted in the queue with `page_limit_reached`. Otherwise it is marked
    healthy and receives today's `lastBackup`.
-9. Same-ID refreshes belong to bounded lookback/weekly refresh and must not
-   advance the new-message cursor.
+9. Same-ID refreshes from the bounded daily lookback must not advance the
+   new-message cursor. They update only the distinct incremental-rich receipt;
+   they never claim that a full-history completeness gate passed.
 
 The deterministic runner never writes `raw/*.md`, canonical JSONL, or attachment
 bytes itself. It never shells out, evaluates Discord content, or sends messages.
@@ -122,6 +125,8 @@ the existing private bounded log.
 - deterministic selection excludes active queue, stale, null-cursor, partial,
   retry, error, and excluded entries;
 - 30/60/4/6/180 limits and `page_limit_reached` queue handoff are tested;
+- a no-new-message run still performs bounded same-ID rich refresh without
+  moving the cursor;
 - archive commit precedes cursor persistence; injected store/state failures
   preserve the old cursor;
 - exact legacy daily adoption and rollback still pass;

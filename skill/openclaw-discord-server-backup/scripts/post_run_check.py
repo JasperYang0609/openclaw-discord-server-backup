@@ -65,7 +65,8 @@ def installed_python_smoke() -> tuple[bool, str]:
         "manage_cron_topology.py",
         "run_managed_component.py",
         "backup_health_report.py",
-        "daily_sync_overlap_canary.py",
+        "daily_sync_lock_canary.py",
+        "run_daily_sync_v3.py",
     )
     for name in cli_scripts:
         script = SKILL_DIR / "scripts" / name
@@ -373,10 +374,11 @@ def main() -> int:
         "scripts/manage_cron_topology.py",
         "scripts/run_managed_component.py",
         "scripts/backup_health_report.py",
-        "scripts/daily_sync_overlap_canary.py",
+        "scripts/daily_sync_lock_canary.py",
+        "scripts/run_daily_sync_v3.py",
+        "scripts/rich_message_archive.py",
         "manifests/owned-cron.v1.json",
         "prompts/core-backup.md",
-        "prompts/daily-sync-v3.md",
         "references/recovery.md",
         "examples/owned-cron.md",
         "examples/adoption-map.example.json",

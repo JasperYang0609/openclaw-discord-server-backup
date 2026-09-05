@@ -5,7 +5,7 @@ This file documents the installer-owned topology. For a normal installation, run
 source is `manifests/owned-cron.v1.json`, shipped inside the `.skill` package.
 
 The installer validates the full cron inventory, stages all desired jobs disabled,
-runs an isolated command canary and a two-job shared-session serialization canary,
+runs an isolated command canary and a two-process shared-file-lock serialization canary,
 then enables and verifies the complete set. Exact reruns are no-ops. Unknown jobs
 are never deleted; adoption requires an explicit checksummed map.
 
@@ -30,15 +30,18 @@ Discovery only registers channels/threads and creates folders. It must not read 
 
 Schedules: daily 05:30, 05:40, and 05:50.
 
-The prompt should follow `prompts/daily-sync-v3.md` with the V3 hard limits (30/60/4):
+The installer runs `scripts/run_daily_sync_v3.py` through the deterministic managed
+component runner with the V3 hard limits (30/60/4):
 `limit=30` per read (exactly 30 allows one extra page), at most 60 messages written
 per entry per run, at most 4 entries written per run (at most 6 checked). On any cap:
 write first, advance cursor only to written raw, mark `partial`, enqueue backlog.
 
-All daily-sync slots for one install must share one custom session key. Before entry
-selection, run `scripts/check_daily_sync_gate.py` against the state and today's
-deterministic inventory report. A busy shared lock or stale/incomplete inventory is a
-safe `skipped` run: do not read messages, write files, or advance cursors.
+All daily-sync slots for one install are isolated command jobs and share the same
+owner-only file lock beside the state file. The runner validates today's deterministic
+inventory report before entry selection. It also re-reads a bounded recent window so
+edits, reactions, and pin-state changes are merged even when no newer ID exists. A busy
+shared lock or stale/incomplete inventory is a safe `skipped` run: do not read messages,
+write files, or advance cursors. There is no agent/prompt fallback.
 
 ## Backlog worker
 

@@ -36,6 +36,8 @@ def main() -> int:
         "limits": {
             "dailyEntryLimit": 6,
             "dailyMessageLimitPerEntry": 60,
+            "dailyLookbackLimit": 10,
+            "dailyFreshnessDays": 2,
             "backlogEntryLimit": 4,
             "backlogBatchLimit": 12,
             "backlogPageLimit": 100,

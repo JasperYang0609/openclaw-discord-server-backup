@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 ROLES = {
-    "core-backup", "discovery", "caught-up-audit", "backlog",
+    "core-backup", "discovery", "daily-sync-1", "daily-sync-2", "daily-sync-3",
+    "caught-up-audit", "backlog",
     "weekly-inventory", "weekly-raw", "workspace-snapshot", "health-report",
 }
 
@@ -83,6 +84,13 @@ def safe_stamp() -> str:
     return datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f%z")
 
 
+def bounded_config_int(value: Any, *, default: int, maximum: int, label: str) -> int:
+    candidate = default if value is None else value
+    if isinstance(candidate, bool) or not isinstance(candidate, int) or not 1 <= candidate <= maximum:
+        raise RuntimeError(f"{label} is outside the reviewed bound")
+    return candidate
+
+
 def command_for(
     role: str,
     *,
@@ -127,6 +135,41 @@ def command_for(
     if role == "weekly-inventory":
         weekly_dir = receipt_dir / "reports" / "weekly" / today
         return [[*base_inventory, "--out", str(weekly_dir / "inventory.json"), "--mapping-ledger-out", str(weekly_dir / "mapping.json")]]
+    if role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}:
+        limits = config.get("limits") if isinstance(config.get("limits"), dict) else {}
+        max_entries = bounded_config_int(
+            limits.get("dailyEntryLimit"), default=6, maximum=6, label="daily entry limit",
+        )
+        max_messages = bounded_config_int(
+            limits.get("dailyMessageLimitPerEntry"), default=60, maximum=60,
+            label="daily message limit",
+        )
+        freshness_days = bounded_config_int(
+            limits.get("dailyFreshnessDays"), default=2, maximum=7,
+            label="daily freshness window",
+        )
+        lookback_limit = bounded_config_int(
+            limits.get("dailyLookbackLimit"), default=10, maximum=30,
+            label="daily lookback limit",
+        )
+        return [[
+            python, str(HERE / "run_daily_sync_v3.py"),
+            "--role", role,
+            "--state", str(state),
+            "--queue", str(queue),
+            "--root", str(discord_root),
+            "--inventory", str(inventory),
+            "--today", today,
+            "--timezone", str(config.get("timezone") or "Asia/Taipei"),
+            "--openclaw-config", str(openclaw_config),
+            "--max-entries", str(max_entries),
+            "--max-write-entries", "4",
+            "--page-limit", "30",
+            "--max-messages-per-entry", str(max_messages),
+            "--max-read-messages", "180",
+            "--lookback-limit", str(lookback_limit),
+            "--freshness-days", str(freshness_days),
+        ]]
     if role == "caught-up-audit":
         return [[
             python, str(HERE / "audit_caught_up_v3.py"), "--state", str(state),
@@ -178,7 +221,12 @@ def parse_metrics(text: str) -> dict[str, Any]:
     if stripped.startswith("{"):
         try:
             data = json.loads(stripped)
-            for key in ("activeQueueLeft", "activeQueue", "remainingMissing", "appended", "finalLiveOnly", "finalLiveErrors"):
+            for key in (
+                "activeQueueLeft", "activeQueue", "remainingMissing", "appended",
+                "finalLiveOnly", "finalLiveErrors", "checked", "writtenEntries",
+                "writtenMessages", "refreshedMessages", "mergedMessages",
+                "queued", "totalRead",
+            ):
                 if key in data and isinstance(data[key], (int, float, bool)):
                     metrics[key] = data[key]
         except json.JSONDecodeError:
@@ -208,11 +256,32 @@ def is_safe_lock_skip(payload: dict[str, Any] | None) -> bool:
     )
 
 
+def is_inventory_gate_skip(payload: dict[str, Any] | None) -> bool:
+    return bool(
+        payload
+        and payload.get("ok") is False
+        and payload.get("status") == "skipped"
+        and payload.get("reason") == "inventory_blocked"
+        and isinstance(payload.get("reasons"), list)
+        and payload["reasons"]
+        and all(
+            reason in {
+                "inventory_stale", "inventory_not_ok", "inventory_incomplete",
+                "inventory_warnings",
+            }
+            for reason in payload["reasons"]
+        )
+    )
+
+
 def success_summary(role: str, metrics: dict[str, Any]) -> tuple[str, str, list[str]]:
     if role == "core-backup":
         return "ok", "核心文件已完成備份與還原驗證", []
     if role == "discovery":
         return "ok", "頻道與討論串完整清單已更新", []
+    if role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}:
+        pending = ["本輪達到安全上限，已交由 backlog 從驗證游標續做"] if int(metrics.get("queued", 0)) else []
+        return ("pending" if pending else "ok"), (pending[0] if pending else "本輪日常同步已完成"), pending
     if role == "caught-up-audit":
         pending = ["尚有頻道待追趕"] if int(metrics.get("activeQueue", 0)) else []
         return ("pending" if pending else "ok"), ("尚有頻道待追趕" if pending else "追平稽核通過"), pending
@@ -245,6 +314,7 @@ def run_role(args: argparse.Namespace) -> int:
     structured: list[dict[str, Any]] = []
     returncode = 0
     safe_skip = False
+    inventory_skip = False
     for command in commands:
         proc = subprocess.run(command, cwd=workspace, text=True, capture_output=True, check=False)
         combined.append("$ " + " ".join(Path(value).name if index in {0, 1} else "[arg]" for index, value in enumerate(command)))
@@ -256,6 +326,10 @@ def run_role(args: argparse.Namespace) -> int:
             structured.append(parsed)
             if is_safe_lock_skip(parsed):
                 safe_skip = True
+                returncode = proc.returncode
+                break
+            if is_inventory_gate_skip(parsed):
+                inventory_skip = True
                 returncode = proc.returncode
                 break
         if proc.returncode != 0:
@@ -273,6 +347,15 @@ def run_role(args: argparse.Namespace) -> int:
             "impact": "本輪新訊息備份延後", "dataLoss": "no",
             "repairStatus": "保留原游標並等待下一輪",
         }]
+    elif inventory_skip:
+        status = "warning"
+        summary = "今日完整頻道清單尚未通過驗證，本輪已在讀寫前安全略過"
+        pending = ["等待完整清單更新後由下一輪自動續做"]
+        anomalies = [{
+            "code": "daily_sync_inventory_blocked", "summary": summary,
+            "impact": "本輪新訊息備份延後", "dataLoss": "no",
+            "repairStatus": "未推進游標，等待驗證後重試",
+        }]
     elif returncode == 0:
         status, summary, pending = success_summary(args.role, metrics)
         anomalies: list[dict[str, Any]] = []
@@ -285,13 +368,18 @@ def run_role(args: argparse.Namespace) -> int:
             "impact": "本項備份健康狀態無法確認", "dataLoss": "unknown",
             "repairStatus": "失敗告警已啟用，等待重試",
         }]
+    producer = (
+        "openclaw-discord-server-backup/daily-sync-v1"
+        if args.role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}
+        else "openclaw-discord-server-backup/run-managed-component.v1"
+    )
     health.write_component(
         receipt_dir, args.role, status, summary, args.declaration_key,
-        producer="openclaw-discord-server-backup/run-managed-component.v1",
+        producer=producer,
         checks=[{
             "key": "command_exit",
-            "status": "warning" if safe_skip else ("ok" if returncode == 0 else "error"),
-            "summary": "安全略過，下一輪續做" if safe_skip else ("命令已完成" if returncode == 0 else "命令失敗"),
+            "status": "warning" if safe_skip or inventory_skip else ("ok" if returncode == 0 else "error"),
+            "summary": "安全略過，下一輪續做" if safe_skip or inventory_skip else ("命令已完成" if returncode == 0 else "命令失敗"),
         }],
         metrics=metrics, anomalies=anomalies, pending=pending,
     )
@@ -300,7 +388,7 @@ def run_role(args: argparse.Namespace) -> int:
     # success keeps OpenClaw's failure alert (which excludes skipped runs) from
     # misclassifying it as an execution failure. The warning remains visible in
     # the component receipt and consolidated health report.
-    return 0 if safe_skip else returncode
+    return 0 if safe_skip or inventory_skip else returncode
 
 
 def verify_topology_and_render(args: argparse.Namespace) -> int:

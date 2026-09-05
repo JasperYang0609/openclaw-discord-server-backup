@@ -6,7 +6,10 @@ It uses V3 cursor state, explicit backlog queue, deterministic workers, and live
 
 ## Core guarantee
 
-A channel/thread is caught up only when `read after=<cursor>` returns 0 messages. `lastBackup` is not completion proof.
+A channel/thread is incrementally caught up only when `read after=<cursor>` returns
+0 messages. Daily sync also re-reads a bounded recent window and commits normalized
+rich payload plus assets through a verified generation before moving the cursor.
+`lastBackup` alone is not completion or rich-content proof.
 
 ## Install
 
@@ -40,7 +43,7 @@ explicitly chosen a non-Desktop location; a custom root disables automatic Deskt
 folder creation. Existing backup trees are never moved automatically.
 
 The installer owns the full cron topology. It performs complete-inventory checks,
-stages jobs disabled, runs command and shared-session canaries, enables the complete
+stages jobs disabled, runs isolated-command and shared-file-lock canaries, enables the complete
 set last, verifies exact contracts, and rolls back on failure. A byte-identical rerun
 is a no-op. Unknown or look-alike jobs are reported and left untouched; legacy
 adoption requires an explicit ID plus SHA-256 fingerprint map.

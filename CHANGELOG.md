@@ -4,7 +4,7 @@
 
 - Add a transactional, idempotent fresh-install/upgrade workflow for all 11 owned
   jobs: complete-inventory and duplicate-key gates, disabled staging, isolated
-  command and shared-session canaries, enable-last commit, exact verification,
+  command and shared-file-lock canaries, enable-last commit, exact verification,
   checksummed receipts, and receipt-backed rollback. Unknown jobs are never deleted;
   allowlisted legacy adoption requires exact ID, fingerprint, role, schedule,
   timezone, declaration key, and payload kind.
@@ -20,8 +20,12 @@
   require workspace/core snapshots to pass verify plus isolated restore canaries
   before being trusted.
 
-- Serialize daily-sync cron slots through one custom session and require every slot to reload durable state/queue before candidate selection, preventing restart catch-up races and duplicate batch selection.
-- Add a deterministic daily-sync preflight gate that skips safely while another backup job holds the shared lock or today's inventory audit is missing/incomplete.
+- Replace the three prompt-driven daily-sync jobs with isolated deterministic command
+  jobs. Each run uses the shared owner-only backup lock, requires the current inventory
+  gate, re-reads a bounded recent window for edits/reactions/pins, and commits through
+  the rich archive generation API before cursor advancement; no prompt fallback remains.
+- Bound Discord response bytes and aggregate 429 wait time, and keep incremental rich
+  verification distinct from the full-history completeness gate.
 - Freeze the audited report entry at a message-ID cutoff during weekly V4 reconciliation so progress cards belong to the next incremental scope instead of causing closeout drift.
 - Share remaining backlog safety-net slots between stale probes and null-cursor bootstrap entries while keeping excluded/invalid entries terminal.
 

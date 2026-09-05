@@ -6,7 +6,7 @@ normal installation.
 
 - 05:10 core workspace backup
 - 05:25 deterministic channel/thread discovery
-- 05:30, 05:40, 05:50 daily sync in one shared persistent session
+- 05:30, 05:40, 05:50 deterministic rich daily sync under one shared file lock
 - 06:10 caught-up audit
 - 07:05 one plain-language health report
 - 23:10, 00:10, 01:10, 02:10, 03:10, 04:10 bounded backlog runs
@@ -31,7 +31,7 @@ python3 scripts/install.py \
 ```
 
 The installer validates the complete cron inventory, stages jobs disabled, runs
-isolated-command and shared-session canaries, disables any explicitly adopted
+isolated-command and shared-file-lock canaries, disables any explicitly adopted
 legacy jobs, enables the full desired set last, then verifies the exact result.
 Any failure rolls the transaction back.
 

@@ -34,9 +34,9 @@ SAFE_STATUSES = {"create", "update", "unchanged"}
 LEGACY_ROLE_TOKENS = {
     "core-backup": {"core_workspace_backup.py"},
     "discovery": {"audit_discord_inventory_v3.py", "discovery.md"},
-    "daily-sync-1": {"daily-sync-v3.md", "check_daily_sync_gate.py"},
-    "daily-sync-2": {"daily-sync-v3.md", "check_daily_sync_gate.py"},
-    "daily-sync-3": {"daily-sync-v3.md", "check_daily_sync_gate.py"},
+    "daily-sync-1": {"daily-sync-v3.md", "check_daily_sync_gate.py", "run_daily_sync_v3.py"},
+    "daily-sync-2": {"daily-sync-v3.md", "check_daily_sync_gate.py", "run_daily_sync_v3.py"},
+    "daily-sync-3": {"daily-sync-v3.md", "check_daily_sync_gate.py", "run_daily_sync_v3.py"},
     "caught-up-audit": {"audit_caught_up_v3.py"},
     "backlog": {"run_backlog_worker_v3.py", "backlog-worker-v3.md"},
     "weekly-inventory": {"audit_discord_inventory_v3.py"},
@@ -51,6 +51,9 @@ LEGACY_DECLARATION_KEYS = {
 }
 LEGACY_PAYLOAD_KINDS = {
     "backlog": {"agentTurn", "command"},
+    "daily-sync-1": {"agentTurn", "command"},
+    "daily-sync-2": {"agentTurn", "command"},
+    "daily-sync-3": {"agentTurn", "command"},
 }
 
 
@@ -161,9 +164,14 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         raise CronManagerError("health report must run at 07:05")
     if by_role["workspace-snapshot"]["schedule"] != "0 7 1 * *":
         raise CronManagerError("workspace recovery snapshot must remain monthly at 07:00 on day one")
-    sessions = {by_role[f"daily-sync-{index}"].get("sharedSession") for index in (1, 2, 3)}
-    if sessions != {"daily-sync"}:
-        raise CronManagerError("all daily-sync jobs must share the daily-sync session")
+    daily = [by_role[f"daily-sync-{index}"] for index in (1, 2, 3)]
+    if any(
+        row.get("kind") != "command"
+        or row.get("runnerRole") != row.get("role")
+        or row.get("sharedLock") != "state-parent-channel-backup"
+        for row in daily
+    ):
+        raise CronManagerError("all daily-sync jobs must use the deterministic runner and shared file lock")
 
 
 def ensure_absolute_safe(path: Path, *, label: str) -> Path:
@@ -291,7 +299,6 @@ def render_jobs(manifest: dict[str, Any], context: RenderContext) -> list[dict[s
         "INVENTORY_REPORT": str(inventory_report),
         "RECEIPT_DIR": str(receipt_dir),
     }
-    shared_session = f"session:{manifest['product']}-{context.guild_id}-daily-sync"
     desired: list[dict[str, Any]] = []
     for row in manifest["jobs"]:
         role = row["role"]
@@ -353,7 +360,7 @@ def render_jobs(manifest: dict[str, Any], context: RenderContext) -> list[dict[s
                 "tz": context.timezone_name,
                 "staggerMs": 0,
             },
-            "sessionTarget": shared_session if row["kind"] == "agent" else "isolated",
+            "sessionTarget": "isolated" if row["kind"] == "command" else f"session:{manifest['product']}-{context.guild_id}-{role}",
             "payload": payload,
             "delivery": delivery,
             "failureAlert": alert,
@@ -361,13 +368,28 @@ def render_jobs(manifest: dict[str, Any], context: RenderContext) -> list[dict[s
         if row["kind"] == "agent":
             job["agentId"] = context.agent
         desired.append(job)
-    daily_targets = {
-        job["sessionTarget"] for job in desired
-        if str(job.get("role") or "").startswith("daily-sync-")
-    }
-    if len(daily_targets) != 1 or not next(iter(daily_targets)).startswith("session:"):
-        raise CronManagerError("daily-sync jobs do not share one persistent session target")
+    daily_jobs = [job for job in desired if str(job.get("role") or "").startswith("daily-sync-")]
+    if any(job.get("sessionTarget") != "isolated" or (job.get("payload") or {}).get("kind") != "command" for job in daily_jobs):
+        raise CronManagerError("daily-sync jobs are not isolated deterministic commands")
     return desired
+
+
+def desired_daily_lock_path(desired: list[dict[str, Any]], workspace: Path) -> Path:
+    daily = next((job for job in desired if job.get("role") == "daily-sync-1"), None)
+    payload = daily.get("payload") if isinstance(daily, dict) else None
+    argv = payload.get("argv") if isinstance(payload, dict) else None
+    if not isinstance(argv, list) or "--config" not in argv:
+        raise CronManagerError("daily-sync command is missing its managed config")
+    index = argv.index("--config") + 1
+    if index >= len(argv) or not isinstance(argv[index], str):
+        raise CronManagerError("daily-sync command config path is invalid")
+    config_path = workspace_child(workspace, argv[index], label="daily-sync config")
+    config = read_json(config_path)
+    state_value = config.get("statePath")
+    if not isinstance(state_value, str) or not state_value:
+        raise CronManagerError("daily-sync state path is missing")
+    state_path = workspace_child(workspace, state_value, label="daily-sync state")
+    return state_path.parent / ".channel_backup.lock"
 
 
 def normalized_delivery(value: Any) -> dict[str, Any]:
@@ -1155,71 +1177,54 @@ class OpenClawCronClient:
         if primary_error:
             raise primary_error
 
-    def persistent_session_canary(self, workspace: Path, session_target: str, agent: str) -> None:
-        if not session_target.startswith("session:"):
-            raise CronManagerError("persistent-session canary requires a session: target")
-        helper = Path(__file__).resolve().parent / "daily_sync_overlap_canary.py"
+    def daily_lock_canary(self, workspace: Path, lock_path: Path) -> None:
+        helper = Path(__file__).resolve().parent / "daily_sync_lock_canary.py"
         if helper.is_symlink() or not helper.is_file():
-            raise CronManagerError("persistent-session canary helper is missing or unsafe")
-        job_ids: list[str] = []
-        declaration_keys: list[str] = []
-        cleanup_errors: list[str] = []
-        primary_error: Exception | None = None
-        processes: list[subprocess.Popen[str]] = []
-        with tempfile.TemporaryDirectory(prefix="openclaw-daily-session-canary-") as tmp:
-            state_dir = Path(tmp) / "state"
+            raise CronManagerError("daily lock canary helper is missing or unsafe")
+        lock_path = workspace_child(workspace, str(lock_path), label="daily lock path")
+        with tempfile.TemporaryDirectory(prefix="openclaw-daily-lock-canary-") as tmp:
+            root = Path(tmp)
+            canary_lock = root / lock_path.name
+            trace = root / "trace.jsonl"
+            command_a = [
+                sys.executable, str(helper), "--lock", str(canary_lock),
+                "--trace", str(trace), "--label", "A", "--hold-ms", "750",
+            ]
+            command_b = [
+                sys.executable, str(helper), "--lock", str(canary_lock),
+                "--trace", str(trace), "--label", "B", "--hold-ms", "1",
+            ]
+            first = subprocess.Popen(command_a, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
-                for label in ("A", "B"):
-                    key = f"openclaw-discord-session-canary-{os.getpid()}-{int(time.time()*1000)}-{label.lower()}"
-                    declaration_keys.append(key)
-                    helper_argv = json.dumps([
-                        sys.executable, str(helper), "--state-dir", str(state_dir), "--label", label,
-                    ])
-                    message = (
-                        "Use the exec tool exactly once with this argv JSON, wait for completion, "
-                        f"and return its stdout only: {helper_argv}"
-                    )
-                    args = [
-                        "cron", "add", "--name", f"Discord daily session canary {label}",
-                        "--at", "+1h", "--declaration-key", key,
-                        "--session", session_target, "--no-deliver",
-                        "--message", message, "--agent", agent, "--tools", "exec",
-                        "--light-context", "--timeout-seconds", "120", "--json",
-                    ]
-                    job_ids.append(str(extract_job(json.loads(self.run(args).stdout))["id"]))
-                processes = [
-                    subprocess.Popen(
-                        [self.binary, "cron", "run", job_id, "--wait", "--wait-timeout", "2m"],
-                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    )
-                    for job_id in job_ids
-                ]
-                self.complete_parallel_canary_runs(job_ids, processes)
-                trace = state_dir / "trace.jsonl"
-                if (state_dir / "overlap").exists() or not trace.is_file():
-                    raise CronManagerError("persistent-session overlap canary detected concurrent execution")
-                events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines() if line.strip()]
-                if [event.get("event") for event in events] not in (["start", "end", "start", "end"],):
-                    raise CronManagerError("persistent-session overlap canary did not prove serialized ordering")
-            except Exception as exc:
-                primary_error = exc
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if trace.is_file() and '"event": "start"' in trace.read_text(encoding="utf-8"):
+                        break
+                    if first.poll() is not None:
+                        raise CronManagerError("daily lock canary owner exited before acquiring the lock")
+                    time.sleep(0.02)
+                else:
+                    raise CronManagerError("daily lock canary owner did not acquire the lock")
+                second = subprocess.run(command_b, text=True, capture_output=True, timeout=30, check=False)
+                first_stdout, _first_stderr = first.communicate(timeout=30)
             finally:
-                for process in processes:
-                    if process.poll() is None:
-                        process.kill()
-                        try:
-                            process.communicate(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            cleanup_errors.append("process")
-                for key in reversed(declaration_keys):
-                    try:
-                        self.remove_declaration_key(key)
-                    except Exception:
-                        cleanup_errors.append(key)
-        if cleanup_errors:
-            raise CronManagerError(f"persistent-session canary cleanup failed for {len(cleanup_errors)} job(s)")
-        if primary_error:
-            raise primary_error
+                if first.poll() is None:
+                    first.kill()
+                    first.communicate(timeout=10)
+            if first.returncode != 0 or second.returncode != 0:
+                raise CronManagerError("daily lock canary process failed")
+            try:
+                first_result = json.loads(first_stdout)
+                second_result = json.loads(second.stdout)
+                events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines() if line.strip()]
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise CronManagerError("daily lock canary output is invalid") from exc
+            if first_result.get("status") != "completed" or second_result != {
+                "ok": False, "reason": "backup_lock_busy", "status": "skipped",
+            }:
+                raise CronManagerError("daily lock canary did not prove fail-closed contention")
+            if [event.get("event") for event in events] != ["start", "skipped", "end"]:
+                raise CronManagerError("daily lock canary trace did not prove serialized ordering")
 
     def complete_parallel_canary_runs(
         self, job_ids: list[str], processes: list[subprocess.Popen[str]],
@@ -1549,9 +1554,10 @@ def apply_plan(
                 raise CronManagerError(f"staged topology verification failed for {expected['role']}")
         if run_canary:
             client.canary(workspace)
-            daily_target = next(job["sessionTarget"] for job in desired if job["role"] == "daily-sync-1")
-            if hasattr(client, "persistent_session_canary"):
-                client.persistent_session_canary(workspace, daily_target, str(by_role["daily-sync-1"]["agentId"]))
+            lock_canary = getattr(client, "daily_lock_canary", None)
+            if not callable(lock_canary):
+                raise CronManagerError("daily shared-lock canary is unavailable")
+            lock_canary(workspace, desired_daily_lock_path(desired, workspace))
         staged_inventory = client.list_jobs()
         staged_by_key = {str(job.get("declarationKey") or ""): job for job in staged_inventory}
         for expected in desired:
@@ -1626,7 +1632,7 @@ def write_topology_component(receipt_dir: Path, guild_id: str, desired: list[dic
         "checks": [
             {"key": "owned_jobs", "status": "ok", "summary": f"{len(desired)} 個 owned jobs 已驗證"},
             {"key": "failure_alerts", "status": "ok", "summary": "每項任務皆在一次錯誤後告警，安全略過不計錯誤"},
-            {"key": "daily_session", "status": "ok", "summary": "三段日常同步使用同一持久 session"},
+            {"key": "daily_lock", "status": "ok", "summary": "三段確定式日常同步共用同一個檔案鎖"},
         ],
         "metrics": {"ownedJobs": len(desired)},
         "anomalies": [],

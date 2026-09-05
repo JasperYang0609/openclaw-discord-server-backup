@@ -75,6 +75,6 @@ Run healthcheck and confirm:
 - LanceDB source map matches the required search depth: summary-only or summary + raw
 - LanceDB database, metadata rules, source map, index state, and embedding cache have a verified recovery snapshot
 - exactly 11 owned declaration keys exist, with no duplicates, and every job matches name, schedule, timezone, kind, delivery, timeout, alert, and session contract
-- the three daily-sync jobs share one persistent session
+- the three deterministic daily-sync command jobs share one owner-only file lock
 - only the 07:05 health job announces routine output
 - a deliberately stale or malformed receipt makes the report non-green
