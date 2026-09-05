@@ -7,13 +7,15 @@ The canonical record retains independent content revisions and mutable
 observations.  A checksummed ``CURRENT.json`` selects one complete generation;
 individual raw/canonical trees are never selected independently.
 
-Nothing in this module can claim full live completeness by itself.  A caller
-must additionally provide a complete Discord inventory, per-entry cutoffs, live
-ID coverage, and immutable pre-repair evidence to the full-history verifier.
+Offline bytes and stored receipts can prove local integrity, but never live
+completeness.  A runtime collector must perform bounded Discord pagination and
+issue an in-process evidence capability before the full-history verifier may
+return PASS.
 """
 from __future__ import annotations
 
 import fcntl
+import errno
 import hashlib
 import ipaddress
 import json
@@ -29,6 +31,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path, PurePosixPath
@@ -40,7 +43,7 @@ POINTER_SCHEMA = "openclaw-discord-rich-current.v1"
 JOURNAL_SCHEMA = "openclaw-discord-rich-journal.v1"
 GENERATION_MANIFEST_SCHEMA = "openclaw-discord-rich-generation.v1"
 ENTRY_RECEIPT_SCHEMA = "openclaw-discord-rich-entry-receipt.v2"
-LIVE_EVIDENCE_SCHEMA = "openclaw-discord-rich-live-evidence.v1"
+LIVE_EVIDENCE_SCHEMA = "openclaw-discord-rich-live-evidence.v2"
 SOURCE_CENSUS_SCHEMA = "openclaw-discord-source-census.v2"
 TZ_TAIPEI = timezone(timedelta(hours=8))
 MACHINE_MARKER_RE = re.compile(
@@ -1950,84 +1953,242 @@ def _validate_immutable_evidence_reference(value: Any) -> dict[str, Any]:
     }
 
 
-def build_live_inventory_evidence(
-    messages: Sequence[Mapping[str, Any]],
+_LIVE_EVIDENCE_GUARD = object()
+_LIVE_EVIDENCE_REGISTRY: dict[str, dict[str, Any]] = {}
+
+
+class LiveEvidenceToken:
+    """Runtime-only capability minted by the bounded Discord collector."""
+
+    def __init__(self, evidence: Mapping[str, Any], *, guard: object) -> None:
+        if guard is not _LIVE_EVIDENCE_GUARD:
+            raise RichArchiveError("live evidence token cannot be constructed externally")
+        self._evidence = json.loads(json.dumps(evidence, ensure_ascii=False))
+        self._nonce = secrets.token_hex(32)
+        self._pid = os.getpid()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def audit_evidence(self) -> dict[str, Any]:
+        if self._closed:
+            raise RichArchiveError("live evidence token is closed")
+        return json.loads(json.dumps(self._evidence, ensure_ascii=False))
+
+    def close(self) -> None:
+        registration = _LIVE_EVIDENCE_REGISTRY.get(self._nonce)
+        if registration is not None and registration.get("token")() is self:
+            _LIVE_EVIDENCE_REGISTRY.pop(self._nonce, None)
+        self._closed = True
+
+    def __enter__(self) -> "LiveEvidenceToken":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+
+def _mint_live_evidence_token(evidence: Mapping[str, Any]) -> LiveEvidenceToken:
+    token = LiveEvidenceToken(evidence, guard=_LIVE_EVIDENCE_GUARD)
+    _LIVE_EVIDENCE_REGISTRY[token._nonce] = {
+        "token": weakref.ref(token),
+        "pid": os.getpid(),
+        "channelId": str(evidence["entryIdentity"]["channelId"]),
+        "relativePath": str(evidence["entryIdentity"]["relativePath"]),
+        "evidenceSha256": str(evidence["evidenceSha256"]),
+    }
+    return token
+
+
+def _require_live_evidence_token(token: LiveEvidenceToken | None) -> dict[str, Any]:
+    registration = (
+        _LIVE_EVIDENCE_REGISTRY.get(token._nonce)
+        if isinstance(token, LiveEvidenceToken)
+        else None
+    )
+    if (
+        not isinstance(token, LiveEvidenceToken)
+        or token.closed
+        or token._pid != os.getpid()
+        or registration is None
+        or registration.get("token")() is not token
+        or registration.get("pid") != os.getpid()
+    ):
+        raise GenerationError("valid runtime live evidence token is required")
+    evidence = token.audit_evidence()
+    if (
+        evidence.get("evidenceSha256") != registration.get("evidenceSha256")
+        or str(evidence.get("entryIdentity", {}).get("channelId") or "")
+        != registration.get("channelId")
+        or str(evidence.get("entryIdentity", {}).get("relativePath") or "")
+        != registration.get("relativePath")
+    ):
+        raise GenerationError("runtime live evidence token binding changed")
+    return evidence
+
+
+def _inventory_identities(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    identities: list[dict[str, str]] = []
+    channels: set[str] = set()
+    paths: set[str] = set()
+    for row in rows:
+        relative_path = str(row.get("relativePath") or "")
+        identity = _validated_entry_identity({
+            "channelId": str(row.get("channelId") or ""),
+            "relativePath": relative_path,
+            "normalizedRelativePath": unicodedata.normalize("NFKC", relative_path).casefold(),
+        })
+        if identity["channelId"] in channels or identity["normalizedRelativePath"] in paths:
+            raise GenerationError("fresh inventory contains duplicate channel or normalized path")
+        channels.add(identity["channelId"])
+        paths.add(identity["normalizedRelativePath"])
+        identities.append(identity)
+    return sorted(identities, key=lambda row: (int(row["channelId"]), row["normalizedRelativePath"]))
+
+
+def _source_page(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [sanitize_lossless_source(dict(message)) for message in messages]
+
+
+def collect_live_evidence(
     *,
+    fetch_page: Callable[..., Sequence[Mapping[str, Any]]],
+    fetch_inventory: Callable[[], Sequence[Mapping[str, Any]]],
+    verify_immutable_evidence: Callable[[], Mapping[str, Any]],
     channel_id: str,
     relative_path: str,
-    inventory_digest: str,
-    inventory_observed_at: str,
-    verified_cutoff: str | None,
-    fetch_started_at: str,
-    fetch_completed_at: str,
-    page_count: int,
-    immutable_evidence: Mapping[str, Any],
+    page_limit: int = 100,
+    max_pages: int = 100_000,
+    max_messages: int = 10_000_000,
     allowed_cdn_hosts: frozenset[str] = DEFAULT_CDN_HOSTS,
-) -> dict[str, Any]:
-    """Create concrete, self-checking live evidence from a completed API fetch."""
+) -> LiveEvidenceToken:
+    """Perform bounded backward pagination and mint non-persistable PASS authority."""
+    if not str(channel_id).isdigit() or not 1 <= page_limit <= 100:
+        raise GenerationError("live collector channel or page limit is invalid")
+    if max_pages < 1 or max_messages < 0:
+        raise GenerationError("live collector bounds are invalid")
     identity = _validated_entry_identity({
         "channelId": str(channel_id),
         "relativePath": relative_path,
         "normalizedRelativePath": unicodedata.normalize("NFKC", relative_path).casefold(),
     })
-    if not re.fullmatch(r"[0-9a-f]{64}", inventory_digest):
-        raise GenerationError("fresh Discord inventory digest is invalid")
-    observed_inventory = _iso_timestamp(
-        inventory_observed_at, field="inventoryObservedAt", required=True,
-    )
-    started = _iso_timestamp(fetch_started_at, field="fetchStartedAt", required=True)
-    completed = _iso_timestamp(fetch_completed_at, field="fetchCompletedAt", required=True)
-    if started > completed:
-        raise GenerationError("live fetch completion precedes start")
-    if not isinstance(page_count, int) or isinstance(page_count, bool) or page_count < 1:
-        raise GenerationError("completed live fetch requires at least one page observation")
-    normalized = [
+    inventory_started = datetime.now(timezone.utc).isoformat()
+    inventory = _inventory_identities(list(fetch_inventory()))
+    if identity not in inventory:
+        raise GenerationError("fresh inventory does not contain the exact entry identity")
+    immutable = _validate_immutable_evidence_reference(verify_immutable_evidence())
+    fetch_started = datetime.now(timezone.utc).isoformat()
+
+    cutoff_raw = list(fetch_page(str(channel_id), before=None, limit=1))
+    if len(cutoff_raw) > 1:
+        raise GenerationError("cutoff observation exceeded requested limit")
+    cutoff_sources = _source_page(cutoff_raw)
+    for source in cutoff_sources:
         normalize_message(
-            message,
-            expected_channel_id=channel_id,
-            observed_at=completed,
+            source, expected_channel_id=str(channel_id), observed_at=fetch_started,
             allowed_cdn_hosts=allowed_cdn_hosts,
         )
-        for message in messages
+    cutoff = str(cutoff_sources[0]["id"]) if cutoff_sources else None
+
+    before = str(int(cutoff) + 1) if cutoff is not None else None
+    raw_pages: list[dict[str, Any]] = []
+    raw_messages: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    terminal = False
+    for page_index in range(max_pages):
+        page_raw = list(fetch_page(str(channel_id), before=before, limit=page_limit))
+        if len(page_raw) > page_limit:
+            raise GenerationError("Discord page exceeded requested limit")
+        sources = _source_page(page_raw)
+        ids = [str(source.get("id") or "") for source in sources]
+        if any(not value.isdigit() for value in ids) or len(ids) != len(set(ids)):
+            raise GenerationError("Discord page contains invalid or duplicate message IDs")
+        if any(value in seen for value in ids):
+            raise GenerationError("Discord pagination repeated a message ID")
+        if before is not None and any(int(value) >= int(before) for value in ids):
+            raise GenerationError("Discord before-pagination response crossed its request cursor")
+        if cutoff is None and ids:
+            raise GenerationError("empty cutoff observation changed during enumeration")
+        if cutoff is not None and any(int(value) > int(cutoff) for value in ids):
+            raise GenerationError("Discord page crossed the frozen cutoff")
+        seen.update(ids)
+        raw_messages.extend(sources)
+        terminal = len(sources) < page_limit
+        raw_pages.append({
+            "pageIndex": page_index,
+            "requestBefore": before,
+            "requestLimit": page_limit,
+            "responseCount": len(sources),
+            "responseIds": ids,
+            "responseSourcePayloads": sources,
+            "responsePayloadSha256": json_sha256(sources),
+            "terminal": terminal,
+        })
+        if len(raw_messages) > max_messages:
+            raise GenerationError("live collector message bound exceeded")
+        if terminal:
+            break
+        if not ids:
+            raise GenerationError("non-terminal Discord page was empty")
+        next_before = min(ids, key=int)
+        if before is not None and int(next_before) >= int(before):
+            raise GenerationError("Discord pagination cursor did not move backward")
+        before = next_before
+    if not terminal:
+        raise GenerationError("live collector page bound reached before terminal page")
+    if cutoff is not None and cutoff not in seen:
+        raise GenerationError("frozen cutoff message was absent from full enumeration")
+
+    fetch_completed = datetime.now(timezone.utc).isoformat()
+    normalized = [
+        normalize_message(
+            source,
+            expected_channel_id=str(channel_id),
+            observed_at=fetch_completed,
+            allowed_cdn_hosts=allowed_cdn_hosts,
+        )
+        for source in sorted(raw_messages, key=lambda row: int(str(row["id"])))
     ]
-    rows = sorted((_active_live_binding(record) for record in normalized), key=lambda row: int(row["messageId"]))
-    ids = [row["messageId"] for row in rows]
-    if len(ids) != len(set(ids)):
-        raise GenerationError("live evidence contains duplicate message IDs")
-    if rows:
-        if not isinstance(verified_cutoff, str) or not verified_cutoff.isdigit():
-            raise GenerationError("non-empty live evidence requires a numeric cutoff")
-        if max(ids, key=int) != verified_cutoff or any(int(value) > int(verified_cutoff) for value in ids):
-            raise GenerationError("live evidence IDs do not terminate at the verified cutoff")
-    elif verified_cutoff not in (None, ""):
-        raise GenerationError("truly empty live evidence must have a null cutoff")
-    immutable = _validate_immutable_evidence_reference(immutable_evidence)
+    message_rows = [_active_live_binding(record) for record in normalized]
     body: dict[str, Any] = {
         "schemaVersion": LIVE_EVIDENCE_SCHEMA,
         "entryIdentity": identity,
         "inventory": {
             "complete": True,
-            "digest": inventory_digest,
-            "observedAt": observed_inventory,
+            "entries": inventory,
+            "digest": json_sha256(inventory),
+            "observedAt": inventory_started,
             "channelId": str(channel_id),
         },
-        "verifiedCutoff": verified_cutoff or None,
-        "trulyEmpty": not rows,
-        "enumeration": {
-            "source": "discord-api-direct",
-            "complete": True,
-            "terminalPageObserved": True,
-            "pageCount": page_count,
-            "fetchedMessageCount": len(rows),
-            "fetchStartedAt": started,
-            "fetchCompletedAt": completed,
-            "pagePayloadSha256": json_sha256(rows),
+        "cutoffObservation": {
+            "requestLimit": 1,
+            "responseCount": len(cutoff_sources),
+            "responseIds": [str(source["id"]) for source in cutoff_sources],
+            "responseSourcePayloads": cutoff_sources,
+            "responsePayloadSha256": json_sha256(cutoff_sources),
         },
-        "messages": rows,
+        "verifiedCutoff": cutoff,
+        "trulyEmpty": not message_rows,
+        "enumeration": {
+            "source": "discord-api-runtime-collector",
+            "direction": "before",
+            "complete": True,
+            "terminalPageObserved": terminal,
+            "pageLimit": page_limit,
+            "pageCount": len(raw_pages),
+            "fetchedMessageCount": len(message_rows),
+            "fetchStartedAt": fetch_started,
+            "fetchCompletedAt": fetch_completed,
+            "pages": raw_pages,
+            "pagePayloadSha256": json_sha256(raw_pages),
+        },
+        "messages": message_rows,
         "immutableEvidence": immutable,
     }
     body["evidenceSha256"] = json_sha256(body)
-    return body
+    return _mint_live_evidence_token(body)
 
 
 def _load_generation_records(root: Path) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], int]:
@@ -2127,9 +2288,15 @@ def _validated_live_evidence(root: Path, evidence: Any, projection: Mapping[str,
     if not isinstance(inventory, Mapping) or inventory.get("complete") is not True:
         errors.append("inventory_not_complete")
         inventory = {}
+    try:
+        inventory_entries = _inventory_identities(list(inventory.get("entries") or []))
+    except (RichArchiveError, TypeError):
+        inventory_entries = []
+        errors.append("inventory_entries_invalid")
     if (
-        not re.fullmatch(r"[0-9a-f]{64}", str(inventory.get("digest") or ""))
+        inventory.get("digest") != json_sha256(inventory_entries)
         or str(inventory.get("channelId") or "") != identity["channelId"]
+        or identity not in inventory_entries
     ):
         errors.append("inventory_identity_or_digest_invalid")
     _iso_timestamp(inventory.get("observedAt"), field="inventory.observedAt", required=True)
@@ -2141,23 +2308,128 @@ def _validated_live_evidence(root: Path, evidence: Any, projection: Mapping[str,
     if not isinstance(messages, list) or any(not isinstance(row, Mapping) for row in messages):
         raise GenerationError("live evidence messages are invalid")
     message_rows = [dict(row) for row in messages]
-    if enumeration.get("source") != "discord-api-direct" or enumeration.get("complete") is not True or enumeration.get("terminalPageObserved") is not True:
+    if (
+        enumeration.get("source") != "discord-api-runtime-collector"
+        or enumeration.get("direction") != "before"
+        or enumeration.get("complete") is not True
+        or enumeration.get("terminalPageObserved") is not True
+    ):
         errors.append("live_enumeration_incomplete")
-    if not isinstance(enumeration.get("pageCount"), int) or isinstance(enumeration.get("pageCount"), bool) or enumeration.get("pageCount") < 1:
+    page_limit = enumeration.get("pageLimit")
+    pages = enumeration.get("pages")
+    if (
+        not isinstance(page_limit, int) or isinstance(page_limit, bool)
+        or not 1 <= page_limit <= 100
+        or not isinstance(pages, list) or not pages
+        or any(not isinstance(page, Mapping) for page in pages)
+    ):
         errors.append("live_page_proof_missing")
-    if enumeration.get("fetchedMessageCount") != len(message_rows) or enumeration.get("pagePayloadSha256") != json_sha256(message_rows):
+        pages = []
+        page_limit = 0
+    if (
+        enumeration.get("pageCount") != len(pages)
+        or enumeration.get("pagePayloadSha256") != json_sha256(pages)
+    ):
         errors.append("live_page_denominator_mismatch")
     started = _iso_timestamp(enumeration.get("fetchStartedAt"), field="fetchStartedAt", required=True)
     completed = _iso_timestamp(enumeration.get("fetchCompletedAt"), field="fetchCompletedAt", required=True)
     if started > completed:
         errors.append("live_fetch_time_invalid")
+    cutoff_observation = evidence.get("cutoffObservation")
+    cutoff_sources: list[dict[str, Any]] = []
+    if isinstance(cutoff_observation, Mapping):
+        supplied_sources = cutoff_observation.get("responseSourcePayloads")
+        if isinstance(supplied_sources, list) and all(isinstance(row, Mapping) for row in supplied_sources):
+            cutoff_sources = [dict(row) for row in supplied_sources]
+    cutoff_ids = [str(row.get("id") or "") for row in cutoff_sources]
+    if (
+        not isinstance(cutoff_observation, Mapping)
+        or cutoff_observation.get("requestLimit") != 1
+        or len(cutoff_sources) > 1
+        or cutoff_observation.get("responseCount") != len(cutoff_sources)
+        or cutoff_observation.get("responseIds") != cutoff_ids
+        or cutoff_observation.get("responsePayloadSha256") != json_sha256(cutoff_sources)
+        or any(not value.isdigit() for value in cutoff_ids)
+    ):
+        errors.append("cutoff_observation_invalid")
+    cutoff = evidence.get("verifiedCutoff")
+    derived_cutoff = cutoff_ids[0] if cutoff_ids else None
+    if cutoff != derived_cutoff:
+        errors.append("verified_cutoff_mismatch")
+
+    page_sources: list[dict[str, Any]] = []
+    seen_page_ids: set[str] = set()
+    expected_before = str(int(derived_cutoff) + 1) if derived_cutoff is not None else None
+    for index, page in enumerate(pages):
+        sources_value = page.get("responseSourcePayloads")
+        sources = (
+            [dict(row) for row in sources_value]
+            if isinstance(sources_value, list) and all(isinstance(row, Mapping) for row in sources_value)
+            else []
+        )
+        page_ids = [str(row.get("id") or "") for row in sources]
+        page_terminal = len(sources) < page_limit if page_limit else False
+        if (
+            page.get("pageIndex") != index
+            or page.get("requestBefore") != expected_before
+            or page.get("requestLimit") != page_limit
+            or page.get("responseCount") != len(sources)
+            or page.get("responseIds") != page_ids
+            or page.get("responsePayloadSha256") != json_sha256(sources)
+            or page.get("terminal") is not page_terminal
+            or any(not value.isdigit() for value in page_ids)
+            or len(page_ids) != len(set(page_ids))
+            or any(value in seen_page_ids for value in page_ids)
+            or (
+                expected_before is not None
+                and any(int(value) >= int(expected_before) for value in page_ids if value.isdigit())
+            )
+            or (derived_cutoff is None and bool(page_ids))
+            or (
+                derived_cutoff is not None
+                and any(int(value) > int(derived_cutoff) for value in page_ids if value.isdigit())
+            )
+            or (index < len(pages) - 1 and page_terminal)
+            or (index == len(pages) - 1 and not page_terminal)
+        ):
+            errors.append(f"pagination_page_invalid:{index}")
+        seen_page_ids.update(page_ids)
+        page_sources.extend(sources)
+        if page_ids:
+            expected_before = min(page_ids, key=int)
+
+    try:
+        derived_rows = sorted(
+            (
+                _active_live_binding(normalize_message(
+                    source,
+                    expected_channel_id=identity["channelId"],
+                    observed_at=completed,
+                ))
+                for source in page_sources
+            ),
+            key=lambda row: int(row["messageId"]),
+        )
+        for source in cutoff_sources:
+            normalize_message(
+                source,
+                expected_channel_id=identity["channelId"],
+                observed_at=completed,
+            )
+    except RichArchiveError:
+        derived_rows = []
+        errors.append("pagination_source_payload_invalid")
+    if message_rows != derived_rows:
+        errors.append("live_messages_not_derived_from_pagination")
+    if enumeration.get("fetchedMessageCount") != len(derived_rows):
+        errors.append("live_page_denominator_mismatch")
+
     ids = [str(row.get("messageId") or "") for row in message_rows]
     if any(not value.isdigit() for value in ids) or len(ids) != len(set(ids)) or ids != sorted(ids, key=int):
         errors.append("live_message_identity_set_invalid")
     records = projection["records"]
     if set(ids) != set(records):
         errors.append("live_and_canonical_id_sets_differ")
-    cutoff = evidence.get("verifiedCutoff")
     truly_empty = evidence.get("trulyEmpty")
     if ids:
         if truly_empty is not False or not isinstance(cutoff, str) or not cutoff.isdigit() or max(ids, key=int) != cutoff:
@@ -2211,8 +2483,8 @@ def _coverage_percent(row: Mapping[str, Any]) -> int:
     return 100 if verified == expected else int((verified * 100) // expected)
 
 
-def build_full_pass_receipt(root: Path, evidence: Mapping[str, Any]) -> dict[str, Any]:
-    """Recompute a v2 receipt from concrete live evidence and staged bytes."""
+def _build_runtime_pass_receipt(root: Path, evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Recompute a runtime receipt from collector evidence and staged bytes."""
     projection = _generation_projection(root)
     validated, evidence_errors = _validated_live_evidence(root, evidence, projection)
     counts = validated["counts"]
@@ -2269,6 +2541,17 @@ def build_full_pass_receipt(root: Path, evidence: Mapping[str, Any]) -> dict[str
     return receipt
 
 
+def _persisted_audit_receipt(runtime_receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist evidence for audit without turning stored bytes into PASS authority."""
+    if runtime_receipt.get("gateStatus") != "PASS":
+        raise GenerationError("only a runtime PASS may be recorded as audit evidence")
+    receipt = dict(runtime_receipt)
+    receipt["gateStatus"] = "AUDIT_ONLY"
+    receipt["runtimeVerificationRequired"] = True
+    receipt["runtimePassReceiptSha256"] = json_sha256(runtime_receipt)
+    return receipt
+
+
 def verify_generation(root: Path, *, require_full_gate: bool = False) -> dict[str, Any]:
     root = _lexical_absolute(root)
     reject_symlink_path(root)
@@ -2293,23 +2576,24 @@ def verify_generation(root: Path, *, require_full_gate: bool = False) -> dict[st
     if full_gate_present:
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
         try:
-            expected_receipt = build_full_pass_receipt(root, evidence)
+            runtime_receipt = _build_runtime_pass_receipt(root, evidence)
+            expected_receipt = _persisted_audit_receipt(runtime_receipt)
         except RichArchiveError as exc:
             full_gate_errors.append(f"live_evidence_invalid:{type(exc).__name__}")
         else:
-            full_gate_errors.extend(expected_receipt.get("errors") or [])
+            full_gate_errors.extend(runtime_receipt.get("errors") or [])
             if receipt != expected_receipt:
-                full_gate_errors.append("receipt_does_not_equal_recomputed_full_gate")
-            if expected_receipt.get("gateStatus") != "PASS":
-                full_gate_errors.append("recomputed_full_gate_not_pass")
+                full_gate_errors.append("receipt_does_not_equal_recomputed_audit_evidence")
+            if runtime_receipt.get("gateStatus") != "PASS":
+                full_gate_errors.append("recomputed_runtime_gate_not_pass")
     else:
         full_gate_errors.append("concrete_live_evidence_or_v2_receipt_missing")
-    if receipt.get("gateStatus") == "PASS" and full_gate_errors:
-        raise GenerationError("PASS receipt failed exact full live completeness validation")
-    if require_full_gate and (
-        not full_gate_present or receipt.get("gateStatus") != "PASS" or full_gate_errors
-    ):
-        raise GenerationError("full live completeness gate is absent or not PASS")
+    if receipt.get("gateStatus") == "PASS":
+        raise GenerationError("stored receipt may not self-assert live PASS")
+    if require_full_gate:
+        raise GenerationError(
+            "offline verification cannot prove live completeness; runtime live evidence token is required"
+        )
     ok = (
         projection["duplicateCanonicalIds"] == 0
         and projection["unknownVisibleFields"] == 0
@@ -2333,13 +2617,53 @@ def verify_generation(root: Path, *, require_full_gate: bool = False) -> dict[st
     }
 
 
+def verify_full_generation(
+    root: Path,
+    *,
+    live_evidence_token: LiveEvidenceToken | None,
+) -> dict[str, Any]:
+    """Return PASS only while a registered collector capability is live."""
+    evidence = _require_live_evidence_token(live_evidence_token)
+    local = verify_generation(root)
+    evidence_path = _lexical_absolute(root) / "receipts" / "live-inventory-evidence.json"
+    receipt_path = _lexical_absolute(root) / "receipts" / "rich-archive-latest.json"
+    if not _regular_single_link(evidence_path) or not _regular_single_link(receipt_path):
+        raise GenerationError("runtime full gate audit evidence is missing")
+    persisted_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if persisted_evidence != evidence:
+        raise GenerationError("runtime token does not match persisted live evidence")
+    runtime_receipt = _build_runtime_pass_receipt(root, evidence)
+    if runtime_receipt.get("gateStatus") != "PASS" or runtime_receipt.get("errors"):
+        raise GenerationError("runtime live completeness gate is not PASS")
+    persisted_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if persisted_receipt != _persisted_audit_receipt(runtime_receipt):
+        raise GenerationError("persisted audit receipt does not match runtime verification")
+    if not local.get("ok") or local.get("fullGateErrors"):
+        raise GenerationError("local generation or audit evidence verification failed")
+    return {
+        **local,
+        "gateStatus": "PASS",
+        "fullGatePresent": True,
+        "runtimeEvidenceVerified": True,
+        "runtimeReceipt": runtime_receipt,
+    }
+
+
 _LOCK_TOKEN_GUARD = object()
+_LOCK_TOKEN_REGISTRY: dict[str, dict[str, Any]] = {}
 
 
 class ArchiveLockToken:
     """Unforgeable-in-process proof that the shared backup lock is held."""
 
-    def __init__(self, path: Path, handle: Any, *, guard: object) -> None:
+    def __init__(
+        self,
+        path: Path,
+        handle: Any,
+        *,
+        issuer_store_id: int,
+        guard: object,
+    ) -> None:
         if guard is not _LOCK_TOKEN_GUARD:
             raise RichArchiveError("archive lock token cannot be constructed externally")
         info = os.fstat(handle.fileno())
@@ -2349,6 +2673,8 @@ class ArchiveLockToken:
         self._pid = os.getpid()
         self._device = info.st_dev
         self._inode = info.st_ino
+        self._descriptor = handle.fileno()
+        self._issuer_store_id = issuer_store_id
         self._nonce = secrets.token_hex(32)
         self._closed = False
 
@@ -2359,6 +2685,9 @@ class ArchiveLockToken:
     def close(self) -> None:
         if self._closed:
             return
+        registration = _LOCK_TOKEN_REGISTRY.get(self._nonce)
+        if registration is not None and registration.get("token")() is self:
+            _LOCK_TOKEN_REGISTRY.pop(self._nonce, None)
         try:
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
         finally:
@@ -2409,17 +2738,45 @@ class RichArchiveStore:
         except OSError:
             handle.close()
             raise RichArchiveError("shared backup lock is busy")
-        return ArchiveLockToken(self.lock_path, handle, guard=_LOCK_TOKEN_GUARD)
+        token = ArchiveLockToken(
+            self.lock_path,
+            handle,
+            issuer_store_id=id(self),
+            guard=_LOCK_TOKEN_GUARD,
+        )
+        _LOCK_TOKEN_REGISTRY[token._nonce] = {
+            "token": weakref.ref(token),
+            "pid": os.getpid(),
+            "path": token.path,
+            "device": token._device,
+            "inode": token._inode,
+            "descriptor": token._descriptor,
+            "issuerStoreId": id(self),
+        }
+        return token
 
     def _require_lock(self, lock_token: ArchiveLockToken | None) -> ArchiveLockToken:
         if self.lock_path is None:
             raise RichArchiveError("shared backup lock path is required for archive mutation")
+        registration = (
+            _LOCK_TOKEN_REGISTRY.get(lock_token._nonce)
+            if isinstance(lock_token, ArchiveLockToken)
+            else None
+        )
         if (
             not isinstance(lock_token, ArchiveLockToken)
             or lock_token._guard is not _LOCK_TOKEN_GUARD
             or lock_token.closed
             or lock_token._pid != os.getpid()
             or lock_token.path != self.lock_path
+            or registration is None
+            or registration.get("token")() is not lock_token
+            or registration.get("pid") != os.getpid()
+            or registration.get("path") != self.lock_path
+            or registration.get("device") != lock_token._device
+            or registration.get("inode") != lock_token._inode
+            or registration.get("descriptor") != lock_token._descriptor
+            or registration.get("issuerStoreId") != lock_token._issuer_store_id
         ):
             raise RichArchiveError("valid shared backup lock ownership token is required")
         try:
@@ -2434,8 +2791,26 @@ class RichArchiveStore:
             or path_info.st_ino != lock_token._inode
             or not stat.S_ISREG(path_info.st_mode)
             or path_info.st_nlink != 1
+            or lock_token._handle.fileno() != lock_token._descriptor
         ):
             raise RichArchiveError("shared backup lock ownership token no longer matches lock file")
+        # On supported flock platforms, a second open-file description must be
+        # unable to obtain the same exclusive lock while this token is live.
+        probe_descriptor = os.open(
+            self.lock_path,
+            os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            try:
+                fcntl.flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise RichArchiveError("shared backup lock ownership probe failed") from exc
+            else:
+                fcntl.flock(probe_descriptor, fcntl.LOCK_UN)
+                raise RichArchiveError("shared backup lock is not actually held")
+        finally:
+            os.close(probe_descriptor)
         return lock_token
 
     def _pointer_body(self, generation_id: str, generation_sha256: str) -> dict[str, str]:
@@ -2505,8 +2880,10 @@ class RichArchiveStore:
         generation_id: str,
         downloader: AssetDownloader | None = None,
         lock_token: ArchiveLockToken | None = None,
-        run_budget: AssetRunBudget | None = None,
+        run_budget: AssetRunBudget,
     ) -> dict[str, Any]:
+        if not isinstance(run_budget, AssetRunBudget):
+            raise AssetDownloadError("externally owned shared asset run budget is required")
         owned_lock = None
         if lock_token is None:
             owned_lock = self.acquire_lock()
@@ -2529,7 +2906,7 @@ class RichArchiveStore:
                 day = canonical_day(message)
                 by_day[day] = merge_day_records(by_day.get(day, []), [record])
             if downloader is not None:
-                budget = run_budget or AssetRunBudget.from_limits(downloader.limits)
+                budget = run_budget
                 if budget.limits != downloader.limits:
                     raise AssetDownloadError("shared asset run budget limits do not match downloader limits")
                 assets = [
@@ -2604,12 +2981,13 @@ class RichArchiveStore:
     def install_full_pass_evidence(
         self,
         stage: Path,
-        evidence: Mapping[str, Any],
         *,
+        live_evidence_token: LiveEvidenceToken | None,
         lock_token: ArchiveLockToken | None = None,
     ) -> dict[str, Any]:
-        """Install concrete evidence and a recomputed PASS receipt on a stage."""
+        """Install collector evidence; only the live token can authorize PASS."""
         self._require_lock(lock_token)
+        evidence = _require_live_evidence_token(live_evidence_token)
         stage = _lexical_absolute(stage)
         if self.staging not in stage.parents or stage.parent != self.staging:
             raise GenerationError("full PASS evidence may only be installed on an owned stage")
@@ -2618,16 +2996,25 @@ class RichArchiveStore:
             raise GenerationError("full PASS evidence stage is missing")
         evidence_path = contained_path(stage, "receipts/live-inventory-evidence.json")
         atomic_json(evidence_path, evidence)
-        receipt = build_full_pass_receipt(stage, evidence)
-        if receipt.get("gateStatus") != "PASS":
+        runtime_receipt = _build_runtime_pass_receipt(stage, evidence)
+        if runtime_receipt.get("gateStatus") != "PASS":
             raise GenerationError("concrete live evidence did not satisfy the full PASS gate")
-        atomic_json(stage / "receipts" / "rich-archive-latest.json", receipt)
+        audit_receipt = _persisted_audit_receipt(runtime_receipt)
+        atomic_json(stage / "receipts" / "rich-archive-latest.json", audit_receipt)
         manifest = generation_inventory(stage)
         atomic_json(stage / "generation-manifest.json", manifest)
-        verified = verify_generation(stage, require_full_gate=True)
+        verified = verify_full_generation(
+            stage,
+            live_evidence_token=live_evidence_token,
+        )
         if not verified["ok"]:
             raise GenerationError("full PASS evidence stage failed local verification")
-        return {"receipt": receipt, "manifest": manifest, "verified": verified}
+        return {
+            "receipt": runtime_receipt,
+            "auditReceipt": audit_receipt,
+            "manifest": manifest,
+            "verified": verified,
+        }
 
     def publish_stage(
         self,
@@ -2636,6 +3023,7 @@ class RichArchiveStore:
         generation_sha256: str,
         *,
         require_full_gate: bool = False,
+        live_evidence_token: LiveEvidenceToken | None = None,
         lock_token: ArchiveLockToken | None = None,
     ) -> None:
         self._require_lock(lock_token)
@@ -2646,7 +3034,12 @@ class RichArchiveStore:
         expected_stage = contained_path(self.staging, generation_id)
         if _lexical_absolute(stage) != expected_stage or stage.is_symlink() or not stage.is_dir():
             raise GenerationError("publish stage path is invalid")
-        verified = verify_generation(stage, require_full_gate=require_full_gate)
+        verified = verify_generation(stage)
+        if require_full_gate:
+            verified = verify_full_generation(
+                stage,
+                live_evidence_token=live_evidence_token,
+            )
         if not verified["ok"] or verified["generationSha256"] != generation_sha256:
             raise GenerationError("publish stage failed generation verification")
         if final.exists() or final.is_symlink():
@@ -2715,14 +3108,14 @@ __all__ = [
     "ArchiveLockToken", "AssetDownloadError", "AssetDownloader", "AssetLimits",
     "AssetProbeBudget", "AssetRunBudget", "DEFAULT_CDN_HOSTS", "ENTRY_RECEIPT_SCHEMA",
     "GENERATION_MANIFEST_SCHEMA", "GenerationError", "LIVE_EVIDENCE_SCHEMA", "RECORD_SCHEMA",
-    "RichArchiveError", "RichArchiveStore", "SOURCE_CENSUS_SCHEMA",
+    "LiveEvidenceToken", "RichArchiveError", "RichArchiveStore", "SOURCE_CENSUS_SCHEMA",
     "SourceBoundsError", "SourceCensusError", "apply_asset_results", "atomic_json",
     "atomic_jsonl", "canonical_day", "contained_path", "file_sha256",
-    "build_full_pass_receipt", "build_live_inventory_evidence", "generation_inventory",
+    "collect_live_evidence", "generation_inventory",
     "inventory_assets", "json_sha256", "load_jsonl",
     "merge_day_records", "merge_message_records", "normalize_message",
     "parse_markdown_markers", "preflight_asset_capacity", "render_day",
     "render_message", "required_render_sections", "resolve_asset_sizes",
     "renderer_pointer_accounting", "sanitize_lossless_source", "source_field_census",
-    "validate_record", "verify_generation",
+    "validate_record", "verify_full_generation", "verify_generation",
 ]
