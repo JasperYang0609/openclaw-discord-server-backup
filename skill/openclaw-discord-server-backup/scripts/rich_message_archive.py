@@ -32,6 +32,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import weakref
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path, PurePosixPath
@@ -44,7 +46,13 @@ JOURNAL_SCHEMA = "openclaw-discord-rich-journal.v1"
 GENERATION_MANIFEST_SCHEMA = "openclaw-discord-rich-generation.v1"
 ENTRY_RECEIPT_SCHEMA = "openclaw-discord-rich-entry-receipt.v2"
 LIVE_EVIDENCE_SCHEMA = "openclaw-discord-rich-live-evidence.v2"
+DISCORD_PAGE_RESPONSE_SCHEMA = "openclaw-discord-page-response.v1"
+DISCORD_INVENTORY_RESPONSE_SCHEMA = "openclaw-discord-inventory-response.v1"
+FULL_RUN_RECEIPT_SCHEMA = "openclaw-discord-full-rebuild-run.v1"
+ASSET_RESERVATION_SCHEMA = "openclaw-discord-full-run-asset-reservation.v1"
 SOURCE_CENSUS_SCHEMA = "openclaw-discord-source-census.v2"
+DEFAULT_LIVE_EVIDENCE_TTL_SECONDS = 300.0
+MAX_LIVE_EVIDENCE_TTL_SECONDS = 900.0
 TZ_TAIPEI = timezone(timedelta(hours=8))
 MACHINE_MARKER_RE = re.compile(
     r"^<!-- openclaw-rich-message id=(\d{1,24}) visible=([0-9a-f]{64}) -->$",
@@ -1484,6 +1492,7 @@ class AssetRunBudget:
         destination_root: Path,
         *,
         assume_unknown_max: bool,
+        assets_materialized: bool = False,
     ) -> dict[str, int]:
         return preflight_asset_capacity(
             assets,
@@ -1492,6 +1501,7 @@ class AssetRunBudget:
             run_file_count=self.file_count,
             run_declared_bytes=self.declared_bytes,
             assume_unknown_max=assume_unknown_max,
+            assets_materialized=assets_materialized,
         )
 
     def commit_entry(self, result: Mapping[str, Any]) -> None:
@@ -1513,7 +1523,10 @@ def preflight_asset_capacity(
     run_file_count: int = 0,
     run_declared_bytes: int = 0,
     assume_unknown_max: bool = False,
+    assets_materialized: bool = False,
 ) -> dict[str, int]:
+    if not isinstance(assets_materialized, bool):
+        raise AssetDownloadError("asset materialization state must be boolean")
     in_scope = [asset for asset in assets if asset.get("inScope")]
     if len(in_scope) > limits.per_entry_files or run_file_count + len(in_scope) > limits.full_run_files:
         raise AssetDownloadError("asset file quota exceeded before download")
@@ -1549,7 +1562,7 @@ def preflight_asset_capacity(
     if not probe.exists() or not probe.is_dir():
         raise AssetDownloadError("no existing directory is available for disk capacity preflight")
     free = shutil.disk_usage(probe).free
-    required = declared + limits.disk_reserve_bytes
+    required = limits.disk_reserve_bytes if assets_materialized else declared + limits.disk_reserve_bytes
     if free < required:
         raise AssetDownloadError("insufficient disk capacity before attachment download")
     return {"files": len(in_scope), "declaredBytes": declared, "freeBytes": free, "requiredBytes": required}
@@ -1953,82 +1966,6 @@ def _validate_immutable_evidence_reference(value: Any) -> dict[str, Any]:
     }
 
 
-_LIVE_EVIDENCE_GUARD = object()
-_LIVE_EVIDENCE_REGISTRY: dict[str, dict[str, Any]] = {}
-
-
-class LiveEvidenceToken:
-    """Runtime-only capability minted by the bounded Discord collector."""
-
-    def __init__(self, evidence: Mapping[str, Any], *, guard: object) -> None:
-        if guard is not _LIVE_EVIDENCE_GUARD:
-            raise RichArchiveError("live evidence token cannot be constructed externally")
-        self._evidence = json.loads(json.dumps(evidence, ensure_ascii=False))
-        self._nonce = secrets.token_hex(32)
-        self._pid = os.getpid()
-        self._closed = False
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    def audit_evidence(self) -> dict[str, Any]:
-        if self._closed:
-            raise RichArchiveError("live evidence token is closed")
-        return json.loads(json.dumps(self._evidence, ensure_ascii=False))
-
-    def close(self) -> None:
-        registration = _LIVE_EVIDENCE_REGISTRY.get(self._nonce)
-        if registration is not None and registration.get("token")() is self:
-            _LIVE_EVIDENCE_REGISTRY.pop(self._nonce, None)
-        self._closed = True
-
-    def __enter__(self) -> "LiveEvidenceToken":
-        return self
-
-    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
-        self.close()
-
-
-def _mint_live_evidence_token(evidence: Mapping[str, Any]) -> LiveEvidenceToken:
-    token = LiveEvidenceToken(evidence, guard=_LIVE_EVIDENCE_GUARD)
-    _LIVE_EVIDENCE_REGISTRY[token._nonce] = {
-        "token": weakref.ref(token),
-        "pid": os.getpid(),
-        "channelId": str(evidence["entryIdentity"]["channelId"]),
-        "relativePath": str(evidence["entryIdentity"]["relativePath"]),
-        "evidenceSha256": str(evidence["evidenceSha256"]),
-    }
-    return token
-
-
-def _require_live_evidence_token(token: LiveEvidenceToken | None) -> dict[str, Any]:
-    registration = (
-        _LIVE_EVIDENCE_REGISTRY.get(token._nonce)
-        if isinstance(token, LiveEvidenceToken)
-        else None
-    )
-    if (
-        not isinstance(token, LiveEvidenceToken)
-        or token.closed
-        or token._pid != os.getpid()
-        or registration is None
-        or registration.get("token")() is not token
-        or registration.get("pid") != os.getpid()
-    ):
-        raise GenerationError("valid runtime live evidence token is required")
-    evidence = token.audit_evidence()
-    if (
-        evidence.get("evidenceSha256") != registration.get("evidenceSha256")
-        or str(evidence.get("entryIdentity", {}).get("channelId") or "")
-        != registration.get("channelId")
-        or str(evidence.get("entryIdentity", {}).get("relativePath") or "")
-        != registration.get("relativePath")
-    ):
-        raise GenerationError("runtime live evidence token binding changed")
-    return evidence
-
-
 def _inventory_identities(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     identities: list[dict[str, str]] = []
     channels: set[str] = set()
@@ -2052,39 +1989,495 @@ def _source_page(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return [sanitize_lossless_source(dict(message)) for message in messages]
 
 
+def _validated_inventory_response(value: Any) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Require explicit completeness metadata from the Discord inventory adapter."""
+    if not isinstance(value, Mapping):
+        raise GenerationError("authoritative Discord inventory response is required")
+    request = value.get("request")
+    entries_value = value.get("entries")
+    if (
+        value.get("schemaVersion") != DISCORD_INVENTORY_RESPONSE_SCHEMA
+        or value.get("source") != "discord-api-runtime-inventory"
+        or value.get("complete") is not True
+        or value.get("truncated") is not False
+        or value.get("terminalPageObserved") is not True
+        or value.get("activeChannelsComplete") is not True
+        or value.get("activeThreadsComplete") is not True
+        or value.get("archivedThreadsComplete") is not True
+        or not isinstance(request, Mapping)
+        or request.get("includeActiveThreads") is not True
+        or request.get("includeArchivedThreads") is not True
+        or not isinstance(entries_value, list)
+        or any(not isinstance(row, Mapping) for row in entries_value)
+        or not isinstance(value.get("responseCount"), int)
+        or isinstance(value.get("responseCount"), bool)
+        or value.get("responseCount") != len(entries_value)
+        or not isinstance(value.get("pageCount"), int)
+        or isinstance(value.get("pageCount"), bool)
+        or value.get("pageCount") < 1
+    ):
+        raise GenerationError("Discord inventory response is partial, truncated, or malformed")
+    identities = _inventory_identities([dict(row) for row in entries_value])
+    canonical = {
+        "schemaVersion": DISCORD_INVENTORY_RESPONSE_SCHEMA,
+        "source": "discord-api-runtime-inventory",
+        "request": {
+            "includeActiveThreads": True,
+            "includeArchivedThreads": True,
+        },
+        "complete": True,
+        "truncated": False,
+        "terminalPageObserved": True,
+        "activeChannelsComplete": True,
+        "activeThreadsComplete": True,
+        "archivedThreadsComplete": True,
+        "pageCount": int(value["pageCount"]),
+        "responseCount": len(identities),
+        "entries": identities,
+    }
+    return canonical, identities
+
+
+def _validated_page_response(
+    value: Any,
+    *,
+    channel_id: str,
+    before: str | None,
+    limit: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Validate one exact adapter response, including anti-truncation metadata."""
+    if not isinstance(value, Mapping):
+        raise GenerationError("authoritative Discord page response is required")
+    request = value.get("request")
+    messages_value = value.get("messages")
+    if (
+        value.get("schemaVersion") != DISCORD_PAGE_RESPONSE_SCHEMA
+        or value.get("source") != "discord-api-runtime-page"
+        or value.get("complete") is not True
+        or value.get("truncated") is not False
+        or not isinstance(request, Mapping)
+        or not isinstance(request.get("channelId"), str)
+        or request.get("channelId") != channel_id
+        or request.get("before") != before
+        or not isinstance(request.get("limit"), int)
+        or isinstance(request.get("limit"), bool)
+        or request.get("limit") != limit
+        or not isinstance(messages_value, list)
+        or any(not isinstance(row, Mapping) for row in messages_value)
+        or not isinstance(value.get("responseCount"), int)
+        or isinstance(value.get("responseCount"), bool)
+        or value.get("responseCount") != len(messages_value)
+        or len(messages_value) > limit
+    ):
+        raise GenerationError("Discord page response is partial, truncated, or request-mismatched")
+    sources = _source_page([dict(row) for row in messages_value])
+    canonical = {
+        "schemaVersion": DISCORD_PAGE_RESPONSE_SCHEMA,
+        "source": "discord-api-runtime-page",
+        "request": {
+            "channelId": channel_id,
+            "before": before,
+            "limit": limit,
+        },
+        "complete": True,
+        "truncated": False,
+        "responseCount": len(sources),
+        "messages": sources,
+    }
+    return canonical, sources
+
+
+_RUN_CONTEXT_GUARD = object()
+_RUN_CONTEXT_REGISTRY: dict[str, dict[str, Any]] = {}
+
+
+class ArchiveRunContext:
+    """Opaque module-minted capability owning one run-wide asset budget."""
+
+    __slots__ = ("_nonce", "_pid", "_kind", "_closed", "__weakref__")
+
+    def __init__(self, *, kind: str, guard: object) -> None:
+        if guard is not _RUN_CONTEXT_GUARD or kind not in {"full_rebuild", "incremental"}:
+            raise RichArchiveError("archive run context cannot be constructed externally")
+        self._nonce = secrets.token_hex(32)
+        self._pid = os.getpid()
+        self._kind = kind
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        registration = _RUN_CONTEXT_REGISTRY.get(self._nonce)
+        if registration is not None and registration.get("context")() is self:
+            _RUN_CONTEXT_REGISTRY.pop(self._nonce, None)
+        self._closed = True
+
+    def __enter__(self) -> "ArchiveRunContext":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+
+class FullRebuildRunContext(ArchiveRunContext):
+    __slots__ = ()
+
+
+class IncrementalRunContext(ArchiveRunContext):
+    __slots__ = ()
+
+
+def _mint_run_context(
+    *,
+    kind: str,
+    entries: Sequence[Mapping[str, str]],
+    archive_root: Path,
+    limits: AssetLimits,
+    inventory_response: Mapping[str, Any] | None,
+    expected_entries: Sequence[Mapping[str, str]] | None = None,
+) -> ArchiveRunContext:
+    context_type = FullRebuildRunContext if kind == "full_rebuild" else IncrementalRunContext
+    context = context_type(kind=kind, guard=_RUN_CONTEXT_GUARD)
+    archive_root = _lexical_absolute(archive_root)
+    reject_symlink_path(archive_root)
+    identities = [dict(row) for row in entries]
+    digest = json_sha256(identities)
+    expected_identities = [dict(row) for row in (expected_entries or identities)]
+    entry_roots = {
+        (row["channelId"], row["normalizedRelativePath"]): contained_path(
+            archive_root, row["relativePath"],
+        )
+        for row in expected_identities
+    }
+    _RUN_CONTEXT_REGISTRY[context._nonce] = {
+        "context": weakref.ref(context),
+        "pid": os.getpid(),
+        "kind": kind,
+        "runContextId": secrets.token_hex(32),
+        "archiveRoot": archive_root,
+        "archiveRootSha256": json_sha256(str(archive_root)),
+        "entries": identities,
+        "expectedEntries": expected_identities,
+        "expectedEntriesDigest": json_sha256(expected_identities),
+        "entryKeys": {
+            (row["channelId"], row["normalizedRelativePath"])
+            for row in expected_identities
+        },
+        "entryRoots": entry_roots,
+        "inventoryDigest": digest,
+        "inventoryResponse": (
+            json.loads(json.dumps(inventory_response, ensure_ascii=False))
+            if inventory_response is not None else None
+        ),
+        "budget": AssetRunBudget.from_limits(limits),
+        "assetReservations": {},
+        "usedAssetReservations": set(),
+        "processed": {},
+    }
+    return context
+
+
+def begin_full_rebuild_run(
+    *,
+    fetch_inventory: Callable[[], Mapping[str, Any]],
+    expected_entries: Sequence[Mapping[str, Any]],
+    archive_root: Path,
+    limits: AssetLimits | None = None,
+) -> FullRebuildRunContext:
+    expected = _inventory_identities(expected_entries)
+    response, entries = _validated_inventory_response(fetch_inventory())
+    if entries != expected:
+        raise GenerationError(
+            "authoritative Discord inventory does not equal the independent expected entry set"
+        )
+    context = _mint_run_context(
+        kind="full_rebuild",
+        entries=entries,
+        expected_entries=expected,
+        archive_root=archive_root,
+        limits=limits or AssetLimits(),
+        inventory_response=response,
+    )
+    assert isinstance(context, FullRebuildRunContext)
+    return context
+
+
+def begin_incremental_run(
+    *,
+    entries: Sequence[Mapping[str, Any]],
+    archive_root: Path,
+    limits: AssetLimits | None = None,
+) -> IncrementalRunContext:
+    identities = _inventory_identities(entries)
+    context = _mint_run_context(
+        kind="incremental",
+        entries=identities,
+        archive_root=archive_root,
+        limits=limits or AssetLimits(),
+        inventory_response=None,
+    )
+    assert isinstance(context, IncrementalRunContext)
+    return context
+
+
+def _require_run_context(
+    context: ArchiveRunContext | None,
+    *,
+    kind: str | None = None,
+    identity: Mapping[str, str] | None = None,
+    entry_root: Path | None = None,
+) -> dict[str, Any]:
+    registration = (
+        _RUN_CONTEXT_REGISTRY.get(context._nonce)
+        if isinstance(context, ArchiveRunContext)
+        else None
+    )
+    if (
+        not isinstance(context, ArchiveRunContext)
+        or context.closed
+        or context._pid != os.getpid()
+        or registration is None
+        or registration.get("context")() is not context
+        or registration.get("pid") != os.getpid()
+        or registration.get("kind") != context._kind
+        or (kind is not None and registration.get("kind") != kind)
+    ):
+        raise RichArchiveError("valid module-minted archive run context is required")
+    if identity is not None:
+        key = (identity["channelId"], identity["normalizedRelativePath"])
+        if key not in registration["entryKeys"]:
+            raise RichArchiveError("archive entry is outside the run context inventory")
+        if entry_root is not None and _lexical_absolute(entry_root) != registration["entryRoots"][key]:
+            raise RichArchiveError("archive entry root does not match the run context identity")
+    return registration
+
+
+def finalize_full_rebuild_run(context: FullRebuildRunContext | None) -> dict[str, Any]:
+    """Consume a full-run context and prove every inventoried entry published."""
+    registration = _require_run_context(context, kind="full_rebuild")
+    expected = sorted(
+        (row["channelId"] for row in registration["expectedEntries"]), key=int,
+    )
+    processed = sorted(registration["processed"], key=int)
+    errors = [] if processed == expected else ["not_all_inventory_entries_published"]
+    reservation_ids = {
+        channel_id: str(receipt.get("reservationId") or "")
+        for channel_id, receipt in registration["assetReservations"].items()
+    }
+    if (
+        sorted(reservation_ids, key=int) != expected
+        or set(reservation_ids.values()) != registration["usedAssetReservations"]
+    ):
+        errors.append("not_all_asset_reservations_consumed")
+    current_hashes: dict[str, str | None] = {}
+    for identity in registration["expectedEntries"]:
+        channel_id = identity["channelId"]
+        key = (channel_id, identity["normalizedRelativePath"])
+        actual_hash: str | None = None
+        try:
+            current = RichArchiveStore(registration["entryRoots"][key]).resolve_current()
+            if current is not None:
+                actual_hash = verify_generation(current)["generationSha256"]
+        except (RichArchiveError, OSError, ValueError):
+            errors.append(f"current_generation_readback_failed:{channel_id}")
+        current_hashes[channel_id] = actual_hash
+        if registration["processed"].get(channel_id) != actual_hash:
+            errors.append(f"current_generation_hash_mismatch:{channel_id}")
+    budget = registration["budget"]
+    receipt: dict[str, Any] = {
+        "schemaVersion": FULL_RUN_RECEIPT_SCHEMA,
+        "gateStatus": "PASS" if not errors else "FAIL",
+        "runContextId": registration["runContextId"],
+        "archiveRootSha256": registration["archiveRootSha256"],
+        "inventoryDigest": registration["inventoryDigest"],
+        "expectedEntriesDigest": registration["expectedEntriesDigest"],
+        "inventoryResponseSha256": json_sha256(registration["inventoryResponse"]),
+        "expectedEntryCount": len(expected),
+        "processedEntryCount": len(processed),
+        "processedGenerationSha256ByChannel": dict(registration["processed"]),
+        "assetReservationIdByChannel": reservation_ids,
+        "currentGenerationSha256ByChannel": current_hashes,
+        "assetFileCount": budget.file_count,
+        "assetDeclaredBytes": budget.declared_bytes,
+        "errors": sorted(set(errors)),
+    }
+    receipt["receiptSha256"] = json_sha256(receipt)
+    context.close()
+    return receipt
+
+
+_LIVE_EVIDENCE_GUARD = object()
+_LIVE_EVIDENCE_REGISTRY: dict[str, dict[str, Any]] = {}
+
+
+class LiveEvidenceToken:
+    """Opaque, expiring, one-transaction proof minted by the live collector."""
+
+    __slots__ = ("_nonce", "_pid", "_closed", "__weakref__")
+
+    def __init__(self, *, guard: object) -> None:
+        if guard is not _LIVE_EVIDENCE_GUARD:
+            raise RichArchiveError("live evidence token cannot be constructed externally")
+        self._nonce = secrets.token_hex(32)
+        self._pid = os.getpid()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def audit_evidence(self) -> dict[str, Any]:
+        registration = _require_live_evidence_token(self, allowed_states={"fresh", "prepared"})
+        return json.loads(json.dumps(registration["evidence"], ensure_ascii=False))
+
+    def close(self) -> None:
+        _consume_live_evidence_token(self)
+
+    def __enter__(self) -> "LiveEvidenceToken":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+
+def _consume_live_evidence_token(token: LiveEvidenceToken | None) -> None:
+    if not isinstance(token, LiveEvidenceToken):
+        return
+    registration = _LIVE_EVIDENCE_REGISTRY.get(token._nonce)
+    if registration is not None and registration.get("token")() is token:
+        registration["state"] = "consumed"
+        _LIVE_EVIDENCE_REGISTRY.pop(token._nonce, None)
+    token._closed = True
+
+
+def _generation_binding(root: Path) -> tuple[Path, str]:
+    absolute = _lexical_absolute(root)
+    generation_id = _validated_generation_id(absolute.name)
+    if absolute.parent.name not in {".staging", "generations"}:
+        raise GenerationError("generation root is outside a managed entry transaction")
+    return absolute.parent.parent, generation_id
+
+
+def _require_live_evidence_token(
+    token: LiveEvidenceToken | None,
+    *,
+    root: Path | None = None,
+    allowed_states: set[str] | None = None,
+) -> dict[str, Any]:
+    registration = (
+        _LIVE_EVIDENCE_REGISTRY.get(token._nonce)
+        if isinstance(token, LiveEvidenceToken)
+        else None
+    )
+    states = allowed_states or {"fresh", "prepared"}
+    if (
+        not isinstance(token, LiveEvidenceToken)
+        or token.closed
+        or token._pid != os.getpid()
+        or registration is None
+        or registration.get("token")() is not token
+        or registration.get("pid") != os.getpid()
+        or registration.get("state") not in states
+    ):
+        raise GenerationError("valid runtime live evidence token is required")
+    if time.monotonic() > registration["expiresAtMonotonic"]:
+        _consume_live_evidence_token(token)
+        raise GenerationError("runtime live evidence token expired")
+    run_context = registration["runContext"]()
+    run_registration = _require_run_context(run_context, kind="full_rebuild")
+    if (
+        run_registration["runContextId"] != registration["runContextId"]
+        or run_registration["archiveRoot"] != registration["archiveRoot"]
+        or run_registration["archiveRootSha256"] != registration["archiveRootSha256"]
+        or run_registration["expectedEntriesDigest"] != registration["expectedEntriesDigest"]
+    ):
+        raise GenerationError("runtime live evidence run context binding changed")
+    if root is not None:
+        entry_root, generation_id = _generation_binding(root)
+        if (
+            entry_root != registration["entryRoot"]
+            or generation_id != registration["generationId"]
+        ):
+            raise GenerationError("runtime live evidence token targets another transaction")
+    evidence = registration["evidence"]
+    transaction = evidence.get("transactionBinding") or {}
+    identity = evidence.get("entryIdentity") or {}
+    if (
+        evidence.get("evidenceSha256") != registration.get("evidenceSha256")
+        or identity.get("channelId") != registration.get("channelId")
+        or identity.get("relativePath") != registration.get("relativePath")
+        or transaction.get("generationId") != registration.get("generationId")
+        or transaction.get("runContextId") != registration.get("runContextId")
+        or transaction.get("archiveRootSha256") != registration.get("archiveRootSha256")
+        or transaction.get("inventoryDigest") != registration.get("inventoryDigest")
+        or transaction.get("expectedEntriesDigest") != registration.get("expectedEntriesDigest")
+        or transaction.get("verifiedCutoff") != registration.get("verifiedCutoff")
+    ):
+        raise GenerationError("runtime live evidence token binding changed")
+    return registration
+
+
 def collect_live_evidence(
     *,
-    fetch_page: Callable[..., Sequence[Mapping[str, Any]]],
-    fetch_inventory: Callable[[], Sequence[Mapping[str, Any]]],
+    fetch_page: Callable[..., Mapping[str, Any]],
     verify_immutable_evidence: Callable[[], Mapping[str, Any]],
+    run_context: FullRebuildRunContext,
+    entry_root: Path,
+    generation_id: str,
     channel_id: str,
     relative_path: str,
     page_limit: int = 100,
     max_pages: int = 100_000,
     max_messages: int = 10_000_000,
+    evidence_ttl_seconds: float = DEFAULT_LIVE_EVIDENCE_TTL_SECONDS,
     allowed_cdn_hosts: frozenset[str] = DEFAULT_CDN_HOSTS,
 ) -> LiveEvidenceToken:
     """Perform bounded backward pagination and mint non-persistable PASS authority."""
-    if not str(channel_id).isdigit() or not 1 <= page_limit <= 100:
+    if (
+        not str(channel_id).isdigit()
+        or not isinstance(page_limit, int)
+        or isinstance(page_limit, bool)
+        or not 1 <= page_limit <= 100
+    ):
         raise GenerationError("live collector channel or page limit is invalid")
-    if max_pages < 1 or max_messages < 0:
+    if (
+        not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1
+        or not isinstance(max_messages, int) or isinstance(max_messages, bool) or max_messages < 0
+        or not isinstance(evidence_ttl_seconds, (int, float))
+        or isinstance(evidence_ttl_seconds, bool)
+        or not 0 < evidence_ttl_seconds <= MAX_LIVE_EVIDENCE_TTL_SECONDS
+    ):
         raise GenerationError("live collector bounds are invalid")
+    generation_id = _validated_generation_id(generation_id)
+    entry_root = _lexical_absolute(entry_root)
     identity = _validated_entry_identity({
         "channelId": str(channel_id),
         "relativePath": relative_path,
         "normalizedRelativePath": unicodedata.normalize("NFKC", relative_path).casefold(),
     })
-    inventory_started = datetime.now(timezone.utc).isoformat()
-    inventory = _inventory_identities(list(fetch_inventory()))
-    if identity not in inventory:
-        raise GenerationError("fresh inventory does not contain the exact entry identity")
+    run_registration = _require_run_context(
+        run_context,
+        kind="full_rebuild",
+        identity=identity,
+        entry_root=entry_root,
+    )
+    inventory_response = run_registration.get("inventoryResponse")
+    if inventory_response is None:
+        raise GenerationError("full rebuild context lacks authoritative inventory evidence")
+    inventory, inventory_entries = _validated_inventory_response(inventory_response)
+    if identity not in inventory_entries:
+        raise GenerationError("full rebuild inventory does not contain the exact entry identity")
     immutable = _validate_immutable_evidence_reference(verify_immutable_evidence())
     fetch_started = datetime.now(timezone.utc).isoformat()
 
-    cutoff_raw = list(fetch_page(str(channel_id), before=None, limit=1))
-    if len(cutoff_raw) > 1:
-        raise GenerationError("cutoff observation exceeded requested limit")
-    cutoff_sources = _source_page(cutoff_raw)
+    cutoff_envelope, cutoff_sources = _validated_page_response(
+        fetch_page(str(channel_id), before=None, limit=1),
+        channel_id=str(channel_id),
+        before=None,
+        limit=1,
+    )
     for source in cutoff_sources:
         normalize_message(
             source, expected_channel_id=str(channel_id), observed_at=fetch_started,
@@ -2098,10 +2491,12 @@ def collect_live_evidence(
     seen: set[str] = set()
     terminal = False
     for page_index in range(max_pages):
-        page_raw = list(fetch_page(str(channel_id), before=before, limit=page_limit))
-        if len(page_raw) > page_limit:
-            raise GenerationError("Discord page exceeded requested limit")
-        sources = _source_page(page_raw)
+        response_envelope, sources = _validated_page_response(
+            fetch_page(str(channel_id), before=before, limit=page_limit),
+            channel_id=str(channel_id),
+            before=before,
+            limit=page_limit,
+        )
         ids = [str(source.get("id") or "") for source in sources]
         if any(not value.isdigit() for value in ids) or len(ids) != len(set(ids)):
             raise GenerationError("Discord page contains invalid or duplicate message IDs")
@@ -2113,26 +2508,24 @@ def collect_live_evidence(
             raise GenerationError("empty cutoff observation changed during enumeration")
         if cutoff is not None and any(int(value) > int(cutoff) for value in ids):
             raise GenerationError("Discord page crossed the frozen cutoff")
+        if ids != sorted(ids, key=int, reverse=True):
+            raise GenerationError("Discord page message IDs are not strictly newest-first")
         seen.update(ids)
         raw_messages.extend(sources)
-        terminal = len(sources) < page_limit
+        terminal = not sources
         raw_pages.append({
             "pageIndex": page_index,
             "requestBefore": before,
             "requestLimit": page_limit,
-            "responseCount": len(sources),
-            "responseIds": ids,
-            "responseSourcePayloads": sources,
-            "responsePayloadSha256": json_sha256(sources),
+            "responseEnvelope": response_envelope,
+            "responseEnvelopeSha256": json_sha256(response_envelope),
             "terminal": terminal,
         })
         if len(raw_messages) > max_messages:
             raise GenerationError("live collector message bound exceeded")
         if terminal:
             break
-        if not ids:
-            raise GenerationError("non-terminal Discord page was empty")
-        next_before = min(ids, key=int)
+        next_before = ids[-1]
         if before is not None and int(next_before) >= int(before):
             raise GenerationError("Discord pagination cursor did not move backward")
         before = next_before
@@ -2157,17 +2550,28 @@ def collect_live_evidence(
         "entryIdentity": identity,
         "inventory": {
             "complete": True,
-            "entries": inventory,
-            "digest": json_sha256(inventory),
-            "observedAt": inventory_started,
+            "entries": inventory_entries,
+            "digest": run_registration["inventoryDigest"],
+            "responseEnvelope": inventory,
+            "responseEnvelopeSha256": json_sha256(inventory),
+            "observedAt": fetch_started,
             "channelId": str(channel_id),
+        },
+        "transactionBinding": {
+            "entryRootSha256": json_sha256(str(entry_root)),
+            "generationId": generation_id,
+            "runContextId": run_registration["runContextId"],
+            "archiveRootSha256": run_registration["archiveRootSha256"],
+            "inventoryDigest": run_registration["inventoryDigest"],
+            "expectedEntriesDigest": run_registration["expectedEntriesDigest"],
+            "channelId": str(channel_id),
+            "relativePath": relative_path,
+            "verifiedCutoff": cutoff,
         },
         "cutoffObservation": {
             "requestLimit": 1,
-            "responseCount": len(cutoff_sources),
-            "responseIds": [str(source["id"]) for source in cutoff_sources],
-            "responseSourcePayloads": cutoff_sources,
-            "responsePayloadSha256": json_sha256(cutoff_sources),
+            "responseEnvelope": cutoff_envelope,
+            "responseEnvelopeSha256": json_sha256(cutoff_envelope),
         },
         "verifiedCutoff": cutoff,
         "trulyEmpty": not message_rows,
@@ -2188,7 +2592,27 @@ def collect_live_evidence(
         "immutableEvidence": immutable,
     }
     body["evidenceSha256"] = json_sha256(body)
-    return _mint_live_evidence_token(body)
+    token = LiveEvidenceToken(guard=_LIVE_EVIDENCE_GUARD)
+    _LIVE_EVIDENCE_REGISTRY[token._nonce] = {
+        "token": weakref.ref(token),
+        "pid": os.getpid(),
+        "state": "fresh",
+        "evidence": body,
+        "evidenceSha256": body["evidenceSha256"],
+        "entryRoot": entry_root,
+        "generationId": generation_id,
+        "channelId": str(channel_id),
+        "relativePath": relative_path,
+        "verifiedCutoff": cutoff,
+        "inventoryDigest": run_registration["inventoryDigest"],
+        "expectedEntriesDigest": run_registration["expectedEntriesDigest"],
+        "archiveRoot": run_registration["archiveRoot"],
+        "archiveRootSha256": run_registration["archiveRootSha256"],
+        "runContext": weakref.ref(run_context),
+        "runContextId": run_registration["runContextId"],
+        "expiresAtMonotonic": time.monotonic() + float(evidence_ttl_seconds),
+    }
+    return token
 
 
 def _load_generation_records(root: Path) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], int]:
@@ -2275,6 +2699,121 @@ def _generation_projection(root: Path) -> dict[str, Any]:
     }
 
 
+def _verified_generation_assets(
+    root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return unique verified in-scope assets and their immutable byte evidence."""
+    records, _by_day, duplicate_ids = _load_generation_records(root)
+    if duplicate_ids:
+        raise AssetDownloadError("asset reservation rejects duplicate canonical IDs")
+    unique: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for record in records.values():
+        outcome = validate_record(record, generation_root=root)
+        if outcome["attachmentErrors"]:
+            raise AssetDownloadError("asset reservation requires verified local attachment bytes")
+        for observation in record.get("observations") or []:
+            for asset in observation.get("assetInventory") or []:
+                if not asset.get("inScope"):
+                    continue
+                relative = str(asset.get("localRelativePath") or "")
+                path = contained_path(root, relative)
+                declared_size = asset.get("declaredSize")
+                byte_length = asset.get("byteLength")
+                digest = str(asset.get("sha256") or "")
+                if (
+                    asset.get("status") != "complete"
+                    or not isinstance(declared_size, int)
+                    or isinstance(declared_size, bool)
+                    or declared_size < 0
+                    or byte_length != declared_size
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or not _regular_single_link(path)
+                    or path.stat().st_size != byte_length
+                    or file_sha256(path) != digest
+                ):
+                    raise AssetDownloadError("asset reservation encountered unverified attachment bytes")
+                budget_asset = dict(asset)
+                evidence = {
+                    "assetId": str(asset.get("assetId") or ""),
+                    "localRelativePath": relative,
+                    "declaredSize": declared_size,
+                    "byteLength": byte_length,
+                    "sha256": digest,
+                }
+                previous = unique.get(relative)
+                if previous is not None and previous[1] != evidence:
+                    raise AssetDownloadError("asset reservation path has conflicting byte evidence")
+                unique[relative] = (budget_asset, evidence)
+    rows = [unique[key] for key in sorted(unique)]
+    return [row[0] for row in rows], [row[1] for row in rows]
+
+
+def _validated_persisted_asset_reservation(
+    stage: Path,
+    identity: Mapping[str, str],
+) -> dict[str, Any]:
+    entry_root, generation_id = _generation_binding(stage)
+    relative_part_count = len(PurePosixPath(identity["relativePath"]).parts)
+    derived_archive_root = entry_root.parents[relative_part_count - 1]
+    receipt_path = contained_path(stage, "receipts/full-run-asset-reservation.json")
+    if not _regular_single_link(receipt_path):
+        raise AssetDownloadError("full-run asset reservation receipt is required")
+    persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(persisted, Mapping):
+        raise AssetDownloadError("full-run asset reservation receipt is invalid")
+    body = dict(persisted)
+    receipt_sha256 = body.pop("receiptSha256", None)
+    if receipt_sha256 != json_sha256(body):
+        raise AssetDownloadError("full-run asset reservation receipt checksum mismatch")
+    assets, asset_evidence = _verified_generation_assets(stage)
+    if (
+        body.get("schemaVersion") != ASSET_RESERVATION_SCHEMA
+        or not re.fullmatch(r"[0-9a-f]{64}", str(body.get("runContextId") or ""))
+        or body.get("archiveRootSha256") != json_sha256(str(derived_archive_root))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(body.get("inventoryDigest") or ""))
+        or body.get("entryIdentity") != dict(identity)
+        or body.get("entryRootSha256") != json_sha256(str(entry_root))
+        or body.get("generationId") != generation_id
+        or body.get("assetFileCount") != len(assets)
+        or body.get("assetDeclaredBytes") != sum(row["declaredSize"] for row in assets)
+        or body.get("assets") != asset_evidence
+        or body.get("assetsSha256") != json_sha256(asset_evidence)
+    ):
+        raise AssetDownloadError("full-run asset reservation no longer matches staged bytes")
+    reservation_id = str(body.get("reservationId") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", reservation_id):
+        raise AssetDownloadError("full-run asset reservation identity is invalid")
+    return dict(persisted)
+
+
+def _validated_stage_asset_reservation(
+    stage: Path,
+    run_registration: Mapping[str, Any],
+    identity: Mapping[str, str],
+    *,
+    require_unused: bool,
+) -> dict[str, Any]:
+    entry_root, _generation_id = _generation_binding(stage)
+    key = (identity["channelId"], identity["normalizedRelativePath"])
+    if run_registration["entryRoots"].get(key) != entry_root:
+        raise AssetDownloadError("asset reservation targets another archive entry root")
+    registered = run_registration["assetReservations"].get(identity["channelId"])
+    persisted = _validated_persisted_asset_reservation(stage, identity)
+    if not isinstance(registered, Mapping) or dict(registered) != persisted:
+        raise AssetDownloadError("module-minted full-run asset reservation binding is required")
+    body = dict(persisted)
+    if (
+        body.get("runContextId") != run_registration["runContextId"]
+        or body.get("archiveRootSha256") != run_registration["archiveRootSha256"]
+        or body.get("inventoryDigest") != run_registration["inventoryDigest"]
+    ):
+        raise AssetDownloadError("full-run asset reservation run binding mismatch")
+    reservation_id = str(body.get("reservationId") or "")
+    if require_unused and reservation_id in run_registration["usedAssetReservations"]:
+        raise AssetDownloadError("full-run asset reservation was already consumed")
+    return persisted
+
+
 def _validated_live_evidence(root: Path, evidence: Any, projection: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     if not isinstance(evidence, Mapping) or evidence.get("schemaVersion") != LIVE_EVIDENCE_SCHEMA:
@@ -2284,21 +2823,45 @@ def _validated_live_evidence(root: Path, evidence: Any, projection: Mapping[str,
     if supplied_digest != json_sha256(body):
         raise GenerationError("live evidence checksum mismatch")
     identity = _validated_entry_identity(evidence.get("entryIdentity"))
+    entry_root, generation_id = _generation_binding(root)
+    relative_part_count = len(PurePosixPath(identity["relativePath"]).parts)
+    derived_archive_root = entry_root.parents[relative_part_count - 1]
+    transaction = evidence.get("transactionBinding")
+    if not isinstance(transaction, Mapping):
+        raise GenerationError("live evidence transaction binding is missing")
     inventory = evidence.get("inventory")
     if not isinstance(inventory, Mapping) or inventory.get("complete") is not True:
         errors.append("inventory_not_complete")
         inventory = {}
     try:
-        inventory_entries = _inventory_identities(list(inventory.get("entries") or []))
+        inventory_response, inventory_entries = _validated_inventory_response(
+            inventory.get("responseEnvelope")
+        )
     except (RichArchiveError, TypeError):
+        inventory_response = {}
         inventory_entries = []
         errors.append("inventory_entries_invalid")
+    inventory_digest = json_sha256(inventory_entries)
     if (
-        inventory.get("digest") != json_sha256(inventory_entries)
+        inventory.get("digest") != inventory_digest
+        or inventory.get("entries") != inventory_entries
+        or inventory.get("responseEnvelope") != inventory_response
+        or inventory.get("responseEnvelopeSha256") != json_sha256(inventory_response)
         or str(inventory.get("channelId") or "") != identity["channelId"]
         or identity not in inventory_entries
     ):
         errors.append("inventory_identity_or_digest_invalid")
+    if (
+        transaction.get("entryRootSha256") != json_sha256(str(entry_root))
+        or transaction.get("generationId") != generation_id
+        or transaction.get("archiveRootSha256") != json_sha256(str(derived_archive_root))
+        or transaction.get("inventoryDigest") != inventory_digest
+        or transaction.get("expectedEntriesDigest") != inventory_digest
+        or transaction.get("channelId") != identity["channelId"]
+        or transaction.get("relativePath") != identity["relativePath"]
+        or not re.fullmatch(r"[0-9a-f]{64}", str(transaction.get("runContextId") or ""))
+    ):
+        errors.append("transaction_binding_invalid")
     _iso_timestamp(inventory.get("observedAt"), field="inventory.observedAt", required=True)
     immutable = _validate_immutable_evidence_reference(evidence.get("immutableEvidence"))
     enumeration = evidence.get("enumeration")
@@ -2337,48 +2900,58 @@ def _validated_live_evidence(root: Path, evidence: Any, projection: Mapping[str,
         errors.append("live_fetch_time_invalid")
     cutoff_observation = evidence.get("cutoffObservation")
     cutoff_sources: list[dict[str, Any]] = []
+    cutoff_envelope: dict[str, Any] = {}
     if isinstance(cutoff_observation, Mapping):
-        supplied_sources = cutoff_observation.get("responseSourcePayloads")
-        if isinstance(supplied_sources, list) and all(isinstance(row, Mapping) for row in supplied_sources):
-            cutoff_sources = [dict(row) for row in supplied_sources]
+        try:
+            cutoff_envelope, cutoff_sources = _validated_page_response(
+                cutoff_observation.get("responseEnvelope"),
+                channel_id=identity["channelId"],
+                before=None,
+                limit=1,
+            )
+        except RichArchiveError:
+            errors.append("cutoff_observation_invalid")
     cutoff_ids = [str(row.get("id") or "") for row in cutoff_sources]
     if (
         not isinstance(cutoff_observation, Mapping)
         or cutoff_observation.get("requestLimit") != 1
-        or len(cutoff_sources) > 1
-        or cutoff_observation.get("responseCount") != len(cutoff_sources)
-        or cutoff_observation.get("responseIds") != cutoff_ids
-        or cutoff_observation.get("responsePayloadSha256") != json_sha256(cutoff_sources)
+        or cutoff_observation.get("responseEnvelope") != cutoff_envelope
+        or cutoff_observation.get("responseEnvelopeSha256") != json_sha256(cutoff_envelope)
         or any(not value.isdigit() for value in cutoff_ids)
     ):
         errors.append("cutoff_observation_invalid")
     cutoff = evidence.get("verifiedCutoff")
     derived_cutoff = cutoff_ids[0] if cutoff_ids else None
-    if cutoff != derived_cutoff:
+    if cutoff != derived_cutoff or transaction.get("verifiedCutoff") != derived_cutoff:
         errors.append("verified_cutoff_mismatch")
 
     page_sources: list[dict[str, Any]] = []
     seen_page_ids: set[str] = set()
     expected_before = str(int(derived_cutoff) + 1) if derived_cutoff is not None else None
     for index, page in enumerate(pages):
-        sources_value = page.get("responseSourcePayloads")
-        sources = (
-            [dict(row) for row in sources_value]
-            if isinstance(sources_value, list) and all(isinstance(row, Mapping) for row in sources_value)
-            else []
-        )
+        try:
+            response_envelope, sources = _validated_page_response(
+                page.get("responseEnvelope"),
+                channel_id=identity["channelId"],
+                before=expected_before,
+                limit=page_limit,
+            )
+        except RichArchiveError:
+            response_envelope = {}
+            sources = []
+            errors.append(f"pagination_page_invalid:{index}")
         page_ids = [str(row.get("id") or "") for row in sources]
-        page_terminal = len(sources) < page_limit if page_limit else False
+        page_terminal = not sources
         if (
             page.get("pageIndex") != index
             or page.get("requestBefore") != expected_before
             or page.get("requestLimit") != page_limit
-            or page.get("responseCount") != len(sources)
-            or page.get("responseIds") != page_ids
-            or page.get("responsePayloadSha256") != json_sha256(sources)
+            or page.get("responseEnvelope") != response_envelope
+            or page.get("responseEnvelopeSha256") != json_sha256(response_envelope)
             or page.get("terminal") is not page_terminal
             or any(not value.isdigit() for value in page_ids)
             or len(page_ids) != len(set(page_ids))
+            or page_ids != sorted(page_ids, key=int, reverse=True)
             or any(value in seen_page_ids for value in page_ids)
             or (
                 expected_before is not None
@@ -2396,7 +2969,7 @@ def _validated_live_evidence(root: Path, evidence: Any, projection: Mapping[str,
         seen_page_ids.update(page_ids)
         page_sources.extend(sources)
         if page_ids:
-            expected_before = min(page_ids, key=int)
+            expected_before = page_ids[-1]
 
     try:
         derived_rows = sorted(
@@ -2468,6 +3041,7 @@ def _validated_live_evidence(root: Path, evidence: Any, projection: Mapping[str,
         "inventory": dict(inventory),
         "immutable": immutable,
         "cutoff": cutoff,
+        "runContextId": str(transaction.get("runContextId") or ""),
         "counts": counts,
         "evidenceSha256": str(supplied_digest),
     }, sorted(set(errors))
@@ -2490,6 +3064,14 @@ def _build_runtime_pass_receipt(root: Path, evidence: Mapping[str, Any]) -> dict
     counts = validated["counts"]
     inventory = generation_inventory(root)
     errors = list(evidence_errors)
+    try:
+        asset_reservation = _validated_persisted_asset_reservation(
+            root,
+            validated["identity"],
+        )
+    except (RichArchiveError, OSError, ValueError):
+        asset_reservation = {}
+        errors.append("full_run_asset_reservation_invalid")
     if projection["duplicateCanonicalIds"]:
         errors.append("duplicate_canonical_ids")
     if projection["unknownVisibleFields"]:
@@ -2509,10 +3091,13 @@ def _build_runtime_pass_receipt(root: Path, evidence: Mapping[str, Any]) -> dict
         errors.append("coverage_not_complete")
     binding = {
         "entryIdentity": validated["identity"],
+        "runContextId": validated["runContextId"],
         "inventoryDigest": validated["inventory"].get("digest"),
         "verifiedCutoff": validated["cutoff"],
         "liveEvidenceSha256": validated["evidenceSha256"],
         "immutableEvidenceSha256": json_sha256(validated["immutable"]),
+        "assetReservationId": asset_reservation.get("reservationId"),
+        "assetReservationSha256": asset_reservation.get("receiptSha256"),
         "coverageCounts": counts,
         "contentGenerationSha256": inventory["contentGenerationSha256"],
     }
@@ -2530,10 +3115,13 @@ def _build_runtime_pass_receipt(root: Path, evidence: Mapping[str, Any]) -> dict
         "verifiedCutoff": validated["cutoff"],
         "entryIdentity": validated["identity"],
         "entryIdentitySha256": json_sha256(validated["identity"]),
+        "runContextId": validated["runContextId"],
         "liveEvidencePath": "receipts/live-inventory-evidence.json",
         "liveEvidenceSha256": validated["evidenceSha256"],
         "immutableEvidenceVerified": "PASS",
         "immutableEvidenceSha256": json_sha256(validated["immutable"]),
+        "assetReservationId": asset_reservation.get("reservationId"),
+        "assetReservationSha256": asset_reservation.get("receiptSha256"),
         "contentGenerationSha256": inventory["contentGenerationSha256"],
         "fullGateBindingSha256": json_sha256(binding),
         "errors": sorted(set(errors)),
@@ -2617,13 +3205,33 @@ def verify_generation(root: Path, *, require_full_gate: bool = False) -> dict[st
     }
 
 
-def verify_full_generation(
+def _verify_full_generation_runtime(
     root: Path,
     *,
     live_evidence_token: LiveEvidenceToken | None,
+    allowed_states: set[str],
 ) -> dict[str, Any]:
     """Return PASS only while a registered collector capability is live."""
-    evidence = _require_live_evidence_token(live_evidence_token)
+    registration = _require_live_evidence_token(
+        live_evidence_token,
+        root=root,
+        allowed_states=allowed_states,
+    )
+    evidence = json.loads(json.dumps(registration["evidence"], ensure_ascii=False))
+    identity = _validated_entry_identity(evidence.get("entryIdentity"))
+    run_context = registration["runContext"]()
+    run_registration = _require_run_context(
+        run_context,
+        kind="full_rebuild",
+        identity=identity,
+        entry_root=registration["entryRoot"],
+    )
+    asset_reservation = _validated_stage_asset_reservation(
+        root,
+        run_registration,
+        identity,
+        require_unused=True,
+    )
     local = verify_generation(root)
     evidence_path = _lexical_absolute(root) / "receipts" / "live-inventory-evidence.json"
     receipt_path = _lexical_absolute(root) / "receipts" / "rich-archive-latest.json"
@@ -2635,6 +3243,11 @@ def verify_full_generation(
     runtime_receipt = _build_runtime_pass_receipt(root, evidence)
     if runtime_receipt.get("gateStatus") != "PASS" or runtime_receipt.get("errors"):
         raise GenerationError("runtime live completeness gate is not PASS")
+    if (
+        runtime_receipt.get("assetReservationId") != asset_reservation.get("reservationId")
+        or runtime_receipt.get("assetReservationSha256") != asset_reservation.get("receiptSha256")
+    ):
+        raise GenerationError("runtime receipt does not match the full-run asset reservation")
     persisted_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     if persisted_receipt != _persisted_audit_receipt(runtime_receipt):
         raise GenerationError("persisted audit receipt does not match runtime verification")
@@ -2649,32 +3262,32 @@ def verify_full_generation(
     }
 
 
+def verify_full_generation(
+    root: Path,
+    *,
+    live_evidence_token: LiveEvidenceToken | None,
+) -> dict[str, Any]:
+    return _verify_full_generation_runtime(
+        root,
+        live_evidence_token=live_evidence_token,
+        allowed_states={"fresh", "prepared"},
+    )
+
+
 _LOCK_TOKEN_GUARD = object()
 _LOCK_TOKEN_REGISTRY: dict[str, dict[str, Any]] = {}
+_LOCK_TOKEN_REGISTRY_MUTEX = threading.RLock()
 
 
 class ArchiveLockToken:
-    """Unforgeable-in-process proof that the shared backup lock is held."""
+    """Opaque capability; the locked descriptor exists only in the registry."""
 
-    def __init__(
-        self,
-        path: Path,
-        handle: Any,
-        *,
-        issuer_store_id: int,
-        guard: object,
-    ) -> None:
+    __slots__ = ("_nonce", "_pid", "_closed", "__weakref__")
+
+    def __init__(self, *, guard: object) -> None:
         if guard is not _LOCK_TOKEN_GUARD:
             raise RichArchiveError("archive lock token cannot be constructed externally")
-        info = os.fstat(handle.fileno())
-        self.path = _lexical_absolute(path)
-        self._handle = handle
-        self._guard = guard
         self._pid = os.getpid()
-        self._device = info.st_dev
-        self._inode = info.st_ino
-        self._descriptor = handle.fileno()
-        self._issuer_store_id = issuer_store_id
         self._nonce = secrets.token_hex(32)
         self._closed = False
 
@@ -2685,13 +3298,7 @@ class ArchiveLockToken:
     def close(self) -> None:
         if self._closed:
             return
-        registration = _LOCK_TOKEN_REGISTRY.get(self._nonce)
-        if registration is not None and registration.get("token")() is self:
-            _LOCK_TOKEN_REGISTRY.pop(self._nonce, None)
-        try:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self._handle.close()
+        if _release_lock_registration(self._nonce, expected_token=self):
             self._closed = True
 
     def __enter__(self) -> "ArchiveLockToken":
@@ -2699,6 +3306,39 @@ class ArchiveLockToken:
 
     def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
         self.close()
+
+
+def _release_lock_registration(
+    nonce: str,
+    *,
+    expected_token: ArchiveLockToken | None = None,
+) -> bool:
+    with _LOCK_TOKEN_REGISTRY_MUTEX:
+        registration = _LOCK_TOKEN_REGISTRY.get(nonce)
+        if registration is None:
+            return True
+        token = registration.get("token")()
+        if expected_token is not None and token is not expected_token:
+            return False
+        if registration.get("borrowCount", 0) > 0:
+            registration["closing"] = True
+            return False
+        _LOCK_TOKEN_REGISTRY.pop(nonce, None)
+        if token is not None:
+            token._closed = True
+        handle = registration.get("handle")
+        if handle is None:
+            return True
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                handle.close()
+            except (OSError, ValueError):
+                pass
+        return True
 
 
 class RichArchiveStore:
@@ -2738,24 +3378,33 @@ class RichArchiveStore:
         except OSError:
             handle.close()
             raise RichArchiveError("shared backup lock is busy")
-        token = ArchiveLockToken(
-            self.lock_path,
-            handle,
-            issuer_store_id=id(self),
-            guard=_LOCK_TOKEN_GUARD,
+        token = ArchiveLockToken(guard=_LOCK_TOKEN_GUARD)
+        token_nonce = token._nonce
+        token_ref = weakref.ref(
+            token,
+            lambda _reference, nonce=token_nonce: _release_lock_registration(nonce),
         )
-        _LOCK_TOKEN_REGISTRY[token._nonce] = {
-            "token": weakref.ref(token),
-            "pid": os.getpid(),
-            "path": token.path,
-            "device": token._device,
-            "inode": token._inode,
-            "descriptor": token._descriptor,
-            "issuerStoreId": id(self),
-        }
+        with _LOCK_TOKEN_REGISTRY_MUTEX:
+            _LOCK_TOKEN_REGISTRY[token._nonce] = {
+                "token": token_ref,
+                "pid": os.getpid(),
+                "path": self.lock_path,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "descriptor": handle.fileno(),
+                "handle": handle,
+                "borrowCount": 0,
+                "borrowOwners": {},
+                "closing": False,
+            }
         return token
 
-    def _require_lock(self, lock_token: ArchiveLockToken | None) -> ArchiveLockToken:
+    def _lock_registration(
+        self,
+        lock_token: ArchiveLockToken | None,
+        *,
+        allow_closing_owner: bool = False,
+    ) -> dict[str, Any]:
         if self.lock_path is None:
             raise RichArchiveError("shared backup lock path is required for archive mutation")
         registration = (
@@ -2765,33 +3414,31 @@ class RichArchiveStore:
         )
         if (
             not isinstance(lock_token, ArchiveLockToken)
-            or lock_token._guard is not _LOCK_TOKEN_GUARD
             or lock_token.closed
             or lock_token._pid != os.getpid()
-            or lock_token.path != self.lock_path
             or registration is None
             or registration.get("token")() is not lock_token
             or registration.get("pid") != os.getpid()
             or registration.get("path") != self.lock_path
-            or registration.get("device") != lock_token._device
-            or registration.get("inode") != lock_token._inode
-            or registration.get("descriptor") != lock_token._descriptor
-            or registration.get("issuerStoreId") != lock_token._issuer_store_id
         ):
             raise RichArchiveError("valid shared backup lock ownership token is required")
+        owner_count = registration.get("borrowOwners", {}).get(threading.get_ident(), 0)
+        if registration.get("closing") and not (allow_closing_owner and owner_count > 0):
+            raise RichArchiveError("shared backup lock is closing")
+        handle = registration.get("handle")
         try:
-            descriptor_info = os.fstat(lock_token._handle.fileno())
+            descriptor_info = os.fstat(handle.fileno())
             path_info = self.lock_path.lstat()
-        except (OSError, ValueError) as exc:
+        except (AttributeError, OSError, ValueError) as exc:
             raise RichArchiveError("shared backup lock ownership token is no longer valid") from exc
         if (
-            descriptor_info.st_dev != lock_token._device
-            or descriptor_info.st_ino != lock_token._inode
-            or path_info.st_dev != lock_token._device
-            or path_info.st_ino != lock_token._inode
+            descriptor_info.st_dev != registration.get("device")
+            or descriptor_info.st_ino != registration.get("inode")
+            or path_info.st_dev != registration.get("device")
+            or path_info.st_ino != registration.get("inode")
             or not stat.S_ISREG(path_info.st_mode)
             or path_info.st_nlink != 1
-            or lock_token._handle.fileno() != lock_token._descriptor
+            or handle.fileno() != registration.get("descriptor")
         ):
             raise RichArchiveError("shared backup lock ownership token no longer matches lock file")
         # On supported flock platforms, a second open-file description must be
@@ -2811,7 +3458,77 @@ class RichArchiveStore:
                 raise RichArchiveError("shared backup lock is not actually held")
         finally:
             os.close(probe_descriptor)
+        return registration
+
+    def _require_lock(self, lock_token: ArchiveLockToken | None) -> ArchiveLockToken:
+        with _LOCK_TOKEN_REGISTRY_MUTEX:
+            self._lock_registration(lock_token, allow_closing_owner=True)
+        assert isinstance(lock_token, ArchiveLockToken)
         return lock_token
+
+    @contextmanager
+    def _borrow_lock(self, lock_token: ArchiveLockToken | None) -> Iterator[ArchiveLockToken]:
+        """Hold the descriptor until the complete mutation (including nested calls) exits."""
+        lease = self._begin_lock_lease(lock_token)
+        assert isinstance(lock_token, ArchiveLockToken)
+        try:
+            yield lock_token
+        finally:
+            self._end_lock_lease(lease)
+
+    def _begin_lock_lease(self, lock_token: ArchiveLockToken | None) -> dict[str, Any]:
+        owner = threading.get_ident()
+        with _LOCK_TOKEN_REGISTRY_MUTEX:
+            registration = self._lock_registration(
+                lock_token,
+                allow_closing_owner=True,
+            )
+            owners = registration["borrowOwners"]
+            if any(
+                thread_id != owner and count > 0
+                for thread_id, count in owners.items()
+            ):
+                raise RichArchiveError(
+                    "shared backup lock token is already in use by another thread"
+                )
+            if registration.get("closing") and owners.get(owner, 0) == 0:
+                raise RichArchiveError("shared backup lock is closing")
+            owners[owner] = owners.get(owner, 0) + 1
+            registration["borrowCount"] += 1
+        assert isinstance(lock_token, ArchiveLockToken)
+        return {
+            "nonce": lock_token._nonce,
+            "owner": owner,
+            "registration": registration,
+            "token": lock_token,
+        }
+
+    def _end_lock_lease(self, lease: Mapping[str, Any]) -> None:
+        lock_token = lease["token"]
+        owner = lease["owner"]
+        registration = lease["registration"]
+        with _LOCK_TOKEN_REGISTRY_MUTEX:
+            current = _LOCK_TOKEN_REGISTRY.get(lease["nonce"])
+            if current is not registration or current.get("token")() is not lock_token:
+                raise RichArchiveError("shared backup lock lease registry changed during mutation")
+            owners = current["borrowOwners"]
+            if owners.get(owner, 0) < 1 or current.get("borrowCount", 0) < 1:
+                raise RichArchiveError("shared backup lock lease count underflow")
+            owners[owner] -= 1
+            if owners[owner] == 0:
+                owners.pop(owner)
+            current["borrowCount"] -= 1
+            if current["borrowCount"] == 0 and current.get("closing"):
+                _release_lock_registration(lock_token._nonce, expected_token=lock_token)
+
+    def _require_active_lock_lease(self, lock_token: ArchiveLockToken | None) -> None:
+        with _LOCK_TOKEN_REGISTRY_MUTEX:
+            registration = self._lock_registration(
+                lock_token,
+                allow_closing_owner=True,
+            )
+            if registration.get("borrowOwners", {}).get(threading.get_ident(), 0) < 1:
+                raise RichArchiveError("active shared backup lock operation lease is required")
 
     def _pointer_body(self, generation_id: str, generation_sha256: str) -> dict[str, str]:
         return {
@@ -2845,6 +3562,21 @@ class RichArchiveStore:
         copy_current: bool = True,
         lock_token: ArchiveLockToken | None = None,
     ) -> Path:
+        with self._borrow_lock(lock_token):
+            return self._create_stage_under_lease(
+                generation_id,
+                copy_current=copy_current,
+                lock_token=lock_token,
+            )
+
+    def _create_stage_under_lease(
+        self,
+        generation_id: str,
+        *,
+        copy_current: bool,
+        lock_token: ArchiveLockToken | None,
+    ) -> Path:
+        self._require_active_lock_lease(lock_token)
         self._require_lock(lock_token)
         generation_id = _validated_generation_id(generation_id)
         reject_symlink_path(self.entry_root)
@@ -2876,19 +3608,28 @@ class RichArchiveStore:
         messages: Sequence[Mapping[str, Any]],
         *,
         channel_id: str,
+        relative_path: str,
         observed_at: str,
         generation_id: str,
         downloader: AssetDownloader | None = None,
         lock_token: ArchiveLockToken | None = None,
-        run_budget: AssetRunBudget,
+        run_context: ArchiveRunContext,
     ) -> dict[str, Any]:
-        if not isinstance(run_budget, AssetRunBudget):
-            raise AssetDownloadError("externally owned shared asset run budget is required")
+        identity = _validated_entry_identity({
+            "channelId": str(channel_id),
+            "relativePath": relative_path,
+            "normalizedRelativePath": unicodedata.normalize("NFKC", relative_path).casefold(),
+        })
+        run_registration = _require_run_context(
+            run_context,
+            identity=identity,
+            entry_root=self.entry_root,
+        )
         owned_lock = None
         if lock_token is None:
             owned_lock = self.acquire_lock()
             lock_token = owned_lock
-        self._require_lock(lock_token)
+        lease = self._begin_lock_lease(lock_token)
         try:
             current = self.resolve_current()
             if current is None:
@@ -2906,7 +3647,7 @@ class RichArchiveStore:
                 day = canonical_day(message)
                 by_day[day] = merge_day_records(by_day.get(day, []), [record])
             if downloader is not None:
-                budget = run_budget
+                budget = run_registration["budget"]
                 if budget.limits != downloader.limits:
                     raise AssetDownloadError("shared asset run budget limits do not match downloader limits")
                 assets = [
@@ -2940,6 +3681,7 @@ class RichArchiveStore:
             stage = self.create_stage(
                 generation_id, copy_current=True, lock_token=lock_token,
             )
+            self._require_active_lock_lease(lock_token)
             if downloader is not None:
                 by_day = {
                     day: [apply_asset_results(record, downloader, stage) for record in rows]
@@ -2975,8 +3717,78 @@ class RichArchiveStore:
             )
             return {"generationId": generation_id, "verified": True, **local}
         finally:
-            if owned_lock is not None:
-                owned_lock.close()
+            try:
+                self._end_lock_lease(lease)
+            finally:
+                if owned_lock is not None:
+                    owned_lock.close()
+
+    def reserve_full_stage_assets(
+        self,
+        stage: Path,
+        *,
+        run_context: FullRebuildRunContext,
+        channel_id: str,
+        relative_path: str,
+        lock_token: ArchiveLockToken | None = None,
+    ) -> dict[str, Any]:
+        """Bind verified staged attachment bytes to the one shared full-run budget."""
+        identity = _validated_entry_identity({
+            "channelId": str(channel_id),
+            "relativePath": relative_path,
+            "normalizedRelativePath": unicodedata.normalize("NFKC", relative_path).casefold(),
+        })
+        registration = _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            identity=identity,
+            entry_root=self.entry_root,
+        )
+        with self._borrow_lock(lock_token):
+            stage = _lexical_absolute(stage)
+            entry_root, generation_id = _generation_binding(stage)
+            if (
+                entry_root != self.entry_root
+                or stage.parent != self.staging
+                or stage.is_symlink()
+                or not stage.is_dir()
+            ):
+                raise AssetDownloadError("asset reservation requires an owned staging generation")
+            if identity["channelId"] in registration["assetReservations"]:
+                raise AssetDownloadError("full-run entry already has an asset reservation")
+            assets, asset_evidence = _verified_generation_assets(stage)
+            budget = registration["budget"]
+            capacity = budget.preflight_entry(
+                assets,
+                stage,
+                assume_unknown_max=False,
+                assets_materialized=True,
+            )
+            reservation: dict[str, Any] = {
+                "schemaVersion": ASSET_RESERVATION_SCHEMA,
+                "reservationId": secrets.token_hex(32),
+                "runContextId": registration["runContextId"],
+                "archiveRootSha256": registration["archiveRootSha256"],
+                "inventoryDigest": registration["inventoryDigest"],
+                "entryIdentity": identity,
+                "entryRootSha256": json_sha256(str(entry_root)),
+                "generationId": generation_id,
+                "assetFileCount": capacity["files"],
+                "assetDeclaredBytes": capacity["declaredBytes"],
+                "assets": asset_evidence,
+                "assetsSha256": json_sha256(asset_evidence),
+            }
+            reservation["receiptSha256"] = json_sha256(reservation)
+            budget.commit_entry(capacity)
+            registration["assetReservations"][identity["channelId"]] = json.loads(
+                json.dumps(reservation, ensure_ascii=False)
+            )
+            self._require_active_lock_lease(lock_token)
+            atomic_json(
+                contained_path(stage, "receipts/full-run-asset-reservation.json"),
+                reservation,
+            )
+            return reservation
 
     def install_full_pass_evidence(
         self,
@@ -2986,35 +3798,54 @@ class RichArchiveStore:
         lock_token: ArchiveLockToken | None = None,
     ) -> dict[str, Any]:
         """Install collector evidence; only the live token can authorize PASS."""
-        self._require_lock(lock_token)
-        evidence = _require_live_evidence_token(live_evidence_token)
-        stage = _lexical_absolute(stage)
-        if self.staging not in stage.parents or stage.parent != self.staging:
-            raise GenerationError("full PASS evidence may only be installed on an owned stage")
-        reject_symlink_path(stage)
-        if not stage.is_dir():
-            raise GenerationError("full PASS evidence stage is missing")
-        evidence_path = contained_path(stage, "receipts/live-inventory-evidence.json")
-        atomic_json(evidence_path, evidence)
-        runtime_receipt = _build_runtime_pass_receipt(stage, evidence)
-        if runtime_receipt.get("gateStatus") != "PASS":
-            raise GenerationError("concrete live evidence did not satisfy the full PASS gate")
-        audit_receipt = _persisted_audit_receipt(runtime_receipt)
-        atomic_json(stage / "receipts" / "rich-archive-latest.json", audit_receipt)
-        manifest = generation_inventory(stage)
-        atomic_json(stage / "generation-manifest.json", manifest)
-        verified = verify_full_generation(
-            stage,
-            live_evidence_token=live_evidence_token,
-        )
-        if not verified["ok"]:
-            raise GenerationError("full PASS evidence stage failed local verification")
-        return {
-            "receipt": runtime_receipt,
-            "auditReceipt": audit_receipt,
-            "manifest": manifest,
-            "verified": verified,
-        }
+        lease: dict[str, Any] | None = None
+        try:
+            lease = self._begin_lock_lease(lock_token)
+            stage = _lexical_absolute(stage)
+            registration = _require_live_evidence_token(
+                live_evidence_token,
+                root=stage,
+                allowed_states={"fresh"},
+            )
+            evidence = json.loads(json.dumps(registration["evidence"], ensure_ascii=False))
+            if self.staging not in stage.parents or stage.parent != self.staging:
+                raise GenerationError("full PASS evidence may only be installed on an owned stage")
+            reject_symlink_path(stage)
+            if not stage.is_dir():
+                raise GenerationError("full PASS evidence stage is missing")
+            evidence_path = contained_path(stage, "receipts/live-inventory-evidence.json")
+            self._require_active_lock_lease(lock_token)
+            atomic_json(evidence_path, evidence)
+            runtime_receipt = _build_runtime_pass_receipt(stage, evidence)
+            if runtime_receipt.get("gateStatus") != "PASS":
+                raise GenerationError("concrete live evidence did not satisfy the full PASS gate")
+            audit_receipt = _persisted_audit_receipt(runtime_receipt)
+            atomic_json(stage / "receipts" / "rich-archive-latest.json", audit_receipt)
+            manifest = generation_inventory(stage)
+            atomic_json(stage / "generation-manifest.json", manifest)
+            verified = verify_full_generation(
+                stage,
+                live_evidence_token=live_evidence_token,
+            )
+            if not verified["ok"]:
+                raise GenerationError("full PASS evidence stage failed local verification")
+            registration["state"] = "prepared"
+            registration["preparedGenerationSha256"] = manifest["generationSha256"]
+            registration["preparedAssetReservationId"] = verified["runtimeReceipt"][
+                "assetReservationId"
+            ]
+            return {
+                "receipt": runtime_receipt,
+                "auditReceipt": audit_receipt,
+                "manifest": manifest,
+                "verified": verified,
+            }
+        except BaseException:
+            _consume_live_evidence_token(live_evidence_token)
+            raise
+        finally:
+            if lease is not None:
+                self._end_lock_lease(lease)
 
     def publish_stage(
         self,
@@ -3026,44 +3857,114 @@ class RichArchiveStore:
         live_evidence_token: LiveEvidenceToken | None = None,
         lock_token: ArchiveLockToken | None = None,
     ) -> None:
-        self._require_lock(lock_token)
-        generation_id = _validated_generation_id(generation_id)
-        if not re.fullmatch(r"[0-9a-f]{64}", generation_sha256):
-            raise GenerationError("invalid generation checksum")
-        final = contained_path(self.generations, generation_id)
-        expected_stage = contained_path(self.staging, generation_id)
-        if _lexical_absolute(stage) != expected_stage or stage.is_symlink() or not stage.is_dir():
-            raise GenerationError("publish stage path is invalid")
-        verified = verify_generation(stage)
-        if require_full_gate:
-            verified = verify_full_generation(
-                stage,
-                live_evidence_token=live_evidence_token,
-            )
-        if not verified["ok"] or verified["generationSha256"] != generation_sha256:
-            raise GenerationError("publish stage failed generation verification")
-        if final.exists() or final.is_symlink():
-            raise GenerationError("generation destination already exists")
-        journal = {
-            "schemaVersion": JOURNAL_SCHEMA,
-            "phase": "prepared",
-            "generationId": generation_id,
-            "generationSha256": generation_sha256,
-            "previousPointerSha256": file_sha256(self.pointer_path) if self.pointer_path.exists() else None,
-        }
-        _write_journal(self.journal_path, journal)
-        os.replace(stage, final)
-        _fsync_dir(self.generations)
-        journal["phase"] = "generation_ready"
-        _write_journal(self.journal_path, journal)
-        pointer = self._pointer_body(generation_id, generation_sha256)
-        pointer["pointerSha256"] = json_sha256(pointer)
-        atomic_json(self.pointer_path, pointer)
-        journal["phase"] = "committed"
-        journal["committedPointerSha256"] = file_sha256(self.pointer_path)
-        _write_journal(self.journal_path, journal)
+        full_registration: dict[str, Any] | None = None
+        run_registration: dict[str, Any] | None = None
+        processed_channel: str | None = None
+        asset_reservation_id: str | None = None
+        lease: dict[str, Any] | None = None
+        try:
+            lease = self._begin_lock_lease(lock_token)
+            generation_id = _validated_generation_id(generation_id)
+            if not re.fullmatch(r"[0-9a-f]{64}", generation_sha256):
+                raise GenerationError("invalid generation checksum")
+            final = contained_path(self.generations, generation_id)
+            expected_stage = contained_path(self.staging, generation_id)
+            if _lexical_absolute(stage) != expected_stage or stage.is_symlink() or not stage.is_dir():
+                raise GenerationError("publish stage path is invalid")
+            verified = verify_generation(stage)
+            if require_full_gate:
+                full_registration = _require_live_evidence_token(
+                    live_evidence_token,
+                    root=stage,
+                    allowed_states={"prepared"},
+                )
+                if full_registration.get("preparedGenerationSha256") != generation_sha256:
+                    raise GenerationError("live evidence token is not prepared for this generation hash")
+                full_registration["state"] = "publishing"
+                verified = _verify_full_generation_runtime(
+                    stage,
+                    live_evidence_token=live_evidence_token,
+                    allowed_states={"publishing"},
+                )
+                run_context = full_registration["runContext"]()
+                identity = _validated_entry_identity(
+                    full_registration["evidence"].get("entryIdentity")
+                )
+                run_registration = _require_run_context(
+                    run_context,
+                    kind="full_rebuild",
+                    identity=identity,
+                    entry_root=full_registration["entryRoot"],
+                )
+                processed_channel = identity["channelId"]
+                asset_reservation_id = str(
+                    verified["runtimeReceipt"].get("assetReservationId") or ""
+                )
+                if full_registration.get("preparedAssetReservationId") != asset_reservation_id:
+                    raise GenerationError("live evidence token asset reservation binding changed")
+                if processed_channel in run_registration["processed"]:
+                    raise GenerationError("full rebuild entry was already published in this run")
+            if not verified["ok"] or verified["generationSha256"] != generation_sha256:
+                raise GenerationError("publish stage failed generation verification")
+            if final.exists() or final.is_symlink():
+                raise GenerationError("generation destination already exists")
+            if require_full_gate:
+                refreshed_registration = _require_live_evidence_token(
+                    live_evidence_token,
+                    root=stage,
+                    allowed_states={"publishing"},
+                )
+                if refreshed_registration is not full_registration:
+                    raise GenerationError("runtime live evidence reservation changed before commit")
+            self._require_active_lock_lease(lock_token)
+            journal = {
+                "schemaVersion": JOURNAL_SCHEMA,
+                "phase": "prepared",
+                "generationId": generation_id,
+                "generationSha256": generation_sha256,
+                "previousPointerSha256": file_sha256(self.pointer_path) if self.pointer_path.exists() else None,
+            }
+            _write_journal(self.journal_path, journal)
+            self._require_active_lock_lease(lock_token)
+            os.replace(stage, final)
+            _fsync_dir(self.generations)
+            journal["phase"] = "generation_ready"
+            _write_journal(self.journal_path, journal)
+            self._require_active_lock_lease(lock_token)
+            pointer = self._pointer_body(generation_id, generation_sha256)
+            pointer["pointerSha256"] = json_sha256(pointer)
+            atomic_json(self.pointer_path, pointer)
+            journal["phase"] = "committed"
+            journal["committedPointerSha256"] = file_sha256(self.pointer_path)
+            _write_journal(self.journal_path, journal)
+            if require_full_gate:
+                assert (
+                    run_registration is not None
+                    and processed_channel is not None
+                    and asset_reservation_id is not None
+                )
+                if asset_reservation_id in run_registration["usedAssetReservations"]:
+                    raise GenerationError("full-run asset reservation was already consumed")
+                run_registration["usedAssetReservations"].add(asset_reservation_id)
+                run_registration["processed"][processed_channel] = generation_sha256
+        finally:
+            try:
+                if lease is not None:
+                    self._end_lock_lease(lease)
+            finally:
+                if require_full_gate:
+                    _consume_live_evidence_token(live_evidence_token)
 
     def recover_journal(self, *, lock_token: ArchiveLockToken | None = None) -> dict[str, Any]:
+        with self._borrow_lock(lock_token):
+            return self._recover_journal_under_lease(lock_token=lock_token)
+
+    def _recover_journal_under_lease(
+        self,
+        *,
+        lock_token: ArchiveLockToken | None,
+    ) -> dict[str, Any]:
+        self._require_active_lock_lease(lock_token)
         self._require_lock(lock_token)
         if not self.journal_path.exists():
             return {"phase": "none", "action": "none"}
@@ -3093,6 +3994,7 @@ class RichArchiveStore:
                 raise GenerationError("recovered CURRENT generation hash mismatch")
             journal["phase"] = "committed"
             journal["recovered"] = True
+            self._require_active_lock_lease(lock_token)
             _write_journal(self.journal_path, journal)
             return {"phase": "committed", "action": "finalized_pointer_commit"}
         # A complete but unpublished generation is retained for explicit resume;
@@ -3105,13 +4007,16 @@ class RichArchiveStore:
 
 
 __all__ = [
-    "ArchiveLockToken", "AssetDownloadError", "AssetDownloader", "AssetLimits",
-    "AssetProbeBudget", "AssetRunBudget", "DEFAULT_CDN_HOSTS", "ENTRY_RECEIPT_SCHEMA",
-    "GENERATION_MANIFEST_SCHEMA", "GenerationError", "LIVE_EVIDENCE_SCHEMA", "RECORD_SCHEMA",
+    "ArchiveLockToken", "ArchiveRunContext", "AssetDownloadError", "AssetDownloader",
+    "AssetLimits", "AssetProbeBudget", "ASSET_RESERVATION_SCHEMA", "DEFAULT_CDN_HOSTS",
+    "DISCORD_INVENTORY_RESPONSE_SCHEMA", "DISCORD_PAGE_RESPONSE_SCHEMA", "ENTRY_RECEIPT_SCHEMA",
+    "FULL_RUN_RECEIPT_SCHEMA", "FullRebuildRunContext", "GENERATION_MANIFEST_SCHEMA",
+    "GenerationError", "IncrementalRunContext", "LIVE_EVIDENCE_SCHEMA", "RECORD_SCHEMA",
     "LiveEvidenceToken", "RichArchiveError", "RichArchiveStore", "SOURCE_CENSUS_SCHEMA",
     "SourceBoundsError", "SourceCensusError", "apply_asset_results", "atomic_json",
-    "atomic_jsonl", "canonical_day", "contained_path", "file_sha256",
-    "collect_live_evidence", "generation_inventory",
+    "atomic_jsonl", "begin_full_rebuild_run", "begin_incremental_run", "canonical_day",
+    "collect_live_evidence", "contained_path", "file_sha256", "finalize_full_rebuild_run",
+    "generation_inventory",
     "inventory_assets", "json_sha256", "load_jsonl",
     "merge_day_records", "merge_message_records", "normalize_message",
     "parse_markdown_markers", "preflight_asset_capacity", "render_day",
