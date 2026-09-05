@@ -28,7 +28,7 @@ Target: OWASP Top 10:2025 A01-A10; ASVS v5.0.0 is `N/A_WITH_REASON` because this
 
 - The versioned manifest specifies schedules, timezone, session mode, notification policy, failure alert threshold/cooldown, and tool policy for every owned job.
 - Ready install requires explicit customer identity. Offline scaffold is reported as partial and creates no cron jobs.
-- Verification requires exactly one enabled job for every declaration and exact contract parity. Legacy `toolsAllow` drift is removed; environment fields on owned jobs fail before mutation because they cannot be safely persisted in rollback receipts.
+- Verification requires exactly one enabled job for every declaration and exact contract parity. Legacy `toolsAllow` on `agentTurn` is removed with the supported edit; command payloads carrying the field and environment fields on owned jobs fail before mutation because they cannot be safely restored from rollback receipts.
 - Evidence: `skill/openclaw-discord-server-backup/manifests/owned-cron.v1.json`, `tests/test_cron_topology_manager.py`, `tests/test_installer_desktop_backup.py`.
 
 ### A03 Software Supply Chain Failures — PASS

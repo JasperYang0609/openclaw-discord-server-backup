@@ -54,7 +54,7 @@ Use scripts for fragile operations. Do not manually invent state transitions.
 - `scripts/check_daily_sync_gate.py`: fail closed when the shared backup lock is busy or today's deterministic inventory report is missing/incomplete.
 - `scripts/reconcile_raw_archive_v3.py`: compare every state entry with raw Markdown and optionally re-fetch full Discord history, appending only message IDs not already verifiably archived.
 - `scripts/weekly_raw_reconcile_v4.py`: recovery-first weekly repair with targeted append-only writes, full-inventory closeout, local-only classification, and report-channel self-drift protection.
-- `scripts/audit_cron_tooling.py`: reject legacy `payload.toolsAllow`; shell jobs must remove the field with `--clear-tools` and pass an isolated GPT/Codex bash canary.
+- `scripts/audit_cron_tooling.py`: reject legacy `payload.toolsAllow` with payload-kind-safe remediation. Only `agentTurn` jobs may use `--clear-tools`; command jobs fail closed and require a reviewed transactional rebuild before the isolated canary.
 - `scripts/snapshot_deployment_assets.py`: checksum customer adapters, wrappers, classification config, and mapping ledgers, then verify them with an isolated restore canary.
 - `scripts/package_skill.py`: build `.skill` artifact.
 - `scripts/run_lancedb_incremental.py`: run optional LanceDB incremental indexing after backup.

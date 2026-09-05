@@ -475,6 +475,65 @@ def test_cron_add_uses_persistent_session_target_for_agent(tmp_path):
     assert "--disabled" in args
 
 
+def test_command_post_add_never_sends_unsupported_tools_patch(tmp_path, monkeypatch):
+    desired, _ = render(tmp_path)
+    row = next(item for item in desired if item["payload"]["kind"] == "command")
+    row["payload"]["toolsAllow"] = ["exec"]
+    client = manager.OpenClawCronClient("openclaw")
+    calls = []
+    monkeypatch.setattr(client, "run", lambda args, **_kwargs: calls.append(list(args)))
+
+    client.configure_post_add("command-job", row, preserve_tools=True)
+
+    assert len(calls) == 1
+    assert "--clear-tools" not in calls[0]
+    assert "--tools" not in calls[0]
+
+
+def test_agent_post_add_still_clears_legacy_tools_policy(tmp_path, monkeypatch):
+    desired, _ = render(tmp_path)
+    row = next(item for item in desired if item["payload"]["kind"] == "agentTurn")
+    client = manager.OpenClawCronClient("openclaw")
+    calls = []
+    monkeypatch.setattr(client, "run", lambda args, **_kwargs: calls.append(list(args)))
+
+    client.configure_post_add("agent-job", row)
+
+    assert len(calls) == 1
+    assert "--clear-tools" in calls[0]
+
+
+def test_agent_post_add_can_restore_tools_policy(tmp_path, monkeypatch):
+    desired, _ = render(tmp_path)
+    row = next(item for item in desired if item["payload"]["kind"] == "agentTurn")
+    row["payload"]["toolsAllow"] = ["message", "exec"]
+    client = manager.OpenClawCronClient("openclaw")
+    calls = []
+    monkeypatch.setattr(client, "run", lambda args, **_kwargs: calls.append(list(args)))
+
+    client.configure_post_add("agent-job", row, preserve_tools=True)
+
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--tools") + 1] == "message,exec"
+    assert "--clear-tools" not in calls[0]
+
+
+def test_command_tools_policy_is_rejected_before_any_mutation(tmp_path):
+    desired, context = render(tmp_path)
+    current = with_ids(desired[:1])
+    assert current[0]["payload"]["kind"] == "command"
+    current[0]["payload"]["toolsAllow"] = ["exec"]
+    client = FakeClient(current)
+
+    with pytest.raises(manager.CronManagerError, match="unrestorable tools policy"):
+        manager.apply_plan(
+            client, client.list_jobs(), desired, context.receipt_dir,
+            context.workspace, run_canary=False,
+        )
+
+    assert client.events == []
+
+
 def test_quiescence_disables_all_owned_before_filesystem_phase_and_restores(tmp_path):
     desired, context = render(tmp_path)
     current = with_ids(desired[:3])

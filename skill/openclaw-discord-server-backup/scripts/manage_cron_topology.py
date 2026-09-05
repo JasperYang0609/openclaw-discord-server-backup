@@ -1055,11 +1055,21 @@ class OpenClawCronClient:
     def configure_post_add(self, job_id: str, desired: dict[str, Any], *, preserve_tools: bool = False) -> None:
         alert = desired.get("failureAlert")
         args = ["cron", "edit", job_id]
-        tools = (desired.get("payload") or {}).get("toolsAllow") if isinstance(desired.get("payload"), dict) else None
-        if preserve_tools and tools is not None:
-            args.extend(["--tools", ",".join(str(item) for item in tools)])
-        else:
-            args.append("--clear-tools")
+        payload = desired.get("payload") if isinstance(desired.get("payload"), dict) else {}
+        payload_kind = payload.get("kind")
+        tools = payload.get("toolsAllow")
+        # OpenClaw 2026.7.1-2 translates command-job tool edits into an invalid
+        # agentTurn payload patch. Fresh command jobs already omit toolsAllow,
+        # while validate_restorable_owned_jobs() rejects legacy command jobs
+        # carrying that field before any mutation. Only agentTurn jobs may use
+        # the supported tool-list edit flags here.
+        if payload_kind == "agentTurn":
+            if preserve_tools and tools is not None:
+                args.extend(["--tools", ",".join(str(item) for item in tools)])
+            else:
+                args.append("--clear-tools")
+        elif payload_kind != "command":
+            raise CronManagerError("unsupported desired payload kind")
         if alert:
             args.extend([
                 "--failure-alert",

@@ -41,8 +41,11 @@ ready, and must not create or mutate cron jobs.
   Agent jobs use packaged prompt files and the minimum existing tool policy.
 - Every owned job enables a failure alert after one execution error, excludes safe
   skipped runs, uses a one-hour cooldown, and sends to the configured report target.
-- Legacy `payload.toolsAllow` is removed from owned jobs with the supported
-  `--clear-tools` operation. An isolated command canary must pass before activation.
+- Compatibility correction (2026-09-05): `--clear-tools` is supported only for
+  `agentTurn`. An owned command job containing `payload.toolsAllow` fails before
+  mutation and requires a reviewed transactional rebuild from the manifest; fresh
+  command declarations omit the field. An isolated command canary must pass before
+  activation.
 
 ## Managed topology
 
@@ -70,8 +73,10 @@ The cron manager exposes `plan`, `apply`, and `verify` operations.
    return a blocker with their IDs; never delete or disable them automatically.
 4. Save a redacted, checksummed pre-change receipt for every owned job definition.
 5. Create missing owned jobs and update drifted owned jobs to the manifest contract.
-6. Clear legacy tools fields, attach alerts, run the isolated canary, and verify the
-   complete topology.
+6. Clear legacy tools fields only on `agentTurn` jobs. Command jobs never receive a
+   tools edit; unsafe owned command definitions fail before mutation and must be
+   rebuilt through a reviewed transaction. Attach alerts, run the isolated canary,
+   and verify the complete topology.
 7. On any failure, remove only jobs created by this transaction and restore prior
    owned definitions. Existing state, queue, config, raw archives, snapshots, and
    unknown cron jobs remain unchanged.

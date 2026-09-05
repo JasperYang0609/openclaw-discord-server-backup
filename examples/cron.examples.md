@@ -94,7 +94,7 @@ Run `scripts/audit_discord_inventory_v3.py` with the guild ID, state path, archi
 
 ## Cron tooling preflight
 
-Before enabling shell-dependent GPT/Codex cron jobs, pipe `openclaw cron list --all --json` into `scripts/audit_cron_tooling.py`. Any `payload.toolsAllow` field is a blocker, including `toolsAllow: []`. Remove the field with `openclaw cron edit <job-id> --clear-tools`, then run a temporary isolated canary that executes `pwd && echo TOOL_OK`; remove the canary after `TOOL_OK` is observed.
+Before enabling shell-dependent GPT/Codex cron jobs, pipe `openclaw cron list --all --json` into `scripts/audit_cron_tooling.py`. Any `payload.toolsAllow` field is a blocker, including `toolsAllow: []`. For an `agentTurn` job, remove the field with `openclaw cron edit <job-id> --clear-tools`. For a command job, stop before mutation and use a reviewed transaction that stages a freshly rendered declaration without `toolsAllow`; never apply a one-off tool-list edit to a command payload. After repair, run a temporary isolated canary that executes `pwd && echo TOOL_OK`; remove the canary after `TOOL_OK` is observed.
 
 ## Daily consolidated health report
 

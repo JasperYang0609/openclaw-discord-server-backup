@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect legacy cron tool allowlists that suppress GPT/Codex shell injection."""
+"""Detect legacy cron tool allowlists and emit payload-kind-safe remediation."""
 from __future__ import annotations
 
 import argparse
@@ -32,18 +32,39 @@ def audit_jobs(data: Any) -> dict[str, Any]:
     enabled = [job for job in jobs if job.get("enabled", True)]
     for job in enabled:
         job_payload = payload(job)
-        message = str(job_payload.get("message") or job_payload.get("prompt") or "")
+        payload_kind = str(job_payload.get("kind") or "unknown")
+        argv = job_payload.get("argv") if isinstance(job_payload.get("argv"), list) else []
+        message = " ".join([
+            str(job_payload.get("message") or job_payload.get("prompt") or ""),
+            *(str(item) for item in argv),
+        ])
         model = str(job_payload.get("model") or job.get("model") or "")
         has_legacy_field = "toolsAllow" in job_payload
         shell_risk = any(marker in message for marker in SHELL_MARKERS)
         if has_legacy_field:
+            if payload_kind == "agentTurn":
+                remediation_mode = "agent_turn_clear"
+                remediation = f"openclaw cron edit {job.get('id')} --clear-tools"
+            elif payload_kind == "command":
+                remediation_mode = "transactional_recreate"
+                remediation = (
+                    "fail closed and transactionally recreate this command job from its approved declaration; "
+                    "do not apply tool-list edits to command jobs"
+                )
+            else:
+                remediation_mode = "manual_review"
+                remediation = (
+                    "fail closed until the payload kind is verified; do not guess a tools edit operation"
+                )
             findings.append({
                 "jobId": str(job.get("id") or ""),
                 "name": job_name(job),
                 "model": model,
+                "payloadKind": payload_kind,
                 "shellRequired": shell_risk,
                 "code": "LEGACY_PAYLOAD_TOOLS_ALLOW",
-                "remediation": f"openclaw cron edit {job.get('id')} --clear-tools",
+                "remediationMode": remediation_mode,
+                "remediation": remediation,
             })
     return {
         "schema": "openclaw-cron-tooling-audit-v1",
@@ -60,7 +81,10 @@ def audit_jobs(data: Any) -> dict[str, Any]:
             "successMarker": "TOOL_OK",
             "cleanup": "remove the temporary canary job after a successful run",
         },
-        "rule": "toolsAllow: [] is still legacy configuration; remove the field with --clear-tools.",
+        "rule": (
+            "toolsAllow: [] is still legacy configuration. Only agentTurn jobs may use --clear-tools; "
+            "command jobs must fail closed and be transactionally recreated without toolsAllow."
+        ),
     }
 
 

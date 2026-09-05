@@ -39,7 +39,9 @@
 - Add recovery-first weekly full-inventory raw repair with bounded append-only closeout, local-only ID classification, and report-channel self-drift protection.
 - Add stable-ID mapping ledgers that preserve customer paths and block unsafe/colliding registration before apply.
 - Add deployment-customization recovery bundles with SHA-256 verification and isolated restore canaries.
-- Add cron tooling preflight that rejects legacy `payload.toolsAllow`, documents `--clear-tools`, and requires a temporary GPT/Codex isolated bash canary.
+- Add cron tooling preflight that rejects legacy `payload.toolsAllow`, permits
+  `--clear-tools` only for `agentTurn`, fails closed on command payloads until a
+  reviewed transactional rebuild, and requires a temporary isolated bash canary.
 
 - Make `post_run_check.py` layout-aware so it performs the full repository checks in a clone and real Python/CLI smoke checks when executed from an installed or extracted `.skill` package.
 - Report active and archived thread counts separately; fail the inventory completeness gate and return an unknown archived total when any archived endpoint is blocked or pagination is incomplete.
