@@ -256,6 +256,7 @@ class FakeResponse:
         self._offset = 0
         self.status = status
         self.headers = headers or {"Content-Length": str(len(body)), "Content-Encoding": "identity"}
+        self.closed = False
 
     def read(self, size=-1):
         if size < 0:
@@ -265,7 +266,7 @@ class FakeResponse:
         return data
 
     def close(self):
-        return None
+        self.closed = True
 
     def getcode(self):
         return self.status
@@ -352,6 +353,45 @@ def test_unknown_size_asset_quota_fails_before_any_head_request(tmp_path):
         )
     assert opener.requests == []
     assert not (store.generations / ".staging-over-quota").exists()
+
+
+def test_unknown_size_probe_budget_is_shared_across_batch_records(tmp_path):
+    store = rich.RichArchiveStore(tmp_path / "entry")
+    write_initial_generation(store, tmp_path, normalize())
+    first = message(
+        id="1540000000000000002", content="",
+        components=[{"type": 12, "items": [{"media": {"url": "https://cdn.discordapp.com/attachments/1/a.png"}}]}],
+    )
+    second = message(
+        id="1540000000000000003", content="",
+        components=[{"type": 12, "items": [{"media": {"url": "https://cdn.discordapp.com/attachments/1/b.png"}}]}],
+    )
+    opener = FakeOpener([])
+    downloader = rich.AssetDownloader(
+        opener=opener,
+        resolver=global_resolver,
+        limits=rich.AssetLimits(max_unknown_size_probes=1, disk_reserve_bytes=0),
+    )
+    with pytest.raises(rich.AssetDownloadError, match="probe quota"):
+        store.merge_messages(
+            [first, second], channel_id=first["channel_id"], observed_at=OBSERVED,
+            generation_id="shared-budget", downloader=downloader,
+        )
+    assert opener.requests == []
+
+
+def test_downloader_closes_response_on_non_success_and_validation_error(tmp_path):
+    non_success = FakeResponse(status=500)
+    downloader = rich.AssetDownloader(opener=FakeOpener([non_success]), resolver=global_resolver)
+    with pytest.raises(rich.AssetDownloadError, match="HTTP status 500"):
+        downloader.download(pending_asset(), tmp_path)
+    assert non_success.closed
+
+    malformed = FakeResponse(headers={"Content-Length": "nope", "Content-Encoding": "identity"})
+    downloader = rich.AssetDownloader(opener=FakeOpener([malformed]), resolver=global_resolver)
+    with pytest.raises(rich.AssetDownloadError, match="Content-Length"):
+        downloader.download(pending_asset(), tmp_path)
+    assert malformed.closed
 
 
 def test_invalid_asset_port_is_metadata_only_without_parser_exception():
