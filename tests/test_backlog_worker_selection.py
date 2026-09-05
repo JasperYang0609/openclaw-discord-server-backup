@@ -235,6 +235,40 @@ def test_normalize_queue_collapses_stale_duplicate_active_item():
     assert queue["items"][0]["cursorMessageId"] == "300"
     assert queue["items"][0]["status"] == "caught_up"
 
+
+def test_legacy_selector_never_consumes_any_rich_prefixed_reason():
+    state = {
+        "entries": {
+            "known-rich": {
+                "type": "channel", "channelId": "10", "relativePath": "known-rich",
+                "lastWrittenMessageId": "100", "lastBackup": "2026-06-08",
+                "syncStatus": "queued", "backlogReason": "rich_incremental_partial",
+            },
+            "future-rich": {
+                "type": "channel", "channelId": "11", "relativePath": "future-rich",
+                "lastWrittenMessageId": "100", "lastBackup": "2026-06-08",
+                "syncStatus": "queued", "backlogReason": "rich_future_protocol_reason",
+            },
+            "legacy": {
+                "type": "channel", "channelId": "12", "relativePath": "legacy",
+                "lastWrittenMessageId": "100", "lastBackup": "2026-06-08",
+                "syncStatus": "partial", "backlogReason": "page_limit_reached",
+            },
+        }
+    }
+    queue = {
+        "version": 1,
+        "items": [
+            {"entryKey": "known-rich", "status": "queued", "reason": "rich_incremental_partial"},
+            {"entryKey": "future-rich", "status": "retry", "reason": "rich_future_protocol_reason"},
+            {"entryKey": "legacy", "status": "queued", "reason": "page_limit_reached"},
+        ],
+    }
+
+    selected = worker.select_candidates(state, queue, 4, RUN_TODAY)
+    assert [row[0] for row in selected] == ["legacy"]
+    assert worker.active_rich_queue_keys(state, queue) == ["future-rich", "known-rich"]
+
 if __name__ == "__main__":
     test_selects_healthy_stale_entry_not_in_queue()
     test_reactivated_queue_cursor_never_lags_state_cursor()

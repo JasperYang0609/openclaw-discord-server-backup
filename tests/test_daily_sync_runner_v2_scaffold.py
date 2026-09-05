@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import importlib.util
 import io
 import json
@@ -77,6 +78,53 @@ def message(message_id: str, *, content: str = "hello") -> dict:
         "channel_id": CHANNEL,
         "content": content,
     }
+
+
+def current_snapshot(
+    ids: list[str], *, verified_empty: bool = False, channel_id: str = CHANNEL
+) -> dict:
+    entry = daily.bind_entry_inventory(
+        binding(), channel_id=channel_id, relative_path="主頻道", entry_type="channel"
+    )
+    source = {message_id: "a" * 64 for message_id in ids}
+    return {
+        "schemaVersion": daily.CURRENT_SNAPSHOT_SCHEMA,
+        "entryBindingSha256": entry["entryBindingSha256"],
+        "channelId": channel_id,
+        "generationId": "generation-20260905",
+        "generationSha256": "b" * 64,
+        "pointerSha256": "c" * 64,
+        "canonicalMessageIds": ids,
+        "activeApiSourcePayloadSha256ById": source,
+        "localGateStatus": "PASS",
+        "fullEvidenceGateStatus": "PASS" if verified_empty else "NOT_PROVIDED",
+        "verifiedEmpty": verified_empty,
+    }
+
+
+def execute_fixture(tmp_path: Path) -> tuple[argparse.Namespace, dict[Path, bytes]]:
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    state_path = tmp_path / "state.json"
+    queue_path = tmp_path / "queue.json"
+    inventory_path = tmp_path / "inventory.json"
+    mapping_path = tmp_path / "mapping.json"
+    config_path = tmp_path / "openclaw.json"
+    state_path.write_text(json.dumps({"entries": {}}), encoding="utf-8")
+    queue_path.write_text(json.dumps({"items": []}), encoding="utf-8")
+    inventory_path.write_text(json.dumps(inventory_payload()), encoding="utf-8")
+    mapping_path.write_text(json.dumps(mapping_payload()), encoding="utf-8")
+    config_path.write_text(json.dumps({}), encoding="utf-8")
+    args = argparse.Namespace(
+        role="daily-sync-1", state=str(state_path), queue=str(queue_path),
+        root=str(archive), inventory=str(inventory_path), mapping_ledger=str(mapping_path),
+        guild_id=GUILD, today="2026-09-05", timezone="Asia/Taipei",
+        openclaw_config=str(config_path), token_env="UNSET_TEST_TOKEN",
+        max_entries=6, max_write_entries=4, page_size=30,
+        max_pages_per_entry=2, max_messages_per_entry=60,
+        max_read_messages=180, mutable_refresh_limit=10,
+    )
+    return args, {path: path.read_bytes() for path in (state_path, queue_path)}
 
 
 def test_inventory_and_mapping_are_bound_by_deterministic_digest():
@@ -279,6 +327,37 @@ def test_response_declared_byte_cap_fails_closed(monkeypatch):
         )
 
 
+def test_verified_empty_head_transport_has_no_cursor_query(monkeypatch):
+    captured = {}
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return json.dumps([message("101")]).encode("utf-8")
+
+    def urlopen(request, *, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(daily.urllib.request, "urlopen", urlopen)
+    rows = daily.discord_messages(
+        "secret", CHANNEL, head=True, limit=10,
+        rate_limit_budget={"waited": 0.0},
+    )
+    parsed = daily.urllib.parse.urlparse(captured["url"])
+    assert daily.urllib.parse.parse_qs(parsed.query) == {"limit": ["10"]}
+    assert captured["timeout"] == 30
+    assert [row["id"] for row in rows] == ["101"]
+
+
 def test_aggregate_rate_limit_wait_cap_fails_closed(monkeypatch):
     def rate_limited(*_args, **_kwargs):
         raise daily.urllib.error.HTTPError(
@@ -312,36 +391,315 @@ def test_queue_then_state_fault_keeps_retry_and_old_cursor(tmp_path):
     assert stat_mode(queue_path) == 0o600
 
 
+def test_queue_then_state_crash_keeps_rich_retry_before_canonical_cursor(tmp_path):
+    queue_path = tmp_path / "queue.json"
+    state_path = tmp_path / "state.json"
+    queue_path.write_text('{"items":[]}\n', encoding="utf-8")
+    state_path.write_text(
+        json.dumps({"entries": {"entry": {"lastWrittenMessageId": "10"}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    def crash_after_queue():
+        raise RuntimeError("crash-after-queue")
+
+    with pytest.raises(RuntimeError, match="crash-after-queue"):
+        daily.persist_queue_then_state(
+            queue_path,
+            {"items": [{
+                "entryKey": "entry", "status": "retry",
+                "reason": "rich_incremental_readback_error",
+            }]},
+            state_path,
+            {"entries": {"entry": {"lastWrittenMessageId": "20"}}},
+            after_queue=crash_after_queue,
+        )
+    assert json.loads(queue_path.read_text())["items"][0]["reason"].startswith("rich_")
+    assert json.loads(state_path.read_text())["entries"]["entry"]["lastWrittenMessageId"] == "10"
+
+
 def stat_mode(path: Path) -> int:
     return os.stat(path).st_mode & 0o777
 
 
 def test_execute_stops_before_core_adapter_and_preserves_files(tmp_path):
-    archive = tmp_path / "archive"
-    archive.mkdir()
-    state_path = tmp_path / "state.json"
-    queue_path = tmp_path / "queue.json"
-    inventory_path = tmp_path / "inventory.json"
-    mapping_path = tmp_path / "mapping.json"
-    config_path = tmp_path / "openclaw.json"
-    state_path.write_text(json.dumps({"entries": {}}), encoding="utf-8")
-    queue_path.write_text(json.dumps({"items": []}), encoding="utf-8")
-    inventory_path.write_text(json.dumps(inventory_payload()), encoding="utf-8")
-    mapping_path.write_text(json.dumps(mapping_payload()), encoding="utf-8")
-    config_path.write_text(json.dumps({}), encoding="utf-8")
-    before = {path: path.read_bytes() for path in (state_path, queue_path)}
-    args = argparse.Namespace(
-        role="daily-sync-1", state=str(state_path), queue=str(queue_path),
-        root=str(archive), inventory=str(inventory_path), mapping_ledger=str(mapping_path),
-        guild_id=GUILD, today="2026-09-05", timezone="Asia/Taipei",
-        openclaw_config=str(config_path), token_env="UNSET_TEST_TOKEN",
-        max_entries=6, max_write_entries=4, page_size=30,
-        max_pages_per_entry=2, max_messages_per_entry=60,
-        max_read_messages=180, mutable_refresh_limit=10,
-    )
+    args, before = execute_fixture(tmp_path)
     with pytest.raises(daily.DailySyncError, match="rich_core_contract_pending"):
         daily.execute(args)
     assert {path: path.read_bytes() for path in before} == before
+
+
+def test_execute_acquires_nominal_slot_before_first_mutable_load(tmp_path, monkeypatch):
+    args, _before = execute_fixture(tmp_path)
+    events: list[str] = []
+    original_load = daily.load_json_object
+
+    class LockedSlot(daily.LockedRichSlotV2):
+        def begin_incremental(self, request):
+            events.append("begin-incremental")
+            assert request.schema_version == daily.INCREMENTAL_BEGIN_SCHEMA
+            raise daily.DailySyncError("rich_core_contract_pending")
+
+    class Adapter(daily.RichCoreAdapterV2):
+        @contextmanager
+        def open_slot(self, *, lock_path):
+            assert lock_path == Path(args.state).parent / ".channel_backup.lock"
+            events.append("lock-entered")
+            yield LockedSlot()
+
+    def observed_load(path, category):
+        if Path(path) == Path(args.state):
+            events.append("load-state")
+        elif Path(path) == Path(args.queue):
+            events.append("load-queue")
+        return original_load(path, category)
+
+    monkeypatch.setattr(daily, "load_json_object", observed_load)
+    with pytest.raises(daily.DailySyncError, match="rich_core_contract_pending"):
+        daily.execute(args, rich_factory=Adapter())
+    assert events.index("lock-entered") < events.index("load-state")
+    assert events.index("lock-entered") < events.index("load-queue")
+    assert events[-1] == "begin-incremental"
+
+
+def test_exact_adapter_contract_rejects_duck_typing_and_version_drift():
+    class DuckTyped:
+        contract = daily.SUPPORTED_RICH_CORE_CONTRACT
+
+        def open_slot(self, **_kwargs):
+            raise AssertionError("must not be called")
+
+    class WrongVersion(daily.RichCoreAdapterV2):
+        contract = daily.RichCoreContractDescriptor(
+            adapter_version="rich-adapter-v999",
+            slot_protocol=daily.RICH_SLOT_PROTOCOL,
+            incremental_protocol=daily.RICH_INCREMENTAL_PROTOCOL,
+            full_snapshot_protocol=daily.RICH_FULL_SNAPSHOT_PROTOCOL,
+            root_current_protocol=daily.RICH_ROOT_CURRENT_PROTOCOL,
+            operations=daily.RICH_CORE_OPERATIONS,
+        )
+
+    with pytest.raises(daily.DailySyncError, match="rich_core_contract_unsupported"):
+        daily.require_rich_adapter(DuckTyped())
+    with pytest.raises(daily.DailySyncError, match="rich_core_contract_unsupported"):
+        daily.require_rich_adapter(WrongVersion())
+    assert daily.require_rich_adapter(daily.RichCoreAdapterV2()).contract == daily.SUPPORTED_RICH_CORE_CONTRACT
+
+
+def test_unsupported_adapter_is_rejected_before_mutable_load(tmp_path, monkeypatch):
+    args, _before = execute_fixture(tmp_path)
+
+    class DuckTyped:
+        contract = daily.SUPPORTED_RICH_CORE_CONTRACT
+
+        def open_slot(self, **_kwargs):
+            raise AssertionError("must not be called")
+
+    monkeypatch.setattr(
+        daily,
+        "load_json_object",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mutable load must not happen")
+        ),
+    )
+    with pytest.raises(daily.DailySyncError, match="rich_core_contract_unsupported"):
+        daily.execute(args, rich_factory=DuckTyped())
+
+
+def test_two_phase_incremental_and_full_protocols_fail_closed_by_default(tmp_path):
+    locked = daily.LockedRichSlotV2()
+    incremental_request = daily.IncrementalBeginRequest(
+        schema_version=daily.INCREMENTAL_BEGIN_SCHEMA,
+        role="daily-sync-1",
+        archive_root=tmp_path,
+        inventory_digest="a" * 64,
+        inventory_observed_at="2026-09-05T00:00:00+00:00",
+        entry_bindings=(),
+        limits=(("maxEntries", 6),),
+    )
+    full_request = daily.FullSnapshotRequest(
+        schema_version=daily.FULL_SNAPSHOT_REQUEST_SCHEMA,
+        run_id="run-20260905",
+        archive_root=tmp_path,
+        inventory_digest="a" * 64,
+        expected_entry_bindings=(),
+    )
+    with pytest.raises(daily.DailySyncError, match="rich_core_contract_pending"):
+        locked.begin_incremental(incremental_request)
+    with pytest.raises(daily.DailySyncError, match="rich_core_contract_pending"):
+        locked.begin_full_rebuild(full_request)
+    full_session = daily.RichFullRebuildSessionV2()
+    for operation in (
+        "collect_and_stage_full_snapshot",
+        "reserve_full_stage_assets",
+        "install_full_pass_evidence",
+        "publish_full_entry",
+        "finalize_full_rebuild",
+    ):
+        with pytest.raises(daily.DailySyncError, match="rich_core_contract_pending"):
+            getattr(full_session, operation)(full_request)
+    root_request = daily.RootRunCurrentRequest(
+        schema_version=daily.ROOT_RUN_CURRENT_REQUEST_SCHEMA,
+        run_id="run-20260905",
+        archive_root=tmp_path,
+        inventory_digest="a" * 64,
+        expected_entry_generation_sha256={},
+    )
+    for operation in ("publish_root_run_current", "inspect_root_run_current"):
+        with pytest.raises(daily.DailySyncError, match="rich_core_contract_pending"):
+            getattr(full_session, operation)(root_request)
+    assert daily.SUPPORTED_RICH_CORE_CONTRACT.operations == (
+        "open_slot", "begin_incremental", "inspect_current",
+        "merge_incremental", "begin_full_rebuild",
+        "collect_and_stage_full_snapshot", "reserve_full_stage_assets",
+        "install_full_pass_evidence", "publish_full_entry",
+        "finalize_full_rebuild", "publish_root_run_current",
+        "inspect_root_run_current",
+    )
+
+
+def test_verified_empty_head_read_detects_first_message_on_next_day():
+    entry = daily.bind_entry_inventory(
+        binding(), channel_id=CHANNEL, relative_path="主頻道", entry_type="channel"
+    )
+    snapshot = current_snapshot([], verified_empty=True)
+    pages = [[], [message("101")]]
+
+    def fetch(_token, _channel, *, head, limit, rate_limit_budget):
+        assert head is True and limit == 10 and rate_limit_budget is budget
+        return pages.pop(0)
+
+    budget = {"waited": 0.0}
+    first, first_complete, first_requests = daily.fetch_verified_empty_head(
+        fetch, "token", CHANNEL, snapshot=snapshot, entry_binding=entry,
+        limit=10, rate_limit_budget=budget,
+    )
+    second, second_complete, second_requests = daily.fetch_verified_empty_head(
+        fetch, "token", CHANNEL, snapshot=snapshot, entry_binding=entry,
+        limit=10, rate_limit_budget=budget,
+    )
+    assert first == [] and first_complete is True and first_requests == 1
+    assert [row["id"] for row in second] == ["101"]
+    assert second_complete is True and second_requests == 1
+
+
+def test_verified_empty_head_exact_limit_is_not_complete():
+    entry = daily.bind_entry_inventory(
+        binding(), channel_id=CHANNEL, relative_path="主頻道", entry_type="channel"
+    )
+    snapshot = current_snapshot([], verified_empty=True)
+
+    def fetch(_token, _channel, *, head, limit, rate_limit_budget):
+        return [message(str(100 + index)) for index in range(limit)]
+
+    rows, complete, _requests = daily.fetch_verified_empty_head(
+        fetch, "token", CHANNEL, snapshot=snapshot, entry_binding=entry,
+        limit=2, rate_limit_budget={"waited": 0.0},
+    )
+    assert len(rows) == 2 and complete is False
+
+
+def test_quiet_current_rejects_cursor_missing_from_canonical_and_generic_ok():
+    entry = daily.bind_entry_inventory(
+        binding(), channel_id=CHANNEL, relative_path="主頻道", entry_type="channel"
+    )
+    with pytest.raises(daily.DailySyncError, match="rich_archive_readback_failed"):
+        daily.validate_quiet_current(current_snapshot(["10"]), entry, cursor="20")
+    with pytest.raises(daily.DailySyncError, match="rich_archive_readback_failed"):
+        daily.validate_quiet_current({"ok": True, "verified": True}, entry, cursor="10")
+    valid = daily.validate_quiet_current(current_snapshot(["10", "20"]), entry, cursor="20")
+    assert valid["canonicalMessageIds"] == ["10", "20"]
+
+
+def test_unverified_empty_snapshot_cannot_authorize_head_read():
+    entry = daily.bind_entry_inventory(
+        binding(), channel_id=CHANNEL, relative_path="主頻道", entry_type="channel"
+    )
+    with pytest.raises(daily.DailySyncError, match="rich_baseline_missing"):
+        daily.fetch_verified_empty_head(
+            lambda *_args, **_kwargs: [], "token", CHANNEL,
+            snapshot=current_snapshot([], verified_empty=False), entry_binding=entry,
+            limit=10, rate_limit_budget={"waited": 0.0},
+        )
+
+
+def test_verified_empty_requires_full_pass_and_current_requires_local_pass():
+    entry = daily.bind_entry_inventory(
+        binding(), channel_id=CHANNEL, relative_path="主頻道", entry_type="channel"
+    )
+    missing_full_gate = current_snapshot([], verified_empty=True)
+    missing_full_gate["fullEvidenceGateStatus"] = "NOT_PROVIDED"
+    with pytest.raises(daily.DailySyncError, match="rich_archive_readback_failed"):
+        daily.validate_current_snapshot(missing_full_gate, entry)
+
+    local_failed = current_snapshot(["10"])
+    local_failed["localGateStatus"] = "FAIL"
+    with pytest.raises(daily.DailySyncError, match="rich_archive_readback_failed"):
+        daily.validate_current_snapshot(local_failed, entry)
+
+
+def test_merge_readback_contract_binds_raw_source_current_and_operation_context():
+    entry = daily.bind_entry_inventory(
+        binding(), channel_id=CHANNEL, relative_path="主頻道", entry_type="channel"
+    )
+    ids = ["10", "20"]
+    raw_hashes = {message_id: "d" * 64 for message_id in ids}
+    commit = {
+        "schemaVersion": daily.MERGE_COMMIT_SCHEMA,
+        "entryBindingSha256": entry["entryBindingSha256"],
+        "channelId": CHANNEL,
+        "preCurrentGenerationId": "generation-before",
+        "preCurrentGenerationSha256": "e" * 64,
+        "committedGenerationId": "generation-20260905",
+        "committedGenerationSha256": "b" * 64,
+        "currentPointerSha256": "c" * 64,
+        "fetchedMessageIds": ids,
+        "fetchedRawPayloadSha256ById": raw_hashes,
+        "activeApiSourcePayloadSha256ById": {message_id: "a" * 64 for message_id in ids},
+        "inventoryDigest": binding()["inventoryDigest"],
+        "inventoryObservedAt": binding()["observedAt"],
+        "verifiedCutoff": "2026-09-05T00:00:00+00:00",
+        "runContextId": "run-context-20260905",
+        "lockReceiptSha256": "f" * 64,
+        "budgetReceiptSha256": "1" * 64,
+        "mode": "incremental",
+    }
+    valid = daily.validate_merge_readback(
+        commit,
+        current_snapshot(ids),
+        entry_binding=entry,
+        expected_raw_sha256_by_id=raw_hashes,
+        inventory_digest=binding()["inventoryDigest"],
+        inventory_observed_at=binding()["observedAt"],
+        verified_cutoff="2026-09-05T00:00:00+00:00",
+    )
+    assert valid["fetchedMessageIds"] == ids
+
+    missing = dict(commit)
+    missing["fetchedMessageIds"] = ["10"]
+    with pytest.raises(daily.DailySyncError, match="rich_archive_readback_failed"):
+        daily.validate_merge_readback(
+            missing,
+            current_snapshot(ids),
+            entry_binding=entry,
+            expected_raw_sha256_by_id=raw_hashes,
+            inventory_digest=binding()["inventoryDigest"],
+            inventory_observed_at=binding()["observedAt"],
+            verified_cutoff="2026-09-05T00:00:00+00:00",
+        )
+
+    stale_current = current_snapshot(ids)
+    stale_current["pointerSha256"] = "9" * 64
+    with pytest.raises(daily.DailySyncError, match="rich_archive_readback_failed"):
+        daily.validate_merge_readback(
+            commit,
+            stale_current,
+            entry_binding=entry,
+            expected_raw_sha256_by_id=raw_hashes,
+            inventory_digest=binding()["inventoryDigest"],
+            inventory_observed_at=binding()["observedAt"],
+            verified_cutoff="2026-09-05T00:00:00+00:00",
+        )
 
 
 def test_error_reason_constructor_never_exposes_arbitrary_text():

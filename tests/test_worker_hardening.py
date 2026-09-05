@@ -176,6 +176,41 @@ def test_worker_skips_when_lock_is_held(tmp_path):
         lock.close()
 
 
+def test_legacy_worker_fails_closed_before_mutation_for_unknown_rich_reason(tmp_path):
+    state_path = tmp_path / "state.json"
+    queue_path = tmp_path / "queue.json"
+    root = tmp_path / "archive"
+    root.mkdir()
+    state = {"entries": {"topic": _entry(
+        "100", syncStatus="queued", backlogReason="rich_future_protocol_reason"
+    )}}
+    queue = {"version": 1, "items": [{
+        "entryKey": "topic", "status": "queued", "attempts": 0,
+        "reason": "rich_future_protocol_reason", "cursorMessageId": "100",
+    }]}
+    worker.save_json(state_path, state)
+    worker.save_json(queue_path, queue)
+    before = (state_path.read_bytes(), queue_path.read_bytes())
+
+    result = subprocess.run(
+        [
+            sys.executable, str(SCRIPT), "--state", str(state_path),
+            "--queue", str(queue_path), "--root", str(root), "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "ok": False,
+        "status": "blocked",
+        "reason": "rich_queue_requires_v2_worker",
+        "blockedEntries": 1,
+    }
+    assert (state_path.read_bytes(), queue_path.read_bytes()) == before
+
+
 def test_audit_warnings_only_count_active_items(tmp_path):
     state_path = tmp_path / "state.json"
     queue_path = tmp_path / "queue.json"

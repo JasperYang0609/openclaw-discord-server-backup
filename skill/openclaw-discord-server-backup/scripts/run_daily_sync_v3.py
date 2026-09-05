@@ -24,7 +24,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -32,6 +32,28 @@ INVENTORY_BINDING_SCHEMA = "openclaw-discord-daily-inventory-binding.v2"
 ENTRY_BINDING_SCHEMA = "openclaw-discord-daily-entry-binding.v2"
 CURRENT_SNAPSHOT_SCHEMA = "openclaw-discord-rich-current-snapshot.v2"
 MERGE_COMMIT_SCHEMA = "openclaw-discord-rich-incremental-commit.v2"
+INCREMENTAL_BEGIN_SCHEMA = "openclaw-discord-rich-incremental-begin.v2"
+FULL_SNAPSHOT_REQUEST_SCHEMA = "openclaw-discord-rich-full-snapshot-request.v1"
+ROOT_RUN_CURRENT_REQUEST_SCHEMA = "openclaw-discord-rich-root-current-request.v1"
+RICH_CORE_ADAPTER_VERSION = "openclaw-discord-rich-core-adapter.v2"
+RICH_SLOT_PROTOCOL = "openclaw-discord-rich-locked-slot.v2"
+RICH_INCREMENTAL_PROTOCOL = "openclaw-discord-rich-incremental-session.v2"
+RICH_FULL_SNAPSHOT_PROTOCOL = "openclaw-discord-rich-full-snapshot-session.v1"
+RICH_ROOT_CURRENT_PROTOCOL = "openclaw-discord-rich-root-current.v1"
+RICH_CORE_OPERATIONS = (
+    "open_slot",
+    "begin_incremental",
+    "inspect_current",
+    "merge_incremental",
+    "begin_full_rebuild",
+    "collect_and_stage_full_snapshot",
+    "reserve_full_stage_assets",
+    "install_full_pass_evidence",
+    "publish_full_entry",
+    "finalize_full_rebuild",
+    "publish_root_run_current",
+    "inspect_root_run_current",
+)
 ACTIVE_QUEUE_STATUSES = frozenset({"queued", "catching_up", "retry"})
 INELIGIBLE_ENTRY_STATUSES = frozenset(
     {"partial", "queued", "catching_up", "retry", "error", "excluded"}
@@ -105,20 +127,199 @@ class MutableRefreshPlan:
     cycle_completed: bool
 
 
-class RichSlotSession(Protocol):
-    """Future v2 rich-core port; implemented only after core review passes."""
+@dataclass(frozen=True)
+class RichCoreContractDescriptor:
+    """Exact nominal boundary between the runner and reviewed rich core.
 
-    def inspect_current(self, entry_root: Path, entry_binding: Mapping[str, Any]) -> Mapping[str, Any]: ...
+    Structural/duck-typed objects are deliberately rejected.  A changed method
+    set or protocol version requires a new adapter and runner review.
+    """
 
-    def normalize_source_bindings(
-        self, messages: Sequence[Mapping[str, Any]], *, channel_id: str, observed_at: str
-    ) -> Mapping[str, str]: ...
+    adapter_version: str
+    slot_protocol: str
+    incremental_protocol: str
+    full_snapshot_protocol: str
+    root_current_protocol: str
+    operations: tuple[str, ...]
 
-    def merge_incremental(self, **operation: Any) -> Mapping[str, Any]: ...
+
+SUPPORTED_RICH_CORE_CONTRACT = RichCoreContractDescriptor(
+    adapter_version=RICH_CORE_ADAPTER_VERSION,
+    slot_protocol=RICH_SLOT_PROTOCOL,
+    incremental_protocol=RICH_INCREMENTAL_PROTOCOL,
+    full_snapshot_protocol=RICH_FULL_SNAPSHOT_PROTOCOL,
+    root_current_protocol=RICH_ROOT_CURRENT_PROTOCOL,
+    operations=RICH_CORE_OPERATIONS,
+)
 
 
-class RichSlotFactory(Protocol):
-    def open_slot(self, *, lock_path: Path) -> AbstractContextManager[RichSlotSession]: ...
+@dataclass(frozen=True)
+class IncrementalBeginRequest:
+    schema_version: str
+    role: str
+    archive_root: Path
+    inventory_digest: str
+    inventory_observed_at: str
+    entry_bindings: tuple[Mapping[str, Any], ...]
+    limits: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class CurrentInspectionRequest:
+    schema_version: str
+    entry_root: Path
+    entry_binding: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class IncrementalMergeRequest:
+    schema_version: str
+    entry_root: Path
+    entry_binding: Mapping[str, Any]
+    observed_at: str
+    messages: tuple[Mapping[str, Any], ...]
+    source_sha256_by_id: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class FullSnapshotRequest:
+    schema_version: str
+    run_id: str
+    archive_root: Path
+    inventory_digest: str
+    expected_entry_bindings: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class RootRunCurrentRequest:
+    schema_version: str
+    run_id: str
+    archive_root: Path
+    inventory_digest: str
+    expected_entry_generation_sha256: Mapping[str, str]
+
+
+class RichIncrementalSessionV2:
+    """Nominal incremental port.  Defaults fail closed until core integration."""
+
+    contract = SUPPORTED_RICH_CORE_CONTRACT
+
+    def inspect_current(self, request: CurrentInspectionRequest) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def merge_incremental(self, request: IncrementalMergeRequest) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+
+class RichFullRebuildSessionV2:
+    """Nominal full-snapshot/root-pointer port; no compatibility fallback."""
+
+    contract = SUPPORTED_RICH_CORE_CONTRACT
+
+    def collect_and_stage_full_snapshot(
+        self, request: FullSnapshotRequest
+    ) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def reserve_full_stage_assets(
+        self, request: FullSnapshotRequest
+    ) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def install_full_pass_evidence(
+        self, request: FullSnapshotRequest
+    ) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def publish_full_entry(
+        self, request: FullSnapshotRequest
+    ) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def finalize_full_rebuild(
+        self, request: FullSnapshotRequest
+    ) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def publish_root_run_current(
+        self, request: RootRunCurrentRequest
+    ) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def inspect_root_run_current(
+        self, request: RootRunCurrentRequest
+    ) -> Mapping[str, Any]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+
+class LockedRichSlotV2:
+    """Second phase: state may be loaded only after this locked slot is entered."""
+
+    contract = SUPPORTED_RICH_CORE_CONTRACT
+
+    def begin_incremental(
+        self, request: IncrementalBeginRequest
+    ) -> AbstractContextManager[RichIncrementalSessionV2]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+    def begin_full_rebuild(
+        self, request: FullSnapshotRequest
+    ) -> AbstractContextManager[RichFullRebuildSessionV2]:
+        del request
+        raise DailySyncError("rich_core_contract_pending")
+
+
+class RichCoreAdapterV2:
+    """First phase: acquire the shared core lock without reading mutable JSON."""
+
+    contract = SUPPORTED_RICH_CORE_CONTRACT
+
+    def open_slot(
+        self, *, lock_path: Path
+    ) -> AbstractContextManager[LockedRichSlotV2]:
+        del lock_path
+        raise DailySyncError("rich_core_contract_pending")
+
+
+def _has_exact_contract(value: Any) -> bool:
+    return (
+        type(getattr(value, "contract", None)) is RichCoreContractDescriptor
+        and value.contract == SUPPORTED_RICH_CORE_CONTRACT
+    )
+
+
+def require_rich_adapter(value: Any) -> RichCoreAdapterV2:
+    if not isinstance(value, RichCoreAdapterV2) or not _has_exact_contract(value):
+        raise DailySyncError("rich_core_contract_unsupported")
+    return value
+
+
+def require_locked_slot(value: Any) -> LockedRichSlotV2:
+    if not isinstance(value, LockedRichSlotV2) or not _has_exact_contract(value):
+        raise DailySyncError("rich_core_contract_unsupported")
+    return value
+
+
+def require_incremental_session(value: Any) -> RichIncrementalSessionV2:
+    if not isinstance(value, RichIncrementalSessionV2) or not _has_exact_contract(value):
+        raise DailySyncError("rich_core_contract_unsupported")
+    return value
+
+
+def require_full_rebuild_session(value: Any) -> RichFullRebuildSessionV2:
+    if not isinstance(value, RichFullRebuildSessionV2) or not _has_exact_contract(value):
+        raise DailySyncError("rich_core_contract_unsupported")
+    return value
 
 
 def now_utc() -> str:
@@ -403,6 +604,218 @@ def bind_entry_inventory(
     return body
 
 
+CURRENT_SNAPSHOT_KEYS = frozenset({
+    "schemaVersion",
+    "entryBindingSha256",
+    "channelId",
+    "generationId",
+    "generationSha256",
+    "pointerSha256",
+    "canonicalMessageIds",
+    "activeApiSourcePayloadSha256ById",
+    "localGateStatus",
+    "fullEvidenceGateStatus",
+    "verifiedEmpty",
+})
+MERGE_COMMIT_KEYS = frozenset({
+    "schemaVersion",
+    "entryBindingSha256",
+    "channelId",
+    "preCurrentGenerationId",
+    "preCurrentGenerationSha256",
+    "committedGenerationId",
+    "committedGenerationSha256",
+    "currentPointerSha256",
+    "fetchedMessageIds",
+    "fetchedRawPayloadSha256ById",
+    "activeApiSourcePayloadSha256ById",
+    "inventoryDigest",
+    "inventoryObservedAt",
+    "verifiedCutoff",
+    "runContextId",
+    "lockReceiptSha256",
+    "budgetReceiptSha256",
+    "mode",
+})
+
+
+def _safe_receipt_identifier(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 160
+        and not any(unicodedata.category(character) == "Cc" for character in value)
+    )
+
+
+def _exact_hash_map(value: Any, expected_ids: Sequence[str]) -> dict[str, str] | None:
+    if not isinstance(value, Mapping) or set(value) != set(expected_ids):
+        return None
+    normalized = dict(value)
+    if any(
+        not isinstance(item, str) or not HASH_RE.fullmatch(item)
+        for item in normalized.values()
+    ):
+        return None
+    return normalized
+
+
+def validate_current_snapshot(
+    snapshot: Mapping[str, Any], entry_binding: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate one exact CURRENT readback; generic success flags are ignored."""
+    if not isinstance(snapshot, Mapping) or set(snapshot) != CURRENT_SNAPSHOT_KEYS:
+        raise DailySyncError("rich_archive_readback_failed")
+    message_ids = snapshot.get("canonicalMessageIds")
+    source_hashes = snapshot.get("activeApiSourcePayloadSha256ById")
+    generation_id = snapshot.get("generationId")
+    if (
+        snapshot.get("schemaVersion") != CURRENT_SNAPSHOT_SCHEMA
+        or snapshot.get("entryBindingSha256") != entry_binding.get("entryBindingSha256")
+        or snapshot.get("channelId") != entry_binding.get("channelId")
+        or not isinstance(snapshot.get("entryBindingSha256"), str)
+        or not HASH_RE.fullmatch(snapshot["entryBindingSha256"])
+        or not isinstance(snapshot.get("channelId"), str)
+        or not SNOWFLAKE_RE.fullmatch(snapshot["channelId"])
+        or not _safe_receipt_identifier(generation_id)
+        or not isinstance(snapshot.get("generationSha256"), str)
+        or not HASH_RE.fullmatch(snapshot["generationSha256"])
+        or not isinstance(snapshot.get("pointerSha256"), str)
+        or not HASH_RE.fullmatch(snapshot["pointerSha256"])
+        or not isinstance(message_ids, list)
+        or not isinstance(source_hashes, Mapping)
+        or snapshot.get("localGateStatus") != "PASS"
+        or snapshot.get("fullEvidenceGateStatus") not in {"PASS", "NOT_PROVIDED"}
+        or type(snapshot.get("verifiedEmpty")) is not bool
+    ):
+        raise DailySyncError("rich_archive_readback_failed")
+    normalized_ids = [str(value) for value in message_ids]
+    if (
+        any(not SNOWFLAKE_RE.fullmatch(value) for value in normalized_ids)
+        or normalized_ids != sorted(set(normalized_ids), key=int)
+        or _exact_hash_map(source_hashes, normalized_ids) is None
+        or (snapshot["verifiedEmpty"] and normalized_ids)
+        or (
+            snapshot["verifiedEmpty"]
+            and snapshot["fullEvidenceGateStatus"] != "PASS"
+        )
+    ):
+        raise DailySyncError("rich_archive_readback_failed")
+    return {
+        **dict(snapshot),
+        "canonicalMessageIds": normalized_ids,
+        "activeApiSourcePayloadSha256ById": dict(source_hashes),
+    }
+
+
+def validate_merge_readback(
+    commit: Mapping[str, Any],
+    current_snapshot: Mapping[str, Any],
+    *,
+    entry_binding: Mapping[str, Any],
+    expected_raw_sha256_by_id: Mapping[str, str],
+    inventory_digest: str,
+    inventory_observed_at: str,
+    verified_cutoff: str,
+) -> dict[str, Any]:
+    """Bind an incremental commit to the exact fetched payloads and CURRENT.
+
+    The commit and the independently inspected CURRENT are both exact schemas;
+    generic success flags, omitted IDs, stale pointers, or substituted source
+    digests fail closed before any caller may advance canonical state.
+    """
+    if not isinstance(commit, Mapping) or set(commit) != MERGE_COMMIT_KEYS:
+        raise DailySyncError("rich_archive_readback_failed")
+    fetched_ids = commit.get("fetchedMessageIds")
+    if not isinstance(fetched_ids, list):
+        raise DailySyncError("rich_archive_readback_failed")
+    normalized_ids = [str(value) for value in fetched_ids]
+    if not isinstance(expected_raw_sha256_by_id, Mapping):
+        raise DailySyncError("rich_archive_readback_failed")
+    expected_input_ids = [str(value) for value in expected_raw_sha256_by_id]
+    if (
+        any(not SNOWFLAKE_RE.fullmatch(value) for value in expected_input_ids)
+        or len(expected_input_ids) != len(set(expected_input_ids))
+    ):
+        raise DailySyncError("rich_archive_readback_failed")
+    expected_ids = sorted(expected_input_ids, key=int)
+    raw_hashes = _exact_hash_map(
+        commit.get("fetchedRawPayloadSha256ById"), normalized_ids
+    )
+    source_hashes = _exact_hash_map(
+        commit.get("activeApiSourcePayloadSha256ById"), normalized_ids
+    )
+    expected_raw_hashes = _exact_hash_map(expected_raw_sha256_by_id, expected_ids)
+    if (
+        commit.get("schemaVersion") != MERGE_COMMIT_SCHEMA
+        or commit.get("mode") != "incremental"
+        or commit.get("entryBindingSha256")
+        != entry_binding.get("entryBindingSha256")
+        or commit.get("channelId") != entry_binding.get("channelId")
+        or any(not SNOWFLAKE_RE.fullmatch(value) for value in normalized_ids)
+        or normalized_ids != sorted(set(normalized_ids), key=int)
+        or normalized_ids != expected_ids
+        or raw_hashes is None
+        or expected_raw_hashes is None
+        or raw_hashes != expected_raw_hashes
+        or source_hashes is None
+        or inventory_digest != entry_binding.get("inventoryDigest")
+        or inventory_observed_at != entry_binding.get("inventoryObservedAt")
+        or not isinstance(inventory_digest, str)
+        or not HASH_RE.fullmatch(inventory_digest)
+        or commit.get("inventoryDigest") != inventory_digest
+        or commit.get("inventoryObservedAt") != inventory_observed_at
+        or commit.get("verifiedCutoff") != verified_cutoff
+        or not _safe_receipt_identifier(commit.get("preCurrentGenerationId"))
+        or not _safe_receipt_identifier(commit.get("committedGenerationId"))
+        or not _safe_receipt_identifier(commit.get("runContextId"))
+        or any(
+            not isinstance(commit.get(key), str)
+            or not HASH_RE.fullmatch(commit[key])
+            for key in (
+                "preCurrentGenerationSha256",
+                "committedGenerationSha256",
+                "currentPointerSha256",
+                "lockReceiptSha256",
+                "budgetReceiptSha256",
+            )
+        )
+    ):
+        raise DailySyncError("rich_archive_readback_failed")
+
+    current = validate_current_snapshot(current_snapshot, entry_binding)
+    current_ids = set(current["canonicalMessageIds"])
+    current_sources = current["activeApiSourcePayloadSha256ById"]
+    if (
+        commit["committedGenerationId"] != current["generationId"]
+        or commit["committedGenerationSha256"] != current["generationSha256"]
+        or commit["currentPointerSha256"] != current["pointerSha256"]
+        or not set(normalized_ids).issubset(current_ids)
+        or any(current_sources.get(key) != source_hashes[key] for key in normalized_ids)
+    ):
+        raise DailySyncError("rich_archive_readback_failed")
+    return {
+        **dict(commit),
+        "fetchedMessageIds": normalized_ids,
+        "fetchedRawPayloadSha256ById": raw_hashes,
+        "activeApiSourcePayloadSha256ById": source_hashes,
+    }
+
+
+def validate_quiet_current(
+    snapshot: Mapping[str, Any], entry_binding: Mapping[str, Any], *, cursor: str | None
+) -> dict[str, Any]:
+    """A quiet API result may update dates only when CURRENT proves its baseline."""
+    current = validate_current_snapshot(snapshot, entry_binding)
+    canonical_ids = current["canonicalMessageIds"]
+    if cursor is None:
+        if canonical_ids or current["verifiedEmpty"] is not True:
+            raise DailySyncError("rich_baseline_missing")
+        return current
+    if not SNOWFLAKE_RE.fullmatch(cursor) or cursor not in canonical_ids:
+        raise DailySyncError("rich_archive_readback_failed")
+    return current
+
+
 def snowflake_int(value: Any) -> int:
     text = str(value or "")
     return int(text) if SNOWFLAKE_RE.fullmatch(text) else 0
@@ -555,22 +968,26 @@ def discord_messages(
     *,
     after: str | None = None,
     around: str | None = None,
+    head: bool = False,
     limit: int,
     rate_limit_budget: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     cursor = after if after is not None else around
+    mode_count = int(after is not None) + int(around is not None) + int(head is True)
     if (
         not SNOWFLAKE_RE.fullmatch(channel_id)
-        or not isinstance(cursor, str)
-        or not SNOWFLAKE_RE.fullmatch(cursor)
-        or (after is None) == (around is None)
+        or type(head) is not bool
+        or mode_count != 1
+        or (not head and (not isinstance(cursor, str) or not SNOWFLAKE_RE.fullmatch(cursor)))
+        or (head and cursor is not None)
         or not isinstance(limit, int)
         or not 1 <= limit <= 100
     ):
         raise DailySyncError("invalid_discord_identity")
-    query = urllib.parse.urlencode({
-        "limit": str(limit), "after" if after is not None else "around": cursor
-    })
+    query_values = {"limit": str(limit)}
+    if not head:
+        query_values["after" if after is not None else "around"] = str(cursor)
+    query = urllib.parse.urlencode(query_values)
     request = urllib.request.Request(
         f"https://discord.com/api/v10/channels/{channel_id}/messages?{query}",
         headers={
@@ -698,6 +1115,42 @@ def fetch_mutable_window(
     return [row for row in rows if str(row.get("id") or "") in allowed], 1
 
 
+def fetch_verified_empty_head(
+    fetch: Callable[..., list[dict[str, Any]]],
+    token: str,
+    channel_id: str,
+    *,
+    snapshot: Mapping[str, Any],
+    entry_binding: Mapping[str, Any],
+    limit: int,
+    rate_limit_budget: dict[str, float],
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """Bounded first-message probe authorized only by a verified empty CURRENT.
+
+    Discord's cursor-less endpoint returns a bounded head page.  A page exactly
+    equal to the cap is deliberately incomplete because older messages may
+    exist; fewer rows (including zero) prove this bounded bootstrap is complete.
+    """
+    current = validate_quiet_current(snapshot, entry_binding, cursor=None)
+    if current["verifiedEmpty"] is not True or current["canonicalMessageIds"]:
+        raise DailySyncError("rich_baseline_missing")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise DailySyncError("invalid_limits")
+    page = fetch(
+        token,
+        channel_id,
+        head=True,
+        limit=limit,
+        rate_limit_budget=rate_limit_budget,
+    )
+    rows = combine_messages(page)
+    if len(rows) != len(page) or any(
+        str(row.get("channel_id") or channel_id) != channel_id for row in rows
+    ):
+        raise DailySyncError("discord_response_invalid")
+    return rows, len(rows) < limit, 1
+
+
 def load_discord_token(config_path: Path, env_name: str) -> str:
     token = os.environ.get(env_name)
     if isinstance(token, str) and token.strip():
@@ -737,38 +1190,81 @@ def execute(
     args: argparse.Namespace,
     *,
     fetch: Callable[..., list[dict[str, Any]]] = discord_messages,
-    rich_factory: RichSlotFactory | None = None,
+    rich_factory: RichCoreAdapterV2 | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Validate non-core inputs, then stop until the reviewed v2 port exists."""
+    """Enter the exact core-owned lock before the first mutable JSON load.
+
+    Fetch/merge orchestration remains deliberately blocked until the reviewed
+    rich-core adapter implements the nominal v2 protocol.  This function still
+    exercises the two-phase lock/begin boundary so a future adapter cannot
+    regress to pre-lock state or queue reads.
+    """
     del fetch
     validate_limits(args)
     state_path = safe_path(args.state, require_file=True)
     queue_path = safe_path(args.queue, require_file=True)
     inventory_path = safe_path(args.inventory, require_file=True)
     mapping_path = safe_path(args.mapping_ledger, require_file=True)
-    safe_path(args.root, require_directory=True)
+    archive_root = safe_path(args.root, require_directory=True)
     safe_path(args.openclaw_config, require_file=True)
-    state = load_json_object(state_path, "unreadable_state")
-    queue = load_json_object(queue_path, "unreadable_queue")
-    inventory = load_json_object(inventory_path, "unreadable_inventory")
-    mapping = load_json_object(mapping_path, "unreadable_mapping_ledger")
-    binding = validate_inventory_binding(
-        inventory, mapping, guild_id=args.guild_id, today=args.today,
-        timezone_name=args.timezone,
-    )
-    selected = select_candidates(state, queue, today=args.today, max_entries=args.max_entries)
     if rich_factory is None:
         raise DailySyncError("rich_core_contract_pending")
-    # The orchestration call is deliberately deferred.  Keeping the port unused
-    # prevents this scaffold from silently accepting the independently blocked
-    # token/evidence implementation.
-    return {
-        "ok": False,
-        "status": "blocked",
-        "reason": "rich_core_contract_pending",
-        "inventoryDigest": binding["inventoryDigest"],
-        "selected": len(selected),
-    }, 2
+    adapter = require_rich_adapter(rich_factory)
+    if state_path.parent != queue_path.parent:
+        raise DailySyncError("unsafe_input_path")
+    lock_path = state_path.parent / ".channel_backup.lock"
+    slot_manager = adapter.open_slot(lock_path=lock_path)
+    if not isinstance(slot_manager, AbstractContextManager):
+        raise DailySyncError("rich_core_contract_unsupported")
+    with slot_manager as slot_value:
+        slot = require_locked_slot(slot_value)
+        # Mutable state/queue are intentionally first opened only after the
+        # core-owned shared lock context has entered successfully.
+        state = load_json_object(state_path, "unreadable_state")
+        queue = load_json_object(queue_path, "unreadable_queue")
+        inventory = load_json_object(inventory_path, "unreadable_inventory")
+        mapping = load_json_object(mapping_path, "unreadable_mapping_ledger")
+        binding = validate_inventory_binding(
+            inventory,
+            mapping,
+            guild_id=args.guild_id,
+            today=args.today,
+            timezone_name=args.timezone,
+        )
+        selected = select_candidates(
+            state, queue, today=args.today, max_entries=args.max_entries
+        )
+        entry_bindings = tuple(
+            bind_entry_inventory(
+                binding,
+                channel_id=str(entry["channelId"]),
+                relative_path=str(entry["relativePath"]),
+                entry_type=str(entry["type"]),
+            )
+            for _key, entry in selected
+        )
+        request = IncrementalBeginRequest(
+            schema_version=INCREMENTAL_BEGIN_SCHEMA,
+            role=args.role,
+            archive_root=archive_root,
+            inventory_digest=str(binding["inventoryDigest"]),
+            inventory_observed_at=str(binding["observedAt"]),
+            entry_bindings=entry_bindings,
+            limits=(
+                ("maxEntries", args.max_entries),
+                ("maxWriteEntries", args.max_write_entries),
+                ("maxReadMessages", args.max_read_messages),
+                ("maxMessagesPerEntry", args.max_messages_per_entry),
+                ("mutableRefreshLimit", args.mutable_refresh_limit),
+            ),
+        )
+        incremental_manager = slot.begin_incremental(request)
+        if not isinstance(incremental_manager, AbstractContextManager):
+            raise DailySyncError("rich_core_contract_unsupported")
+        with incremental_manager as session_value:
+            require_incremental_session(session_value)
+            # The reviewed merge/readback adapter has not landed in this branch.
+            raise DailySyncError("rich_core_contract_pending")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
