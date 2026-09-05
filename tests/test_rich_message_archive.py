@@ -20,6 +20,7 @@ spec.loader.exec_module(rich)
 
 
 OBSERVED = "2026-09-05T04:00:00Z"
+LOCK_NAME = ".channel-backup.lock"
 
 
 def message(**overrides):
@@ -51,6 +52,42 @@ def normalize(value=None, **kwargs):
     return rich.normalize_message(
         value or message(), expected_channel_id="1490000000000000001",
         observed_at=kwargs.pop("observed_at", OBSERVED), **kwargs,
+    )
+
+
+def make_store(tmp_path, name="entry"):
+    return rich.RichArchiveStore(
+        tmp_path / name,
+        lock_path=tmp_path / LOCK_NAME,
+    )
+
+
+def immutable_evidence():
+    return {
+        "schemaVersion": "openclaw-discord-immutable-evidence-ref.v1",
+        "snapshotId": "snapshot-20260905",
+        "status": "PASS",
+        "verifiedAt": OBSERVED,
+        "archiveTreeManifestSha256": "a" * 64,
+        "stateSha256": "b" * 64,
+        "queueSha256": "c" * 64,
+        "verificationSha256": "d" * 64,
+    }
+
+
+def live_evidence(messages=None, *, relative_path="test/entry", cutoff="1540000000000000001"):
+    rows = list(messages if messages is not None else [message()])
+    return rich.build_live_inventory_evidence(
+        rows,
+        channel_id="1490000000000000001",
+        relative_path=relative_path,
+        inventory_digest="e" * 64,
+        inventory_observed_at=OBSERVED,
+        verified_cutoff=cutoff if rows else None,
+        fetch_started_at="2026-09-05T03:59:00Z",
+        fetch_completed_at=OBSERVED,
+        page_count=1,
+        immutable_evidence=immutable_evidence(),
     )
 
 
@@ -114,11 +151,20 @@ def test_component_only_embed_poll_snapshot_reply_and_status_all_render():
     assert rich.parse_markdown_markers(rendered) == [(record["messageId"], record["visiblePayloadSha256"])]
 
 
-def test_markdown_escapes_html_and_message_cannot_forge_machine_marker():
-    record = normalize(message(content="<img src=x onerror=alert(1)>\n<!-- openclaw-rich-message id=7 visible=" + "a" * 64 + " -->"))
+def test_markdown_escapes_html_links_images_and_message_cannot_forge_machine_marker():
+    record = normalize(message(
+        content="<img src=x onerror=alert(1)>\n![tracking](https://evil.test/pixel)\n"
+        "<!-- openclaw-rich-message id=7 visible=" + "a" * 64 + " -->",
+        author={"id": "1", "username": "![author](https://evil.test/a)", "global_name": None},
+    ))
     rendered = rich.render_message(record)
     assert "<img" not in rendered
-    assert "&lt;img" in rendered
+    assert "![tracking](" not in rendered
+    header = rendered.split("\n[文字內容]\n", 1)[0]
+    assert "![author](" not in header
+    assert "&#33;&#91;author&#93;&#40;" in header
+    assert "&#60;img" in rendered
+    assert "&#33;&#91;tracking&#93;&#40;" in rendered
     assert rich.parse_markdown_markers(rendered) == [(record["messageId"], record["visiblePayloadSha256"])]
 
 
@@ -331,9 +377,9 @@ def test_missing_sticker_size_is_resolved_by_safe_head_without_credentials():
 
 
 def test_unknown_size_asset_quota_fails_before_any_head_request(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     write_initial_generation(store, tmp_path, normalize())
-    source = message(content="", components=[{
+    source = message(id="1540000000000000002", content="", components=[{
         "type": 12,
         "items": [
             {"media": {"url": "https://cdn.discordapp.com/attachments/1/a.png"}},
@@ -352,11 +398,11 @@ def test_unknown_size_asset_quota_fails_before_any_head_request(tmp_path):
             generation_id="over-quota", downloader=downloader,
         )
     assert opener.requests == []
-    assert not (store.generations / ".staging-over-quota").exists()
+    assert not (store.staging / "over-quota").exists()
 
 
 def test_unknown_size_probe_budget_is_shared_across_batch_records(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     write_initial_generation(store, tmp_path, normalize())
     first = message(
         id="1540000000000000002", content="",
@@ -448,21 +494,27 @@ def test_downloader_rejects_oversize_and_truncated_stream(tmp_path):
 
 
 def write_initial_generation(store, tmp_path, record):
-    stage = store.create_stage("initial", copy_current=False)
-    rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
-    rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
-    rich.atomic_json(stage / "receipts/rich-archive-latest.json", {
-        "schemaVersion": rich.ENTRY_RECEIPT_SCHEMA,
-        "gateStatus": "INCOMPLETE",
-        "reason": "test",
-    })
-    manifest = rich.generation_inventory(stage)
-    rich.atomic_json(stage / "generation-manifest.json", manifest)
-    store.publish_stage(stage, "initial", manifest["generationSha256"])
+    with store.acquire_lock() as lock_token:
+        stage = store.create_stage("initial", copy_current=False, lock_token=lock_token)
+        rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
+        rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
+        rich.atomic_json(stage / "receipts/rich-archive-latest.json", {
+            "schemaVersion": rich.ENTRY_RECEIPT_SCHEMA,
+            "gateStatus": "INCOMPLETE",
+            "reason": "test",
+        })
+        manifest = rich.generation_inventory(stage)
+        rich.atomic_json(stage / "generation-manifest.json", manifest)
+        store.publish_stage(
+            stage,
+            "initial",
+            manifest["generationSha256"],
+            lock_token=lock_token,
+        )
 
 
 def test_generation_pointer_is_atomic_checksummed_and_never_claims_full_pass(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     record = normalize()
     write_initial_generation(store, tmp_path, record)
 
@@ -483,7 +535,7 @@ def test_generation_pointer_is_atomic_checksummed_and_never_claims_full_pass(tmp
 
 
 def test_generation_verifier_rejects_raw_body_tamper_even_when_marker_survives(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     record = normalize(message(components=[{"type": 10, "content": "visible"}]))
     write_initial_generation(store, tmp_path, record)
     current = store.resolve_current()
@@ -498,44 +550,37 @@ def test_generation_verifier_rejects_raw_body_tamper_even_when_marker_survives(t
 
 
 def test_real_full_pass_receipt_binds_non_self_referential_content_hash(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     record = normalize()
-    stage = store.create_stage("full-pass", copy_current=False)
-    rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
-    rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
-    content_hash = rich.generation_inventory(stage)["contentGenerationSha256"]
-    receipt = {
-        "schemaVersion": rich.ENTRY_RECEIPT_SCHEMA,
-        "gateStatus": "PASS",
-        "inventoryCoverage": 100,
-        "idCoverage": "100%",
-        "visibleTextCoverage": 100.0,
-        "markdownCoverage": 100,
-        "binaryAssetCoverage": 100,
-        "liveErrors": 0,
-        "duplicateCanonicalIds": 0,
-        "unknownVisibleFields": 0,
-        "attachmentErrors": 0,
-        "inventoryComplete": True,
-        "inventoryDigest": "a" * 64,
-        "verifiedCutoff": "1540000000000000001",
-        "immutableEvidenceVerified": "PASS",
-        "contentGenerationSha256": content_hash,
-    }
-    rich.atomic_json(stage / "receipts/rich-archive-latest.json", receipt)
-    manifest = rich.generation_inventory(stage)
-    rich.atomic_json(stage / "generation-manifest.json", manifest)
-    assert rich.verify_generation(stage, require_full_gate=True)["verified"]
-    store.publish_stage(
-        stage, "full-pass", manifest["generationSha256"], require_full_gate=True,
-    )
+    with store.acquire_lock() as lock_token:
+        stage = store.create_stage("full-pass", copy_current=False, lock_token=lock_token)
+        rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
+        rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
+        installed = store.install_full_pass_evidence(
+            stage,
+            live_evidence(),
+            lock_token=lock_token,
+        )
+        receipt = installed["receipt"]
+        assert receipt["gateStatus"] == "PASS"
+        assert receipt["coverageCounts"]["messages"] == {"expected": 1, "verified": 1}
+        assert receipt["contentGenerationSha256"] == rich.generation_inventory(stage)["contentGenerationSha256"]
+        assert rich.verify_generation(stage, require_full_gate=True)["verified"]
+        store.publish_stage(
+            stage,
+            "full-pass",
+            installed["manifest"]["generationSha256"],
+            require_full_gate=True,
+            lock_token=lock_token,
+        )
     assert store.resolve_current().name == "full-pass"
 
 
 def test_forged_pass_receipt_is_rejected(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     record = normalize()
-    stage = store.create_stage("forged", copy_current=False)
+    with store.acquire_lock() as lock_token:
+        stage = store.create_stage("forged", copy_current=False, lock_token=lock_token)
     rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
     rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
     rich.atomic_json(stage / "receipts/rich-archive-latest.json", {
@@ -562,28 +607,29 @@ def test_forged_pass_receipt_is_rejected(tmp_path):
 
 
 def test_generation_journal_recovery_does_not_publish_unselected_generation(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     record = normalize()
     write_initial_generation(store, tmp_path, record)
-    stage = store.create_stage("next", copy_current=True)
-    manifest = rich.generation_inventory(stage)
-    rich.atomic_json(stage / "generation-manifest.json", manifest)
-    final = store.generations / "next"
-    os.replace(stage, final)
-    rich.atomic_json(store.journal_path, rich._journal_payload({
-        "schemaVersion": rich.JOURNAL_SCHEMA,
-        "phase": "generation_ready",
-        "generationId": "next",
-        "generationSha256": manifest["generationSha256"],
-    }))
+    with store.acquire_lock() as lock_token:
+        stage = store.create_stage("next", copy_current=True, lock_token=lock_token)
+        manifest = rich.generation_inventory(stage)
+        rich.atomic_json(stage / "generation-manifest.json", manifest)
+        final = store.generations / "next"
+        os.replace(stage, final)
+        rich.atomic_json(store.journal_path, rich._journal_payload({
+            "schemaVersion": rich.JOURNAL_SCHEMA,
+            "phase": "generation_ready",
+            "generationId": "next",
+            "generationSha256": manifest["generationSha256"],
+        }))
 
-    outcome = store.recover_journal()
+        outcome = store.recover_journal(lock_token=lock_token)
     assert outcome["action"] == "retain_unpublished_generation"
     assert store.resolve_current().name == "initial"
 
 
 def test_journal_checksum_and_generation_path_are_fail_closed(tmp_path):
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     store.entry_root.mkdir()
     rich.atomic_json(store.journal_path, {
         "schemaVersion": rich.JOURNAL_SCHEMA,
@@ -592,8 +638,9 @@ def test_journal_checksum_and_generation_path_are_fail_closed(tmp_path):
         "generationSha256": "a" * 64,
         "journalSha256": "b" * 64,
     })
-    with pytest.raises(rich.GenerationError):
-        store.recover_journal()
+    with store.acquire_lock() as lock_token:
+        with pytest.raises(rich.GenerationError):
+            store.recover_journal(lock_token=lock_token)
 
 
 def test_shared_lock_rejects_symlink_and_insecure_mode(tmp_path):
@@ -611,11 +658,11 @@ def test_shared_lock_rejects_symlink_and_insecure_mode(tmp_path):
 
 
 def test_store_atomic_merge_is_idempotent_and_requires_existing_full_rebuild(tmp_path):
-    empty = rich.RichArchiveStore(tmp_path / "empty")
+    empty = make_store(tmp_path, "empty")
     with pytest.raises(rich.GenerationError, match="full rebuild"):
         empty.merge_messages([message()], channel_id="1490000000000000001", observed_at=OBSERVED, generation_id="x")
 
-    store = rich.RichArchiveStore(tmp_path / "entry")
+    store = make_store(tmp_path)
     write_initial_generation(store, tmp_path, normalize())
     newer = message(content="edited", edited_timestamp="2026-09-05T04:30:00Z")
     result = store.merge_messages(
@@ -630,3 +677,243 @@ def test_store_atomic_merge_is_idempotent_and_requires_existing_full_rebuild(tmp
     assert rich.parse_markdown_markers((current / "raw/2026-09-05.md").read_text()) == [
         (rows[0]["messageId"], rows[0]["visiblePayloadSha256"])
     ]
+
+
+def test_unknown_top_level_root_is_accounted_rendered_and_fails_closed():
+    record = normalize(message(future_visible_root={"text": "must not disappear"}))
+    census = record["sourceCensus"]
+    assert census["unclassifiedPointers"] == ["/future_visible_root/text"]
+    observation = record["observations"][0]
+    accounting = next(
+        row for row in observation["rendererAccounting"]
+        if row["pointer"] == "/future_visible_root/text"
+    )
+    assert accounting == {
+        "pointer": "/future_visible_root/text",
+        "valueSha256": rich.json_sha256("must not disappear"),
+        "rendererSection": "未分類可見資料",
+    }
+    rendered = rich.render_message(record)
+    assert "[未分類可見資料]" in rendered
+    assert "must not disappear" in rendered
+    assert not rich.validate_record(record, require_assets=False)["ok"]
+
+
+def test_external_original_and_discord_proxy_are_separate_asset_denominator_rows():
+    record = normalize(message(attachments=[{
+        "id": "900",
+        "filename": "proxied.png",
+        "size": 3,
+        "url": "https://example.com/original.png",
+        "proxy_url": "https://media.discordapp.net/attachments/1/proxied.png",
+    }]))
+    assets = record["observations"][0]["assetInventory"]
+    assert len(assets) == 2
+    original = next(row for row in assets if row["kind"] == "attachment")
+    proxy = next(row for row in assets if row["kind"] == "attachment_proxy")
+    assert original["status"] == "metadata_only" and not original["inScope"]
+    assert proxy["status"] == "pending" and proxy["inScope"]
+    assert proxy["localRelativePath"]
+
+
+def test_both_sticker_shapes_are_rendered():
+    record = normalize(message(
+        content="",
+        sticker_items=[{"id": "1500000000000000001", "name": "item sticker", "format_type": 1}],
+        stickers=[{
+            "id": "1500000000000000002",
+            "name": "full sticker",
+            "format_type": 1,
+            "url": "https://cdn.discordapp.com/stickers/1500000000000000002.png",
+        }],
+    ))
+    rendered = rich.render_message(record)
+    assert "item sticker" in rendered
+    assert "full sticker" in rendered
+
+
+def test_active_ids_must_be_latest_and_equal_timestamp_conflicts_fail_closed():
+    first = normalize(message(content="v1"), observed_at="2026-09-05T04:00:00Z")
+    second = normalize(
+        message(content="v2", edited_timestamp="2026-09-05T04:10:00Z"),
+        observed_at="2026-09-05T04:11:00Z",
+    )
+    merged = rich.merge_message_records(first, second)
+    merged["activeRevisionId"] = first["activeRevisionId"]
+    with pytest.raises(rich.RichArchiveError, match="active revision is not the latest"):
+        rich.validate_record(merged, require_assets=False)
+
+    conflicting = normalize(message(content="different-without-edit-timestamp"))
+    with pytest.raises(rich.RecordConflictError, match="share one versionTimestamp"):
+        rich.merge_message_records(first, conflicting)
+
+
+def test_historical_observation_render_preserves_full_source_payload():
+    first_source = message(attachments=[{
+        "id": "900",
+        "filename": "x.png",
+        "size": 3,
+        "url": "https://cdn.discordapp.com/attachments/1/x.png?ex=1&hm=old",
+    }])
+    second_source = json.loads(json.dumps(first_source))
+    second_source["attachments"][0]["url"] = (
+        "https://cdn.discordapp.com/attachments/1/x.png?ex=2&hm=new"
+    )
+    merged = rich.merge_message_records(
+        normalize(first_source, observed_at="2026-09-05T04:00:00Z"),
+        normalize(second_source, observed_at="2026-09-05T04:10:00Z"),
+    )
+    rendered = rich.render_message(merged)
+    assert "[歷史觀測版本]" in rendered
+    assert "ex=1&hm=old" in rendered
+    assert "ex=2&hm=new" in rendered
+
+
+@pytest.mark.parametrize(
+    "generation_id",
+    [".staging-repair", ".hidden", "a.b", "CURRENT", "generations", "staging"],
+)
+def test_reserved_generation_ids_are_rejected(generation_id, tmp_path):
+    store = make_store(tmp_path)
+    with store.acquire_lock() as lock_token:
+        with pytest.raises(rich.GenerationError, match="unsafe"):
+            store.create_stage(
+                generation_id,
+                copy_current=False,
+                lock_token=lock_token,
+            )
+
+
+def test_mutation_apis_require_live_matching_lock_token(tmp_path):
+    store = make_store(tmp_path)
+    with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
+        store.create_stage("one", copy_current=False)
+    with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
+        store.recover_journal()
+
+    token = store.acquire_lock()
+    token.close()
+    with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
+        store.create_stage("closed", copy_current=False, lock_token=token)
+
+    other = rich.RichArchiveStore(
+        tmp_path / "other-entry",
+        lock_path=tmp_path / "other.lock",
+    )
+    with store.acquire_lock() as valid:
+        with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
+            other.create_stage("wrong-lock", copy_current=False, lock_token=valid)
+
+
+def test_symlinked_entry_ancestor_is_rejected_before_archive_mutation(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    store = rich.RichArchiveStore(
+        linked / "entry",
+        lock_path=tmp_path / LOCK_NAME,
+    )
+    with store.acquire_lock() as lock_token:
+        with pytest.raises(rich.RichArchiveError, match="symlinked"):
+            store.create_stage("blocked", copy_current=False, lock_token=lock_token)
+    assert not (outside / "entry").exists()
+
+
+def test_symlinked_download_root_is_rejected_before_network_or_write(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    opener = FakeOpener([])
+    downloader = rich.AssetDownloader(opener=opener, resolver=global_resolver)
+    with pytest.raises(rich.RichArchiveError, match="symlinked"):
+        downloader.download(pending_asset(), linked)
+    assert opener.requests == []
+    assert list(outside.iterdir()) == []
+
+
+def test_full_pass_receipt_recomputes_counts_and_rejects_tampering(tmp_path):
+    store = make_store(tmp_path)
+    record = normalize()
+    with store.acquire_lock() as lock_token:
+        stage = store.create_stage("tamper-pass", copy_current=False, lock_token=lock_token)
+        rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
+        rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
+        installed = store.install_full_pass_evidence(
+            stage,
+            live_evidence(),
+            lock_token=lock_token,
+        )
+        receipt_path = stage / "receipts/rich-archive-latest.json"
+        forged = dict(installed["receipt"])
+        forged["coverageCounts"] = dict(forged["coverageCounts"])
+        forged["coverageCounts"]["messages"] = {"expected": 0, "verified": 0}
+        rich.atomic_json(receipt_path, forged)
+        rich.atomic_json(stage / "generation-manifest.json", rich.generation_inventory(stage))
+        with pytest.raises(rich.GenerationError, match="exact full live completeness"):
+            rich.verify_generation(stage, require_full_gate=True)
+
+
+@pytest.mark.parametrize("mutation", ["identity", "cutoff", "fingerprint", "immutable"])
+def test_live_evidence_identity_cutoff_fingerprint_and_immutable_binding_fail_closed(mutation, tmp_path):
+    store = make_store(tmp_path)
+    record = normalize()
+    evidence = live_evidence()
+    if mutation == "identity":
+        evidence["entryIdentity"] = {}
+    elif mutation == "cutoff":
+        evidence["verifiedCutoff"] = "1540000000000000000"
+    elif mutation == "fingerprint":
+        evidence["messages"][0]["visiblePayloadSha256"] = "f" * 64
+    else:
+        evidence["immutableEvidence"]["stateSha256"] = "invalid"
+    evidence.pop("evidenceSha256", None)
+    evidence["evidenceSha256"] = rich.json_sha256(evidence)
+    with store.acquire_lock() as lock_token:
+        stage = store.create_stage(f"bad-{mutation}", copy_current=False, lock_token=lock_token)
+        rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
+        rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
+        with pytest.raises(rich.GenerationError):
+            store.install_full_pass_evidence(stage, evidence, lock_token=lock_token)
+
+
+def test_truly_empty_full_pass_requires_concrete_terminal_inventory_evidence(tmp_path):
+    store = make_store(tmp_path)
+    with store.acquire_lock() as lock_token:
+        stage = store.create_stage("empty-pass", copy_current=False, lock_token=lock_token)
+        installed = store.install_full_pass_evidence(
+            stage,
+            live_evidence([], cutoff=None),
+            lock_token=lock_token,
+        )
+        assert installed["receipt"]["gateStatus"] == "PASS"
+        assert installed["receipt"]["coverageCounts"]["messages"] == {
+            "expected": 0,
+            "verified": 0,
+        }
+
+        evidence_path = stage / "receipts/live-inventory-evidence.json"
+        evidence = json.loads(evidence_path.read_text())
+        evidence["enumeration"]["terminalPageObserved"] = False
+        evidence.pop("evidenceSha256", None)
+        evidence["evidenceSha256"] = rich.json_sha256(evidence)
+        rich.atomic_json(evidence_path, evidence)
+        rich.atomic_json(stage / "generation-manifest.json", rich.generation_inventory(stage))
+        with pytest.raises(rich.GenerationError, match="exact full live completeness"):
+            rich.verify_generation(stage, require_full_gate=True)
+
+
+def test_asset_run_budget_accumulates_across_entries(tmp_path):
+    limits = rich.AssetLimits(
+        full_run_files=1,
+        full_run_bytes=3,
+        disk_reserve_bytes=0,
+    )
+    budget = rich.AssetRunBudget.from_limits(limits)
+    first = pending_asset(size=3)
+    result = budget.preflight_entry([first], tmp_path, assume_unknown_max=False)
+    budget.commit_entry(result)
+    second = dict(first, assetId="another")
+    with pytest.raises(rich.AssetDownloadError, match="file quota"):
+        budget.preflight_entry([second], tmp_path, assume_unknown_max=False)
