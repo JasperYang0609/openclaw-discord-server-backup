@@ -1115,6 +1115,31 @@ class AssetLimits:
     metadata_probe_elapsed_seconds: float = 60.0
 
 
+@dataclass
+class AssetProbeBudget:
+    """One shared unknown-size metadata budget for a batch or full run."""
+
+    remaining_requests: int
+    deadline_monotonic: float
+
+    @classmethod
+    def from_limits(cls, limits: AssetLimits) -> "AssetProbeBudget":
+        return cls(
+            remaining_requests=limits.max_unknown_size_probes,
+            deadline_monotonic=time.monotonic() + limits.metadata_probe_elapsed_seconds,
+        )
+
+    def ensure_capacity(self, count: int) -> None:
+        if count > self.remaining_requests:
+            raise AssetDownloadError("unknown-size asset metadata probe quota exceeded")
+        if time.monotonic() > self.deadline_monotonic:
+            raise AssetDownloadError("asset metadata probe elapsed-time cap exceeded")
+
+    def consume(self) -> None:
+        self.ensure_capacity(1)
+        self.remaining_requests -= 1
+
+
 def preflight_asset_capacity(
     assets: Sequence[Mapping[str, Any]],
     destination_root: Path,
@@ -1167,6 +1192,15 @@ def preflight_asset_capacity(
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
         return None
+
+
+def _close_response_safely(response: Any) -> None:
+    try:
+        response.close()
+    except Exception:
+        # Cleanup must never mask the security or integrity error that caused
+        # the response to be rejected (including synthetic HTTPError objects).
+        pass
 
 
 class AssetDownloader:
@@ -1243,11 +1277,16 @@ class AssetDownloader:
                 response = self.opener.open(request, timeout=self.limits.timeout_seconds)
             except urllib.error.HTTPError as exc:
                 if exc.code not in REDIRECT_CODES:
+                    _close_response_safely(exc)
                     raise AssetDownloadError(f"asset metadata HTTP status {exc.code}") from exc
                 location = exc.headers.get("Location")
                 if not location or redirects >= self.limits.max_redirects:
+                    _close_response_safely(exc)
                     raise AssetDownloadError("asset metadata redirect limit exceeded") from exc
-                url, _ = self._validated_url(urllib.parse.urljoin(url, location), expected_host=original_host)
+                try:
+                    url, _ = self._validated_url(urllib.parse.urljoin(url, location), expected_host=original_host)
+                finally:
+                    _close_response_safely(exc)
                 redirects += 1
                 continue
             try:
@@ -1272,7 +1311,7 @@ class AssetDownloader:
                     raise AssetDownloadError("asset exceeds per-file size limit")
                 return size
             finally:
-                response.close()
+                _close_response_safely(response)
 
     def download(self, asset: Mapping[str, Any], generation_root: Path) -> dict[str, Any]:
         row = dict(asset)
@@ -1307,32 +1346,37 @@ class AssetDownloader:
                 response = self.opener.open(request, timeout=self.limits.timeout_seconds)
             except urllib.error.HTTPError as exc:
                 if exc.code not in REDIRECT_CODES:
+                    _close_response_safely(exc)
                     raise AssetDownloadError(f"asset HTTP status {exc.code}") from exc
                 location = exc.headers.get("Location")
                 if not location or redirects >= self.limits.max_redirects:
+                    _close_response_safely(exc)
                     raise AssetDownloadError("asset redirect limit exceeded") from exc
-                url, _ = self._validated_url(urllib.parse.urljoin(url, location), expected_host=original_host)
+                try:
+                    url, _ = self._validated_url(urllib.parse.urljoin(url, location), expected_host=original_host)
+                finally:
+                    _close_response_safely(exc)
                 redirects += 1
                 continue
             status = getattr(response, "status", response.getcode())
             if status in REDIRECT_CODES:
                 location = response.headers.get("Location")
-                response.close()
+                _close_response_safely(response)
                 if not location or redirects >= self.limits.max_redirects:
                     raise AssetDownloadError("asset redirect limit exceeded")
                 url, _ = self._validated_url(urllib.parse.urljoin(url, location), expected_host=original_host)
                 redirects += 1
                 continue
             if status != 200:
-                response.close()
+                _close_response_safely(response)
                 raise AssetDownloadError(f"asset HTTP status {status}")
             encoding = (response.headers.get("Content-Encoding") or "identity").lower()
             if encoding != "identity":
-                response.close()
+                _close_response_safely(response)
                 raise AssetDownloadError("compressed asset response is forbidden")
             content_length = response.headers.get("Content-Length")
             if content_length is None or not content_length.isdigit() or int(content_length) != expected_size:
-                response.close()
+                _close_response_safely(response)
                 raise AssetDownloadError("asset Content-Length does not match declared size")
             descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".download", dir=target.parent)
             digest = hashlib.sha256()
@@ -1357,7 +1401,7 @@ class AssetDownloader:
                 os.chmod(target, 0o600)
                 _fsync_dir(target.parent)
             finally:
-                response.close()
+                _close_response_safely(response)
                 try:
                     os.unlink(temporary)
                 except FileNotFoundError:
@@ -1366,7 +1410,12 @@ class AssetDownloader:
             return row
 
 
-def resolve_asset_sizes(record: Mapping[str, Any], downloader: AssetDownloader) -> dict[str, Any]:
+def resolve_asset_sizes(
+    record: Mapping[str, Any],
+    downloader: AssetDownloader,
+    *,
+    probe_budget: AssetProbeBudget | None = None,
+) -> dict[str, Any]:
     """Fill missing in-scope sizes from safe HEAD metadata before mutation."""
     updated = dict(record)
     observations = [dict(row) for row in updated.get("observations") or []]
@@ -1374,16 +1423,14 @@ def resolve_asset_sizes(record: Mapping[str, Any], downloader: AssetDownloader) 
         1 for observation in observations for asset in observation.get("assetInventory") or []
         if asset.get("inScope") and asset.get("declaredSize") is None
     )
-    if unknown_count > downloader.limits.max_unknown_size_probes:
-        raise AssetDownloadError("unknown-size asset metadata probe quota exceeded")
-    deadline = time.monotonic() + downloader.limits.metadata_probe_elapsed_seconds
+    budget = probe_budget or AssetProbeBudget.from_limits(downloader.limits)
+    budget.ensure_capacity(unknown_count)
     for observation in observations:
         output: list[dict[str, Any]] = []
         for asset in observation.get("assetInventory") or []:
             row = dict(asset)
             if row.get("inScope") and row.get("declaredSize") is None:
-                if time.monotonic() > deadline:
-                    raise AssetDownloadError("asset metadata probe elapsed-time cap exceeded")
+                budget.consume()
                 row["declaredSize"] = downloader.probe_size(row)
                 row["sizeSource"] = "http_head"
             output.append(row)
@@ -1674,7 +1721,16 @@ class RichArchiveStore:
                     assets, self.entry_root, limits=downloader.limits,
                     assume_unknown_max=True,
                 )
-                normalized = [resolve_asset_sizes(record, downloader) for record in normalized]
+                unknown_count = sum(
+                    1 for asset in assets
+                    if asset.get("inScope") and asset.get("declaredSize") is None
+                )
+                probe_budget = AssetProbeBudget.from_limits(downloader.limits)
+                probe_budget.ensure_capacity(unknown_count)
+                normalized = [
+                    resolve_asset_sizes(record, downloader, probe_budget=probe_budget)
+                    for record in normalized
+                ]
                 assets = [
                     asset for record in normalized for observation in record["observations"]
                     for asset in observation["assetInventory"]
@@ -1800,7 +1856,7 @@ class RichArchiveStore:
 
 
 __all__ = [
-    "AssetDownloadError", "AssetDownloader", "AssetLimits", "DEFAULT_CDN_HOSTS",
+    "AssetDownloadError", "AssetDownloader", "AssetLimits", "AssetProbeBudget", "DEFAULT_CDN_HOSTS",
     "GenerationError", "RECORD_SCHEMA", "RichArchiveError", "RichArchiveStore",
     "SourceBoundsError", "SourceCensusError", "apply_asset_results", "atomic_json",
     "atomic_jsonl", "canonical_day", "contained_path", "file_sha256",
