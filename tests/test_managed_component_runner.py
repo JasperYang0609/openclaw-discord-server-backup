@@ -148,6 +148,8 @@ def test_daily_role_builds_bounded_deterministic_command(tmp_path):
     assert command[command.index("--role") + 1] == "daily-sync-2"
     assert command[command.index("--mapping-ledger") + 1].endswith("inventory-mapping.json")
     assert command[command.index("--guild-id") + 1] == config["guildId"]
+    assert command[command.index("--workspace") + 1] == str(workspace)
+    assert command[command.index("--backup-config") + 1] == str(config_path)
     assert command[command.index("--max-entries") + 1] == "6"
     assert command[command.index("--max-write-entries") + 1] == "4"
     assert command[command.index("--max-read-messages") + 1] == "180"

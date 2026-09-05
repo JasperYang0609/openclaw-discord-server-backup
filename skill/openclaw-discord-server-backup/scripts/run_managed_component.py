@@ -146,7 +146,11 @@ def command_for(
             label="daily entry limit",
         )
         max_messages = bounded_config_int(
-            limits.get("dailyMessageLimit"), default=60, maximum=60,
+            limits.get(
+                "dailyMessageLimitPerEntry",
+                limits.get("dailyMessageLimit"),
+            ),
+            default=60, maximum=60,
             label="daily message limit",
         )
         mutable_limit = bounded_config_int(
@@ -165,6 +169,8 @@ def command_for(
             "--today", today,
             "--timezone", str(config.get("timezone") or "Asia/Taipei"),
             "--openclaw-config", str(openclaw_config),
+            "--workspace", str(workspace),
+            "--backup-config", str(config_path),
             "--max-entries", str(max_entries),
             "--max-write-entries", "4",
             "--page-size", "30",

@@ -13,10 +13,20 @@ module-issued runtime capabilities may authorize a state or cursor update.
 ## Runtime loading
 
 `run_daily_sync_v3.py` loads only the sibling `rich_core_adapter_v3.py`. A
-versioned runtime manifest binds that adapter and `rich_message_archive.py` by
-SHA-256, owner, exact file mode, regular-file type, and single-link identity.
+versioned runtime manifest binds the rich core, adapter, daily runner, and
+managed dispatcher by SHA-256, owner, exact file mode, regular-file type, and
+single-link identity.
 Symlinks, hardlinks, unsupported contracts, path substitution, and permissive
 fallback imports fail before the shared lock or mutable state is opened.
+
+The user-managed backup config is a separate dynamic authority. The dispatcher
+passes its canonical workspace path to the daily runner, but does not attest a
+hash. After acquiring the canonical archive lock, the adapter independently
+opens the config with no-follow semantics, validates owner/mode/link and the
+relevant schema and safe paths, recomputes SHA-256 from descriptor bytes, and
+binds that derived identity to the slot, session, and every capability. A
+caller-supplied or config-embedded hash is ignored. Config replacement or
+content/identity drift revokes live capabilities before any state update.
 
 Production has no adapter/factory command-line option and no caller-supplied
 factory parameter. Test seams may replace the managed loader only by
@@ -91,6 +101,7 @@ branch. A separate reviewed saga owns seal-without-CURRENT and root
 - The canonical lock is exact and acquired before mutable state/queue reads.
 - Incremental, mutable-only, partial, quiet, and null-baseline cursor rules pass.
 - Managed loader rejects SHA, owner, mode, link, contract, and path drift.
+- Managed config replacement, unsafe identity, schema/path mismatch, and
+  self-attested hashes cannot authorize a state or cursor update.
 - Source, packaged Skill, and runtime manifest have exact parity.
 - Targeted and full pytest, compile, diff, secret-shape scan, and OWASP gate pass.
-

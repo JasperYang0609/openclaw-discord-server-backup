@@ -41,6 +41,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 
 RECORD_SCHEMA = "openclaw-discord-rich-message.v1"
+RICH_CORE_CONTRACT = "openclaw-discord-rich-storage-core.v3"
 POINTER_SCHEMA = "openclaw-discord-rich-current.v1"
 JOURNAL_SCHEMA = "openclaw-discord-rich-journal.v1"
 GENERATION_MANIFEST_SCHEMA = "openclaw-discord-rich-generation.v1"
@@ -4805,7 +4806,7 @@ __all__ = [
     "DISCORD_INVENTORY_RESPONSE_SCHEMA", "DISCORD_PAGE_RESPONSE_SCHEMA", "ENTRY_RECEIPT_SCHEMA",
     "FULL_RUN_RECEIPT_SCHEMA", "FullRebuildRunContext", "GENERATION_MANIFEST_SCHEMA",
     "GenerationError", "IncrementalRunContext", "LIVE_EVIDENCE_SCHEMA", "RECORD_SCHEMA",
-    "LiveEvidenceToken", "RichArchiveError", "RichArchiveStore", "SOURCE_CENSUS_SCHEMA",
+    "LiveEvidenceToken", "RICH_CORE_CONTRACT", "RichArchiveError", "RichArchiveStore", "SOURCE_CENSUS_SCHEMA",
     "STAGE_BASE_SCHEMA",
     "SourceBoundsError", "SourceCensusError", "apply_asset_results", "atomic_json",
     "atomic_jsonl", "begin_full_rebuild_run", "begin_incremental_run",

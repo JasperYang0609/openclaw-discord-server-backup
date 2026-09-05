@@ -11,6 +11,13 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skill" / "openclaw-discord-server-backup"
 PACKAGER = SKILL / "scripts" / "package_skill.py"
+PRIVATE_RUNTIME_PATHS = {
+    "manifests/runtime-components.v1.json",
+    "scripts/rich_message_archive.py",
+    "scripts/rich_core_adapter_v3.py",
+    "scripts/run_daily_sync_v3.py",
+    "scripts/run_managed_component.py",
+}
 
 
 class PackageSkillTests(unittest.TestCase):
@@ -40,6 +47,10 @@ class PackageSkillTests(unittest.TestCase):
                     archived = "openclaw-discord-server-backup/" + source.relative_to(SKILL).as_posix()
                     self.assertIn(archived, names)
                     self.assertEqual(archive.read(archived), source.read_bytes(), archived)
+                    relative = source.relative_to(SKILL).as_posix()
+                    if relative in PRIVATE_RUNTIME_PATHS:
+                        mode = archive.getinfo(archived).external_attr >> 16
+                        self.assertEqual(mode & 0o777, 0o600, archived)
 
     def test_packaged_post_run_check_passes_in_installed_layout(self):
         with tempfile.TemporaryDirectory() as tmp:

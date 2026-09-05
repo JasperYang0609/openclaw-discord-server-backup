@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Bounded deterministic daily Discord rich-sync runner (v2 scaffold).
+"""Bounded daily Discord rich-sync runner using the managed Adapter V3.
 
-The transport, inventory, selection, and queue contracts live here.  The rich
-archive adapter intentionally fails closed until the independently reviewed v2
-core exports its final slot/session API; no compatibility shim may guess that
-contract.
+The production CLI loads exactly the sibling adapter and rich core pinned by
+the installed runtime manifest. Persisted Mapping receipts are audit-only;
+only process-local capabilities issued while the canonical archive lock is
+held may authorize a state or cursor update.
 """
 from __future__ import annotations
 
@@ -14,16 +14,17 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -32,28 +33,34 @@ INVENTORY_BINDING_SCHEMA = "openclaw-discord-daily-inventory-binding.v2"
 ENTRY_BINDING_SCHEMA = "openclaw-discord-daily-entry-binding.v2"
 CURRENT_SNAPSHOT_SCHEMA = "openclaw-discord-rich-current-snapshot.v2"
 MERGE_COMMIT_SCHEMA = "openclaw-discord-rich-incremental-commit.v2"
-INCREMENTAL_BEGIN_SCHEMA = "openclaw-discord-rich-incremental-begin.v2"
-FULL_SNAPSHOT_REQUEST_SCHEMA = "openclaw-discord-rich-full-snapshot-request.v1"
-ROOT_RUN_CURRENT_REQUEST_SCHEMA = "openclaw-discord-rich-root-current-request.v1"
-RICH_CORE_ADAPTER_VERSION = "openclaw-discord-rich-core-adapter.v2"
-RICH_SLOT_PROTOCOL = "openclaw-discord-rich-locked-slot.v2"
-RICH_INCREMENTAL_PROTOCOL = "openclaw-discord-rich-incremental-session.v2"
-RICH_FULL_SNAPSHOT_PROTOCOL = "openclaw-discord-rich-full-snapshot-session.v1"
-RICH_ROOT_CURRENT_PROTOCOL = "openclaw-discord-rich-root-current.v1"
-RICH_CORE_OPERATIONS = (
-    "open_slot",
-    "begin_incremental",
-    "inspect_current",
-    "merge_incremental",
-    "begin_full_rebuild",
-    "collect_and_stage_full_snapshot",
-    "reserve_full_stage_assets",
-    "install_full_pass_evidence",
-    "publish_full_entry",
-    "finalize_full_rebuild",
-    "publish_root_run_current",
-    "inspect_root_run_current",
-)
+RICH_CORE_ADAPTER_VERSION = "openclaw-discord-rich-core-adapter.v3"
+RUNTIME_MANIFEST_SCHEMA = "openclaw-discord-runtime-components.v1"
+RUNTIME_MANIFEST_RELATIVE = "manifests/runtime-components.v1.json"
+MANAGED_ADAPTER_FILENAME = "rich_core_adapter_v3.py"
+MANAGED_RUNNER_FILENAME = "run_daily_sync_v3.py"
+MANAGED_DISPATCHER_FILENAME = "run_managed_component.py"
+RUNTIME_COMPONENT_PATHS = {
+    "rich_message_archive.py": "scripts/rich_message_archive.py",
+    MANAGED_ADAPTER_FILENAME: f"scripts/{MANAGED_ADAPTER_FILENAME}",
+    MANAGED_RUNNER_FILENAME: f"scripts/{MANAGED_RUNNER_FILENAME}",
+    MANAGED_DISPATCHER_FILENAME: f"scripts/{MANAGED_DISPATCHER_FILENAME}",
+}
+CONFIG_BINDING_VIEW_KEYS = frozenset({
+    "schemaVersion",
+    "authority",
+    "configSha256",
+    "configPathSha256",
+    "workspaceRootSha256",
+    "archiveRootSha256",
+    "guildId",
+    "timezone",
+    "statePathSha256",
+    "queuePathSha256",
+    "openclawConfigPathSha256",
+    "dailyEntryLimit",
+    "dailyMessageLimit",
+    "dailyMutableRefreshLimit",
+})
 ACTIVE_QUEUE_STATUSES = frozenset({"queued", "catching_up", "retry"})
 INELIGIBLE_ENTRY_STATUSES = frozenset(
     {"partial", "queued", "catching_up", "retry", "error", "excluded"}
@@ -93,10 +100,22 @@ ERROR_REASONS = frozenset({
     "discord_rate_limit_exhausted",
     "discord_duplicate_conflict",
     "rich_core_contract_pending",
+    "rich_core_load_failed",
+    "rich_core_integrity_mismatch",
     "rich_core_contract_unsupported",
+    "rich_core_authority_invalid",
+    "rich_core_authority_expired",
     "rich_baseline_missing",
     "rich_archive_merge_failed",
     "rich_archive_readback_failed",
+    "rich_cursor_not_authorized",
+    "rich_asset_budget_exhausted",
+    "rich_full_stage_failed",
+    "rich_full_evidence_failed",
+    "rich_full_run_incomplete",
+    "rich_root_publish_failed",
+    "rich_root_readback_failed",
+    "rich_root_rollback_failed",
     "queue_persist_failed",
     "state_persist_failed",
     "journal_recovery_failed",
@@ -127,201 +146,6 @@ class MutableRefreshPlan:
     cycle_completed: bool
 
 
-@dataclass(frozen=True)
-class RichCoreContractDescriptor:
-    """Exact nominal boundary between the runner and reviewed rich core.
-
-    Structural/duck-typed objects are deliberately rejected.  A changed method
-    set or protocol version requires a new adapter and runner review.
-    """
-
-    adapter_version: str
-    slot_protocol: str
-    incremental_protocol: str
-    full_snapshot_protocol: str
-    root_current_protocol: str
-    operations: tuple[str, ...]
-
-
-SUPPORTED_RICH_CORE_CONTRACT = RichCoreContractDescriptor(
-    adapter_version=RICH_CORE_ADAPTER_VERSION,
-    slot_protocol=RICH_SLOT_PROTOCOL,
-    incremental_protocol=RICH_INCREMENTAL_PROTOCOL,
-    full_snapshot_protocol=RICH_FULL_SNAPSHOT_PROTOCOL,
-    root_current_protocol=RICH_ROOT_CURRENT_PROTOCOL,
-    operations=RICH_CORE_OPERATIONS,
-)
-
-
-@dataclass(frozen=True)
-class IncrementalBeginRequest:
-    schema_version: str
-    role: str
-    archive_root: Path
-    inventory_digest: str
-    inventory_observed_at: str
-    entry_bindings: tuple[Mapping[str, Any], ...]
-    limits: tuple[tuple[str, int], ...]
-
-
-@dataclass(frozen=True)
-class CurrentInspectionRequest:
-    schema_version: str
-    entry_root: Path
-    entry_binding: Mapping[str, Any]
-
-
-@dataclass(frozen=True)
-class IncrementalMergeRequest:
-    schema_version: str
-    entry_root: Path
-    entry_binding: Mapping[str, Any]
-    observed_at: str
-    messages: tuple[Mapping[str, Any], ...]
-    source_sha256_by_id: Mapping[str, str]
-
-
-@dataclass(frozen=True)
-class FullSnapshotRequest:
-    schema_version: str
-    run_id: str
-    archive_root: Path
-    inventory_digest: str
-    expected_entry_bindings: tuple[Mapping[str, Any], ...]
-
-
-@dataclass(frozen=True)
-class RootRunCurrentRequest:
-    schema_version: str
-    run_id: str
-    archive_root: Path
-    inventory_digest: str
-    expected_entry_generation_sha256: Mapping[str, str]
-
-
-class RichIncrementalSessionV2:
-    """Nominal incremental port.  Defaults fail closed until core integration."""
-
-    contract = SUPPORTED_RICH_CORE_CONTRACT
-
-    def inspect_current(self, request: CurrentInspectionRequest) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def merge_incremental(self, request: IncrementalMergeRequest) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-
-class RichFullRebuildSessionV2:
-    """Nominal full-snapshot/root-pointer port; no compatibility fallback."""
-
-    contract = SUPPORTED_RICH_CORE_CONTRACT
-
-    def collect_and_stage_full_snapshot(
-        self, request: FullSnapshotRequest
-    ) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def reserve_full_stage_assets(
-        self, request: FullSnapshotRequest
-    ) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def install_full_pass_evidence(
-        self, request: FullSnapshotRequest
-    ) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def publish_full_entry(
-        self, request: FullSnapshotRequest
-    ) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def finalize_full_rebuild(
-        self, request: FullSnapshotRequest
-    ) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def publish_root_run_current(
-        self, request: RootRunCurrentRequest
-    ) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def inspect_root_run_current(
-        self, request: RootRunCurrentRequest
-    ) -> Mapping[str, Any]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-
-class LockedRichSlotV2:
-    """Second phase: state may be loaded only after this locked slot is entered."""
-
-    contract = SUPPORTED_RICH_CORE_CONTRACT
-
-    def begin_incremental(
-        self, request: IncrementalBeginRequest
-    ) -> AbstractContextManager[RichIncrementalSessionV2]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-    def begin_full_rebuild(
-        self, request: FullSnapshotRequest
-    ) -> AbstractContextManager[RichFullRebuildSessionV2]:
-        del request
-        raise DailySyncError("rich_core_contract_pending")
-
-
-class RichCoreAdapterV2:
-    """First phase: acquire the shared core lock without reading mutable JSON."""
-
-    contract = SUPPORTED_RICH_CORE_CONTRACT
-
-    def open_slot(
-        self, *, lock_path: Path
-    ) -> AbstractContextManager[LockedRichSlotV2]:
-        del lock_path
-        raise DailySyncError("rich_core_contract_pending")
-
-
-def _has_exact_contract(value: Any) -> bool:
-    return (
-        type(getattr(value, "contract", None)) is RichCoreContractDescriptor
-        and value.contract == SUPPORTED_RICH_CORE_CONTRACT
-    )
-
-
-def require_rich_adapter(value: Any) -> RichCoreAdapterV2:
-    if not isinstance(value, RichCoreAdapterV2) or not _has_exact_contract(value):
-        raise DailySyncError("rich_core_contract_unsupported")
-    return value
-
-
-def require_locked_slot(value: Any) -> LockedRichSlotV2:
-    if not isinstance(value, LockedRichSlotV2) or not _has_exact_contract(value):
-        raise DailySyncError("rich_core_contract_unsupported")
-    return value
-
-
-def require_incremental_session(value: Any) -> RichIncrementalSessionV2:
-    if not isinstance(value, RichIncrementalSessionV2) or not _has_exact_contract(value):
-        raise DailySyncError("rich_core_contract_unsupported")
-    return value
-
-
-def require_full_rebuild_session(value: Any) -> RichFullRebuildSessionV2:
-    if not isinstance(value, RichFullRebuildSessionV2) or not _has_exact_contract(value):
-        raise DailySyncError("rich_core_contract_unsupported")
-    return value
-
-
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -334,6 +158,202 @@ def canonical_json(value: Any) -> bytes:
 
 def json_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_SKILL_ROOT = _SCRIPT_DIR.parent
+_RUNTIME_MANIFEST = _SKILL_ROOT / RUNTIME_MANIFEST_RELATIVE
+_MANAGED_ADAPTER_CACHE: tuple[tuple[Any, ...], ModuleType] | None = None
+MAX_RUNTIME_COMPONENT_BYTES = 8 * 1024 * 1024
+
+
+def _runtime_component_row(
+    payload: Mapping[str, Any], filename: str
+) -> dict[str, Any]:
+    components = payload.get("components")
+    row = components.get(filename) if isinstance(components, Mapping) else None
+    if (
+        not isinstance(row, dict)
+        or set(row) != {"relativePath", "sha256", "mode", "owner", "links"}
+        or filename not in RUNTIME_COMPONENT_PATHS
+        or row.get("relativePath") != RUNTIME_COMPONENT_PATHS[filename]
+        or row.get("mode") != "0600"
+        or row.get("owner") != "effective-user"
+        or row.get("links") != 1
+        or not HASH_RE.fullmatch(str(row.get("sha256") or ""))
+    ):
+        raise DailySyncError("rich_core_integrity_mismatch")
+    return row
+
+
+def _read_runtime_component(
+    path: Path, row: Mapping[str, Any]
+) -> tuple[bytes, tuple[Any, ...]]:
+    reject_symlink_components(path)
+    descriptor = -1
+    try:
+        before = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+    except OSError as exc:
+        raise DailySyncError("rich_core_integrity_mismatch") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise DailySyncError("rich_core_integrity_mismatch")
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_RUNTIME_COMPONENT_BYTES:
+                raise DailySyncError("rich_core_integrity_mismatch")
+            chunks.append(chunk)
+        after = path.lstat()
+    except (OSError, DailySyncError) as exc:
+        if isinstance(exc, DailySyncError):
+            raise
+        raise DailySyncError("rich_core_integrity_mismatch") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    encoded = b"".join(chunks)
+    if (
+        len(encoded) != info.st_size
+        or hashlib.sha256(encoded).hexdigest() != row.get("sha256")
+        or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    ):
+        raise DailySyncError("rich_core_integrity_mismatch")
+    return encoded, (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, row["sha256"]
+    )
+
+
+def _verify_runtime_component(path: Path, row: Mapping[str, Any]) -> tuple[Any, ...]:
+    _encoded, identity = _read_runtime_component(path, row)
+    return identity
+
+
+def load_managed_rich_adapter() -> ModuleType:
+    """Load only the manifest-pinned sibling Adapter V3 module."""
+    global _MANAGED_ADAPTER_CACHE
+    manifest_path = Path(os.path.abspath(_RUNTIME_MANIFEST))
+    reject_symlink_components(manifest_path)
+    descriptor = -1
+    try:
+        before = manifest_path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(manifest_path, flags)
+        manifest_info = os.fstat(descriptor)
+        encoded = os.read(descriptor, 64 * 1024 + 1)
+        after = manifest_path.lstat()
+        payload = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DailySyncError("rich_core_integrity_mismatch") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        len(encoded) > 64 * 1024
+        or len(encoded) != manifest_info.st_size
+        or not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(manifest_info.st_mode)
+        or (before.st_dev, before.st_ino)
+        != (manifest_info.st_dev, manifest_info.st_ino)
+        or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (
+            manifest_info.st_dev,
+            manifest_info.st_ino,
+            manifest_info.st_size,
+            manifest_info.st_mtime_ns,
+        )
+        or manifest_info.st_uid != os.geteuid()
+        or manifest_info.st_nlink != 1
+        or stat.S_IMODE(manifest_info.st_mode) != 0o600
+        or not isinstance(payload, dict)
+        or set(payload) != {"schemaVersion", "adapterContract", "components"}
+        or payload.get("schemaVersion") != RUNTIME_MANIFEST_SCHEMA
+        or payload.get("adapterContract") != RICH_CORE_ADAPTER_VERSION
+        or not isinstance(payload.get("components"), dict)
+        or set(payload["components"]) != set(RUNTIME_COMPONENT_PATHS)
+    ):
+        raise DailySyncError("rich_core_integrity_mismatch")
+    rows = {
+        filename: _runtime_component_row(payload, filename)
+        for filename in RUNTIME_COMPONENT_PATHS
+    }
+    expected_hashes = {
+        filename: str(row["sha256"])
+        for filename, row in rows.items()
+    }
+    for filename, row in rows.items():
+        if filename != MANAGED_ADAPTER_FILENAME:
+            _verify_runtime_component(_SCRIPT_DIR / filename, row)
+    runner_row = rows[MANAGED_RUNNER_FILENAME]
+    adapter_row = rows[MANAGED_ADAPTER_FILENAME]
+    adapter_source, cache_key = _read_runtime_component(
+        _SCRIPT_DIR / MANAGED_ADAPTER_FILENAME, adapter_row
+    )
+    if _MANAGED_ADAPTER_CACHE is not None and _MANAGED_ADAPTER_CACHE[0] == cache_key:
+        cached_module = _MANAGED_ADAPTER_CACHE[1]
+        try:
+            cached_hashes = cached_module.validate_runtime_components()
+        except Exception as exc:
+            category = getattr(exc, "category", "rich_core_integrity_mismatch")
+            raise DailySyncError(category) from exc
+        if cached_hashes != expected_hashes:
+            raise DailySyncError("rich_core_integrity_mismatch")
+        return cached_module
+    module_name = f"_openclaw_managed_rich_adapter_{adapter_row['sha256'][:20]}"
+    module = ModuleType(module_name)
+    module.__file__ = str(_SCRIPT_DIR / MANAGED_ADAPTER_FILENAME)
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    try:
+        compiled = compile(
+            adapter_source,
+            str(_SCRIPT_DIR / MANAGED_ADAPTER_FILENAME),
+            "exec",
+            dont_inherit=True,
+        )
+        exec(compiled, module.__dict__)
+        component_hashes = module.validate_runtime_components()
+    except Exception as exc:
+        sys.modules.pop(module_name, None)
+        category = getattr(exc, "category", "rich_core_load_failed")
+        raise DailySyncError(category) from exc
+    if (
+        getattr(module, "ADAPTER_VERSION", None) != RICH_CORE_ADAPTER_VERSION
+        or type(getattr(module, "ManagedRichCoreAdapterV3", None)) is not type
+        or component_hashes != expected_hashes
+    ):
+        raise DailySyncError("rich_core_contract_unsupported")
+    _MANAGED_ADAPTER_CACHE = (cache_key, module)
+    return module
 
 
 def reject_control_characters(value: str, label: str) -> None:
@@ -1118,15 +1138,19 @@ def fetch_mutable_window(
     limit: int,
     canonical_ids: Sequence[str],
     rate_limit_budget: dict[str, float],
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, int]:
     if plan.target_message_id is None:
-        return [], 0
+        return [], 0, 0
     rows = fetch(
         token, channel_id, around=plan.target_message_id, limit=limit,
         rate_limit_budget=rate_limit_budget,
     )
     allowed = set(canonical_ids)
-    return [row for row in rows if str(row.get("id") or "") in allowed], 1
+    return (
+        [row for row in rows if str(row.get("id") or "") in allowed],
+        1,
+        len(rows),
+    )
 
 
 def fetch_verified_empty_head(
@@ -1200,85 +1224,541 @@ def validate_limits(args: argparse.Namespace) -> None:
         raise DailySyncError("invalid_limits")
 
 
+def _translate_adapter_error(exc: BaseException) -> DailySyncError:
+    return DailySyncError(str(getattr(exc, "category", "rich_core_contract_unsupported")))
+
+
+def _persist_progress(
+    *,
+    queue_path: Path,
+    queue: dict[str, Any],
+    state_path: Path,
+    state: dict[str, Any],
+) -> None:
+    timestamp = now_utc()
+    queue["updatedAt"] = timestamp
+    state["updatedAt"] = timestamp
+    persist_queue_then_state(queue_path, queue, state_path, state)
+
+
+def _queue_for_rebuild(
+    queue: dict[str, Any], key: str, entry: dict[str, Any]
+) -> None:
+    entry.update({
+        "syncStatus": "queued",
+        "backlogReason": "rich_full_rebuild_required",
+        "richArchiveIncrementalStatus": "full_rebuild_required",
+    })
+    upsert_queue_item(
+        queue,
+        key,
+        entry,
+        status="queued",
+        reason="rich_full_rebuild_required",
+    )
+
+
+def _queue_for_retry(
+    queue: dict[str, Any], key: str, entry: dict[str, Any], *, reason: str
+) -> None:
+    if reason not in {
+        "rich_incremental_read_error",
+        "rich_incremental_merge_error",
+        "rich_incremental_readback_error",
+    }:
+        reason = "rich_incremental_readback_error"
+    entry.update({
+        "syncStatus": "retry",
+        "backlogReason": reason,
+        "richArchiveIncrementalStatus": "retry",
+        "consecutiveErrors": int(entry.get("consecutiveErrors") or 0) + 1,
+    })
+    upsert_queue_item(queue, key, entry, status="retry", reason=reason)
+
+
+def _apply_consumed_grant(
+    entry: dict[str, Any],
+    grant: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+    config_binding: Mapping[str, Any],
+    today: str,
+    partial: bool,
+    mutable_plan: MutableRefreshPlan | None,
+) -> None:
+    if (
+        grant.get("authority") != "CONSUMED_RUNTIME_GRANT"
+        or grant.get("entryBindingSha256") != binding.get("entryBindingSha256")
+        or grant.get("channelId") != binding.get("channelId")
+        or grant.get("inventoryDigest") != binding.get("inventoryDigest")
+        or grant.get("inventoryObservedAt") != binding.get("inventoryObservedAt")
+        or grant.get("configSha256") != config_binding.get("configSha256")
+        or grant.get("configPathSha256")
+        != config_binding.get("configPathSha256")
+        or not isinstance(grant.get("generationId"), str)
+        or not HASH_RE.fullmatch(str(grant.get("generationSha256") or ""))
+        or not HASH_RE.fullmatch(str(grant.get("pointerSha256") or ""))
+    ):
+        raise DailySyncError("rich_archive_readback_failed")
+    cursor = grant.get("authorizedCursor")
+    if cursor is not None and not SNOWFLAKE_RE.fullmatch(str(cursor)):
+        raise DailySyncError("rich_cursor_not_authorized")
+    observed_at = str(grant.get("observedAt") or now_utc())
+    entry.update({
+        "syncStatus": "partial" if partial else "healthy",
+        "backlogReason": "rich_incremental_partial" if partial else None,
+        "richArchiveIncrementalStatus": "verified",
+        "richArchiveIncrementalGenerationId": grant["generationId"],
+        "richArchiveIncrementalVerifiedAt": observed_at,
+        "consecutiveErrors": 0,
+    })
+    if cursor is not None:
+        entry["lastWrittenMessageId"] = str(cursor)
+        entry["lastMessageId"] = str(cursor)
+    if grant.get("quiet") is not True:
+        entry["lastSuccessfulWriteAt"] = observed_at
+    if mutable_plan is not None and mutable_plan.next_scan_cursor is not None:
+        entry["richMutableScanCursor"] = mutable_plan.next_scan_cursor
+        if mutable_plan.cycle_completed:
+            entry["richMutableScanCompletedAt"] = observed_at
+    if not partial:
+        entry["lastBackup"] = today
+
+
 def execute(
     args: argparse.Namespace,
     *,
     fetch: Callable[..., list[dict[str, Any]]] = discord_messages,
-    rich_factory: RichCoreAdapterV2 | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Enter the exact core-owned lock before the first mutable JSON load.
-
-    Fetch/merge orchestration remains deliberately blocked until the reviewed
-    rich-core adapter implements the nominal v2 protocol.  This function still
-    exercises the two-phase lock/begin boundary so a future adapter cannot
-    regress to pre-lock state or queue reads.
-    """
-    del fetch
+    """Run one bounded slot through opaque core-issued capabilities."""
     validate_limits(args)
     state_path = safe_path(args.state, require_file=True)
     queue_path = safe_path(args.queue, require_file=True)
     inventory_path = safe_path(args.inventory, require_file=True)
     mapping_path = safe_path(args.mapping_ledger, require_file=True)
     archive_root = safe_path(args.root, require_directory=True)
-    safe_path(args.openclaw_config, require_file=True)
-    if rich_factory is None:
-        raise DailySyncError("rich_core_contract_pending")
-    adapter = require_rich_adapter(rich_factory)
-    if state_path.parent != queue_path.parent:
-        raise DailySyncError("unsafe_input_path")
-    lock_path = state_path.parent / ".channel_backup.lock"
-    slot_manager = adapter.open_slot(lock_path=lock_path)
-    if not isinstance(slot_manager, AbstractContextManager):
-        raise DailySyncError("rich_core_contract_unsupported")
-    with slot_manager as slot_value:
-        slot = require_locked_slot(slot_value)
-        # Mutable state/queue are intentionally first opened only after the
-        # core-owned shared lock context has entered successfully.
-        state = load_json_object(state_path, "unreadable_state")
-        queue = load_json_object(queue_path, "unreadable_queue")
-        inventory = load_json_object(inventory_path, "unreadable_inventory")
-        mapping = load_json_object(mapping_path, "unreadable_mapping_ledger")
-        binding = validate_inventory_binding(
-            inventory,
-            mapping,
-            guild_id=args.guild_id,
-            today=args.today,
-            timezone_name=args.timezone,
-        )
-        selected = select_candidates(
-            state, queue, today=args.today, max_entries=args.max_entries
-        )
-        entry_bindings = tuple(
-            bind_entry_inventory(
-                binding,
-                channel_id=str(entry["channelId"]),
-                relative_path=str(entry["relativePath"]),
-                entry_type=str(entry["type"]),
-            )
-            for _key, entry in selected
-        )
-        request = IncrementalBeginRequest(
-            schema_version=INCREMENTAL_BEGIN_SCHEMA,
-            role=args.role,
+    workspace_root = safe_path(args.workspace, require_directory=True)
+    backup_config_path = safe_path(args.backup_config, require_file=True)
+    config_path = safe_path(args.openclaw_config, require_file=True)
+    adapter_module = load_managed_rich_adapter()
+    try:
+        adapter = adapter_module.ManagedRichCoreAdapterV3()
+        slot_manager = adapter.open_slot(
             archive_root=archive_root,
-            inventory_digest=str(binding["inventoryDigest"]),
-            inventory_observed_at=str(binding["observedAt"]),
-            entry_bindings=entry_bindings,
-            limits=(
-                ("maxEntries", args.max_entries),
-                ("maxWriteEntries", args.max_write_entries),
-                ("maxReadMessages", args.max_read_messages),
-                ("maxMessagesPerEntry", args.max_messages_per_entry),
-                ("mutableRefreshLimit", args.mutable_refresh_limit),
-            ),
+            lock_path=archive_root / adapter_module.CANONICAL_LOCK_NAME,
+            workspace_root=workspace_root,
+            config_path=backup_config_path,
         )
-        incremental_manager = slot.begin_incremental(request)
-        if not isinstance(incremental_manager, AbstractContextManager):
-            raise DailySyncError("rich_core_contract_unsupported")
-        with incremental_manager as session_value:
-            require_incremental_session(session_value)
-            # The reviewed merge/readback adapter has not landed in this branch.
-            raise DailySyncError("rich_core_contract_pending")
+        with slot_manager as slot:
+            if type(slot) is not adapter_module.LockedRichSlotV3:
+                raise DailySyncError("rich_core_contract_unsupported")
+            try:
+                config_binding = slot.config_view()
+            except adapter_module.RichCoreAdapterError as exc:
+                raise _translate_adapter_error(exc) from exc
+            if (
+                set(config_binding) != CONFIG_BINDING_VIEW_KEYS
+                or config_binding.get("schemaVersion")
+                != adapter_module.CONFIG_BINDING_AUDIT_SCHEMA
+                or config_binding.get("authority") != "AUDIT_ONLY"
+                or config_binding.get("guildId") != args.guild_id
+                or config_binding.get("timezone") != args.timezone
+                or config_binding.get("statePathSha256")
+                != json_sha256(str(state_path))
+                or config_binding.get("queuePathSha256")
+                != json_sha256(str(queue_path))
+                or config_binding.get("openclawConfigPathSha256")
+                != json_sha256(str(config_path))
+                or config_binding.get("dailyEntryLimit") != args.max_entries
+                or config_binding.get("dailyMessageLimit")
+                != args.max_messages_per_entry
+                or config_binding.get("dailyMutableRefreshLimit")
+                != args.mutable_refresh_limit
+                or not HASH_RE.fullmatch(
+                    str(config_binding.get("configSha256") or "")
+                )
+                or not HASH_RE.fullmatch(
+                    str(config_binding.get("configPathSha256") or "")
+                )
+            ):
+                raise DailySyncError("rich_core_authority_invalid")
+
+            # Mutable state and queue are first opened only after the canonical
+            # archive-root lock is held by the reviewed core.
+            state = load_json_object(state_path, "unreadable_state")
+            queue = load_json_object(queue_path, "unreadable_queue")
+            inventory = load_json_object(inventory_path, "unreadable_inventory")
+            mapping = load_json_object(mapping_path, "unreadable_mapping_ledger")
+            inventory_binding = validate_inventory_binding(
+                inventory,
+                mapping,
+                guild_id=args.guild_id,
+                today=args.today,
+                timezone_name=args.timezone,
+            )
+            selected = select_candidates(
+                state, queue, today=args.today, max_entries=args.max_entries
+            )
+            if not selected:
+                return {
+                    "ok": True,
+                    "status": "ok",
+                    "checked": 0,
+                    "writtenEntries": 0,
+                    "writtenMessages": 0,
+                    "refreshedMessages": 0,
+                    "mergedMessages": 0,
+                    "queued": 0,
+                    "totalRead": 0,
+                    "activeQueueLeft": sum(
+                        1 for item in queue.get("items", [])
+                        if isinstance(item, Mapping)
+                        and item.get("status") in ACTIVE_QUEUE_STATUSES
+                    ),
+                }, 0
+
+            audit_bindings = tuple(
+                bind_entry_inventory(
+                    inventory_binding,
+                    channel_id=str(entry["channelId"]),
+                    relative_path=str(entry["relativePath"]),
+                    entry_type=str(entry["type"]),
+                )
+                for _key, entry in selected
+            )
+            rich_bindings = tuple(
+                adapter_module.EntryBindingV3.from_mapping(row)
+                for row in audit_bindings
+            )
+            begin_request = adapter_module.IncrementalBeginRequestV3(
+                schema_version=adapter_module.INCREMENTAL_BEGIN_SCHEMA,
+                role=args.role,
+                archive_root=archive_root,
+                workspace_root=workspace_root,
+                state_path=state_path,
+                queue_path=queue_path,
+                openclaw_config_path=config_path,
+                timezone_name=args.timezone,
+                inventory_digest=str(inventory_binding["inventoryDigest"]),
+                inventory_observed_at=str(inventory_binding["observedAt"]),
+                entry_bindings=rich_bindings,
+                limits=(
+                    ("maxEntries", args.max_entries),
+                    ("maxWriteEntries", args.max_write_entries),
+                    ("maxReadMessages", args.max_read_messages),
+                    ("maxMessagesPerEntry", args.max_messages_per_entry),
+                    ("mutableRefreshLimit", args.mutable_refresh_limit),
+                ),
+            )
+            token = load_discord_token(config_path, args.token_env)
+            rate_limit_budget: dict[str, float] = {"waited": 0.0}
+            checked = 0
+            written_entries = 0
+            written_messages = 0
+            refreshed_messages = 0
+            merged_messages = 0
+            queued = 0
+            total_read = 0
+
+            with slot.begin_incremental(begin_request) as session:
+                if type(session) is not adapter_module.IncrementalSessionV3:
+                    raise DailySyncError("rich_core_contract_unsupported")
+                for (key, selected_entry), audit_binding, rich_binding in zip(
+                    selected, audit_bindings, rich_bindings
+                ):
+                    if (
+                        written_entries >= args.max_write_entries
+                        or total_read >= args.max_read_messages
+                    ):
+                        break
+                    entries = state.get("entries")
+                    live_entry = entries.get(key) if isinstance(entries, dict) else None
+                    if not isinstance(live_entry, dict) or dict(live_entry) != selected_entry:
+                        raise DailySyncError("invalid_state")
+                    checked += 1
+                    try:
+                        current = session.inspect_current(rich_binding)
+                        current_view = session.current_view(current)
+                    except adapter_module.RichCoreAdapterError as exc:
+                        if exc.category == "rich_baseline_missing":
+                            _queue_for_rebuild(queue, key, live_entry)
+                            queued += 1
+                            _persist_progress(
+                                queue_path=queue_path, queue=queue,
+                                state_path=state_path, state=state,
+                            )
+                            continue
+                        _queue_for_retry(
+                            queue, key, live_entry,
+                            reason="rich_incremental_readback_error",
+                        )
+                        _persist_progress(
+                            queue_path=queue_path, queue=queue,
+                            state_path=state_path, state=state,
+                        )
+                        raise
+
+                    cursor = newest_cursor(
+                        live_entry.get("lastWrittenMessageId"),
+                        live_entry.get("lastMessageId"),
+                    )
+                    mutable_plan: MutableRefreshPlan | None = None
+                    if cursor is None:
+                        def head_fetch(channel_id: str, limit: int):
+                            return fetch(
+                                token, channel_id, head=True, limit=limit,
+                                rate_limit_budget=rate_limit_budget,
+                            )
+
+                        try:
+                            probe = session.probe_head(
+                                rich_binding,
+                                fetch_page=head_fetch,
+                                limit=min(args.page_size, args.max_read_messages - total_read),
+                            )
+                            probe_view = session.head_probe_view(probe)
+                        except adapter_module.RichCoreAdapterError as exc:
+                            if exc.category == "rich_baseline_missing":
+                                _queue_for_rebuild(queue, key, live_entry)
+                                queued += 1
+                                _persist_progress(
+                                    queue_path=queue_path, queue=queue,
+                                    state_path=state_path, state=state,
+                                )
+                                continue
+                            _queue_for_retry(
+                                queue, key, live_entry,
+                                reason="rich_incremental_read_error",
+                            )
+                            _persist_progress(
+                                queue_path=queue_path, queue=queue,
+                                state_path=state_path, state=state,
+                            )
+                            raise
+                        total_read += len(probe_view["messageIds"])
+                        if probe_view["messageIds"]:
+                            _queue_for_rebuild(queue, key, live_entry)
+                            queued += 1
+                            _persist_progress(
+                                queue_path=queue_path, queue=queue,
+                                state_path=state_path, state=state,
+                            )
+                            continue
+                        try:
+                            grant = session.authorize_quiet_update(
+                                current,
+                                requested_cursor=None,
+                                head_probe=probe,
+                            )
+                            consumed = session.consume_state_update_grant(grant)
+                        except adapter_module.RichCoreAdapterError:
+                            _queue_for_retry(
+                                queue, key, live_entry,
+                                reason="rich_incremental_readback_error",
+                            )
+                            _persist_progress(
+                                queue_path=queue_path, queue=queue,
+                                state_path=state_path, state=state,
+                            )
+                            raise
+                        _apply_consumed_grant(
+                            live_entry,
+                            consumed,
+                            binding=audit_binding,
+                            config_binding=config_binding,
+                            today=args.today,
+                            partial=False,
+                            mutable_plan=None,
+                        )
+                        _persist_progress(
+                            queue_path=queue_path, queue=queue,
+                            state_path=state_path, state=state,
+                        )
+                        continue
+
+                    canonical_ids = list(current_view["canonicalMessageIds"])
+                    if cursor not in canonical_ids:
+                        _queue_for_rebuild(queue, key, live_entry)
+                        queued += 1
+                        _persist_progress(
+                            queue_path=queue_path, queue=queue,
+                            state_path=state_path, state=state,
+                        )
+                        continue
+                    try:
+                        new_messages, terminal, _requests = fetch_new_messages(
+                            fetch,
+                            token,
+                            str(live_entry["channelId"]),
+                            cursor,
+                            page_size=args.page_size,
+                            max_pages=args.max_pages_per_entry,
+                            max_messages=args.max_messages_per_entry,
+                            remaining_messages=args.max_read_messages - total_read,
+                            rate_limit_budget=rate_limit_budget,
+                        )
+                    except DailySyncError:
+                        _queue_for_retry(
+                            queue, key, live_entry,
+                            reason="rich_incremental_read_error",
+                        )
+                        _persist_progress(
+                            queue_path=queue_path, queue=queue,
+                            state_path=state_path, state=state,
+                        )
+                        raise
+                    total_read += len(new_messages)
+                    mutable_plan = plan_mutable_refresh(
+                        canonical_ids, live_entry.get("richMutableScanCursor")
+                    )
+                    refresh_messages: list[dict[str, Any]] = []
+                    remaining = args.max_read_messages - total_read
+                    if remaining > 0 and mutable_plan.target_message_id is not None:
+                        try:
+                            (
+                                refresh_messages,
+                                _refresh_requests,
+                                mutable_rows_read,
+                            ) = fetch_mutable_window(
+                                fetch,
+                                token,
+                                str(live_entry["channelId"]),
+                                mutable_plan,
+                                limit=min(args.mutable_refresh_limit, remaining),
+                                canonical_ids=canonical_ids,
+                                rate_limit_budget=rate_limit_budget,
+                            )
+                        except DailySyncError:
+                            _queue_for_retry(
+                                queue, key, live_entry,
+                                reason="rich_incremental_read_error",
+                            )
+                            _persist_progress(
+                                queue_path=queue_path, queue=queue,
+                                state_path=state_path, state=state,
+                            )
+                            raise
+                        # Account for every Discord row returned, including
+                        # around-window rows filtered out of the merge set.
+                        total_read += mutable_rows_read
+                    messages = combine_messages(refresh_messages, new_messages)
+                    partial = not terminal
+                    if messages:
+                        new_ids = tuple(
+                            sorted(
+                                {str(row["id"]) for row in new_messages},
+                                key=int,
+                            )
+                        )
+                        merge_request = adapter_module.IncrementalMergeRequestV3(
+                            schema_version=adapter_module.INCREMENTAL_MERGE_SCHEMA,
+                            entry=rich_binding,
+                            observed_at=now_utc(),
+                            messages=tuple(messages),
+                            previous_cursor=cursor,
+                            new_message_ids=new_ids,
+                            partial=partial,
+                        )
+                        try:
+                            commit = session.merge_incremental(
+                                merge_request, pre_current=current
+                            )
+                            safe_cursor = max(new_ids, key=int) if new_ids else cursor
+                            grant = session.authorize_state_update(
+                                commit, requested_cursor=safe_cursor
+                            )
+                            consumed = session.consume_state_update_grant(grant)
+                        except adapter_module.RichCoreAdapterError as exc:
+                            reason = (
+                                "rich_incremental_merge_error"
+                                if exc.category == "rich_archive_merge_failed"
+                                else "rich_incremental_readback_error"
+                            )
+                            _queue_for_retry(queue, key, live_entry, reason=reason)
+                            _persist_progress(
+                                queue_path=queue_path, queue=queue,
+                                state_path=state_path, state=state,
+                            )
+                            raise
+                        _apply_consumed_grant(
+                            live_entry,
+                            consumed,
+                            binding=audit_binding,
+                            config_binding=config_binding,
+                            today=args.today,
+                            partial=partial,
+                            mutable_plan=mutable_plan,
+                        )
+                        written_entries += 1
+                        written_messages += len(new_ids)
+                        refreshed_messages += len(messages) - len(new_ids)
+                        merged_messages += len(messages)
+                    else:
+                        if not terminal:
+                            raise DailySyncError("rich_archive_readback_failed")
+                        try:
+                            grant = session.authorize_quiet_update(
+                                current,
+                                requested_cursor=cursor,
+                                explicit_terminal_empty=True,
+                            )
+                            consumed = session.consume_state_update_grant(grant)
+                        except adapter_module.RichCoreAdapterError:
+                            _queue_for_retry(
+                                queue, key, live_entry,
+                                reason="rich_incremental_readback_error",
+                            )
+                            _persist_progress(
+                                queue_path=queue_path, queue=queue,
+                                state_path=state_path, state=state,
+                            )
+                            raise
+                        _apply_consumed_grant(
+                            live_entry,
+                            consumed,
+                            binding=audit_binding,
+                            config_binding=config_binding,
+                            today=args.today,
+                            partial=False,
+                            mutable_plan=mutable_plan,
+                        )
+                    if partial:
+                        upsert_queue_item(
+                            queue,
+                            key,
+                            live_entry,
+                            status="queued",
+                            reason="rich_incremental_partial",
+                        )
+                        queued += 1
+                    _persist_progress(
+                        queue_path=queue_path, queue=queue,
+                        state_path=state_path, state=state,
+                    )
+
+            active_left = sum(
+                1 for item in queue.get("items", [])
+                if isinstance(item, Mapping)
+                and item.get("status") in ACTIVE_QUEUE_STATUSES
+            )
+            return {
+                "ok": True,
+                "status": "pending" if queued else "ok",
+                "checked": checked,
+                "writtenEntries": written_entries,
+                "writtenMessages": written_messages,
+                "refreshedMessages": refreshed_messages,
+                "mergedMessages": merged_messages,
+                "queued": queued,
+                "totalRead": total_read,
+                "activeQueueLeft": active_left,
+            }, 0
+    except DailySyncError:
+        raise
+    except Exception as exc:
+        if type(exc).__module__ == adapter_module.__name__:
+            raise _translate_adapter_error(exc) from exc
+        raise
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1295,6 +1775,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--today", required=True)
     parser.add_argument("--timezone", required=True)
     parser.add_argument("--openclaw-config", required=True)
+    parser.add_argument("--workspace", required=True)
+    parser.add_argument("--backup-config", required=True)
     parser.add_argument("--token-env", default="DISCORD_BOT_TOKEN")
     parser.add_argument("--max-entries", type=int, default=6)
     parser.add_argument("--max-write-entries", type=int, default=4)
@@ -1310,7 +1792,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result, code = execute(parse_args(argv))
     except DailySyncError as exc:
-        result, code = {"ok": False, "status": "error", "reason": exc.category}, 2
+        status = "skipped" if exc.category == "backup_lock_busy" else "error"
+        result, code = {"ok": False, "status": status, "reason": exc.category}, 2
     except Exception:
         result, code = {"ok": False, "status": "error", "reason": "unexpected_error"}, 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

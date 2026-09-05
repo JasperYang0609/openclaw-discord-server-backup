@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import hashlib
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,14 @@ IS_REPOSITORY_LAYOUT = (
 )
 ROOT = REPO_ROOT_CANDIDATE if IS_REPOSITORY_LAYOUT else SKILL_DIR
 LAYOUT = "repository" if IS_REPOSITORY_LAYOUT else "installed"
+RUNTIME_MANIFEST_SCHEMA = "openclaw-discord-runtime-components.v1"
+RUNTIME_ADAPTER_CONTRACT = "openclaw-discord-rich-core-adapter.v3"
+RUNTIME_COMPONENTS = {
+    "rich_message_archive.py": "scripts/rich_message_archive.py",
+    "rich_core_adapter_v3.py": "scripts/rich_core_adapter_v3.py",
+    "run_daily_sync_v3.py": "scripts/run_daily_sync_v3.py",
+    "run_managed_component.py": "scripts/run_managed_component.py",
+}
 
 
 def check(name: str, ok: bool, detail: str = "", results: list[tuple[str, bool, str]] | None = None) -> None:
@@ -75,6 +85,53 @@ def json_loads(path: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def runtime_components_smoke() -> tuple[bool, str]:
+    manifest_path = SKILL_DIR / "manifests/runtime-components.v1.json"
+    try:
+        manifest_info = manifest_path.lstat()
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return False, f"runtime manifest unreadable: {type(exc).__name__}"
+    if (
+        manifest_path.is_symlink()
+        or not stat.S_ISREG(manifest_info.st_mode)
+        or manifest_info.st_uid != os.geteuid()
+        or manifest_info.st_nlink != 1
+        or stat.S_IMODE(manifest_info.st_mode) != 0o600
+        or not isinstance(payload, dict)
+        or set(payload) != {"schemaVersion", "adapterContract", "components"}
+        or payload.get("schemaVersion") != RUNTIME_MANIFEST_SCHEMA
+        or payload.get("adapterContract") != RUNTIME_ADAPTER_CONTRACT
+        or not isinstance(payload.get("components"), dict)
+        or set(payload["components"]) != set(RUNTIME_COMPONENTS)
+    ):
+        return False, "runtime manifest identity or schema mismatch"
+    for name, relative in RUNTIME_COMPONENTS.items():
+        row = payload["components"].get(name)
+        path = SKILL_DIR / relative
+        try:
+            info = path.lstat()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            return False, f"runtime component unreadable: {name}:{type(exc).__name__}"
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"relativePath", "sha256", "mode", "owner", "links"}
+            or row.get("relativePath") != relative
+            or row.get("mode") != "0600"
+            or row.get("owner") != "effective-user"
+            or row.get("links") != 1
+            or path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or row.get("sha256") != digest
+        ):
+            return False, f"runtime component identity mismatch: {name}"
+    return True, f"components={len(RUNTIME_COMPONENTS)}"
 
 
 def queue_selector_smoke() -> tuple[bool, str]:
@@ -342,7 +399,10 @@ def main() -> int:
         "scripts/backup_health_report.py",
         "scripts/daily_sync_lock_canary.py",
         "scripts/daily_sync_overlap_canary.py",
+        "scripts/rich_message_archive.py",
+        "scripts/rich_core_adapter_v3.py",
         "scripts/run_daily_sync_v3.py",
+        "manifests/runtime-components.v1.json",
         "manifests/owned-cron.v1.json",
         "prompts/core-backup.md",
         "prompts/daily-sync-v3.md",
@@ -365,6 +425,9 @@ def main() -> int:
 
     ok, detail = cron_manifest_smoke()
     check("owned cron manifest validation", ok, detail, results)
+
+    ok, detail = runtime_components_smoke()
+    check("runtime component manifest", ok, detail, results)
 
     ok, detail = daily_sync_gate_smoke()
     check("daily sync preflight gate", ok, detail, results)

@@ -42,6 +42,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 GUILD_RE = re.compile(r"^[0-9]{6,32}$")
 REPORT_RE = re.compile(r"^(?:discord:)?(?:channel|user):[0-9]{6,32}$")
+PRIVATE_RUNTIME_FILES = (
+    "manifests/runtime-components.v1.json",
+    "scripts/rich_message_archive.py",
+    "scripts/rich_core_adapter_v3.py",
+    "scripts/run_daily_sync_v3.py",
+    "scripts/run_managed_component.py",
+)
 
 
 class InstallError(RuntimeError):
@@ -78,6 +85,19 @@ def reject_symlink_components(path: Path, label: str) -> None:
         current /= part
         if os.path.lexists(current) and current.is_symlink():
             raise InstallError(f"{label} contains a symlinked path component")
+
+
+def harden_private_runtime_files(skill_root: Path) -> None:
+    for relative in PRIVATE_RUNTIME_FILES:
+        path = skill_root / relative
+        reject_symlink_components(path, "private runtime component")
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise InstallError("private runtime component is missing") from exc
+        if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise InstallError("private runtime component identity is unsafe")
+        os.chmod(path, 0o600)
 
 
 def secure_parent(path: Path) -> None:
@@ -279,11 +299,13 @@ def choose_value(existing: dict[str, Any] | None, key: str, cli: str | None, pla
 
 def stage_and_swap_skill(source: Path, target: Path) -> SkillSwap:
     if source.resolve() == target.resolve():
+        harden_private_runtime_files(source)
         check = subprocess.run([sys.executable, str(source / "scripts/post_run_check.py")], text=True, capture_output=True, check=False)
         if check.returncode != 0:
             raise InstallError("current installed Skill failed its self-check")
         return SkillSwap(target, None, False)
     if target.exists() and target.is_dir() and not target.is_symlink() and skill_tree_hash(source) == skill_tree_hash(target):
+        harden_private_runtime_files(target)
         check = subprocess.run([sys.executable, str(target / "scripts/post_run_check.py")], text=True, capture_output=True, check=False)
         if check.returncode != 0:
             raise InstallError("installed Skill failed its self-check")
@@ -302,6 +324,7 @@ def stage_and_swap_skill(source: Path, target: Path) -> SkillSwap:
     if any(item.is_symlink() for item in staged.rglob("*")):
         shutil.rmtree(staged)
         raise InstallError("Skill package contains a symlink")
+    harden_private_runtime_files(staged)
     check = subprocess.run([sys.executable, str(staged / "scripts/post_run_check.py")], text=True, capture_output=True, check=False)
     if check.returncode != 0:
         shutil.rmtree(staged)

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "openclaw-discord-runtime-components.v1",
+  "adapterContract": "openclaw-discord-rich-core-adapter.v3",
+  "components": {
+    "rich_message_archive.py": {
+      "relativePath": "scripts/rich_message_archive.py",
+      "sha256": "541e3764a1c59eab63183a6f76b7f52bad9c54d93fb70aaf99805ab709aa442b",
+      "mode": "0600",
+      "owner": "effective-user",
+      "links": 1
+    },
+    "rich_core_adapter_v3.py": {
+      "relativePath": "scripts/rich_core_adapter_v3.py",
+      "sha256": "f8c06e885dd2c7377b72ec5479202f206e84ac5fe0bad1c1f41edd572c19a858",
+      "mode": "0600",
+      "owner": "effective-user",
+      "links": 1
+    },
+    "run_daily_sync_v3.py": {
+      "relativePath": "scripts/run_daily_sync_v3.py",
+      "sha256": "d3d1c4e44e20056a180bb5875b25b5d8345be029645b3f124dd3083902d85eb7",
+      "mode": "0600",
+      "owner": "effective-user",
+      "links": 1
+    },
+    "run_managed_component.py": {
+      "relativePath": "scripts/run_managed_component.py",
+      "sha256": "3d9c86ae825970ecde45d61200b53b2b691cdb8fb9d57acde12d82713639d333",
+      "mode": "0600",
+      "owner": "effective-user",
+      "links": 1
+    }
+  }
+}
