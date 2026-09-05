@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -23,10 +22,11 @@ import secrets
 import stat
 import sys
 import tempfile
+import types
 import unicodedata
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
@@ -37,6 +37,12 @@ JOURNAL_SCHEMA = "openclaw-discord-full-rich-rebuild-journal.v2"
 JOURNAL_ENVELOPE_SCHEMA = "openclaw-discord-full-rich-rebuild-journal-envelope.v1"
 EVENT_RECEIPT_SCHEMA = "openclaw-discord-full-rich-rebuild-event.v1"
 FINAL_RECEIPT_SCHEMA = "openclaw-discord-full-rich-rebuild-run.v1"
+APPROVED_BASELINE_SCHEMA = "openclaw-discord-full-rich-approved-baseline.v2"
+RUNTIME_MANIFEST_SCHEMA = "openclaw-discord-full-rich-runtime-components.v1"
+COMMITTED_READBACK_AUDIT_SCHEMA = (
+    "openclaw-discord-rich-committed-readback-audit.v2"
+)
+PRODUCTION_ENTRY_COUNT = 178
 
 RICH_CORE_ADAPTER_VERSION = "openclaw-discord-rich-core-adapter.v3"
 RICH_SLOT_PROTOCOL = "openclaw-discord-rich-locked-slot.v3"
@@ -53,6 +59,15 @@ RUN_READY_AUDIT_SCHEMA = "openclaw-discord-rich-run-ready-audit.v2"
 ROOT_CURRENT_AUDIT_SCHEMA = "openclaw-discord-rich-root-current-audit.v2"
 ROOT_GRANT_AUDIT_SCHEMA = "openclaw-discord-rich-root-grant-audit.v2"
 COMPATIBILITY_AUDIT_SCHEMA = "openclaw-discord-rich-compatibility-audit.v2"
+
+RUNTIME_COMPONENT_PATHS = {
+    "adapter": "scripts/rich_core_adapter_v3.py",
+    "richCore": "scripts/rich_message_archive.py",
+    "coordinator": "scripts/run_full_rich_rebuild_v2.py",
+    "canonicalConfig": "manifests/full-rich-rebuild-config.v1.json",
+    "expectedEntries": "manifests/full-rich-rebuild-entries.v1.json",
+}
+_PRODUCTION_AUTHORITY = object()
 
 REQUIRED_INVENTORY_CLASSES = (
     "guild_channels",
@@ -116,6 +131,7 @@ ERROR_REASONS = frozenset({
     "rich_root_readback_failed",
     "rich_root_rollback_failed",
     "rich_compatibility_publish_failed",
+    "committed_readback_failed",
     "journal_corrupt",
     "journal_binding_mismatch",
     "receipt_chain_corrupt",
@@ -155,6 +171,7 @@ class RichCoreContractDescriptor:
 RICH_CORE_OPERATIONS = (
     "open_slot",
     "begin_full_rebuild",
+    "assert_canonical_lock_held",
     "verify_immutable_baseline",
     "collect_fresh_inventory",
     "prove_permissions",
@@ -169,6 +186,7 @@ RICH_CORE_OPERATIONS = (
     "finalize_full_rebuild",
     "publish_root_run_current",
     "inspect_root_run_current",
+    "inspect_committed_full_rebuild",
     "publish_compatibility_currents",
     "describe_capability",
 )
@@ -238,6 +256,10 @@ class RootCommitGrantV2(CoreCapability):
     pass
 
 
+class CommittedRunInspectionCapabilityV2(CoreCapability):
+    pass
+
+
 @dataclass(frozen=True)
 class EntryBindingV2:
     channel_id: str
@@ -256,6 +278,52 @@ class EntryBindingV2:
             "parentChannelId": self.parent_channel_id,
             "inventoryClass": self.inventory_class,
         }
+
+
+@dataclass(frozen=True)
+class RuntimeComponentBindingV1:
+    name: str
+    path: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ApprovedRebuildBaselineV2:
+    """Immutable configuration authority selected before a run is created.
+
+    ``TEST_ONLY`` values support dependency injection without weakening the
+    production loader.  Only the integrity-bound loader can attach the private
+    production marker; production execution rejects every other source.
+    """
+
+    schema_version: str
+    authority_mode: str
+    archive_root: Path
+    state_path: Path
+    queue_path: Path
+    baseline_dir: Path
+    baseline_sha256: str
+    expected_state_sha256: str
+    expected_queue_sha256: str
+    expected_entry_count: int
+    expected_entry_set_sha256: str
+    expected_entries: tuple[EntryBindingV2, ...]
+    guild_id: str
+    timezone_name: str
+    adapter_code_sha256: str
+    rich_core_code_sha256: str
+    coordinator_code_sha256: str
+    configuration_sha256: str
+    expected_entries_artifact_sha256: str
+    runtime_manifest_path: Path | None
+    runtime_manifest_sha256: str
+    component_bindings: tuple[RuntimeComponentBindingV1, ...]
+    limits: "FullRebuildLimitsV2"
+    _authority: object | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def production_authorized(self) -> bool:
+        return self._authority is _PRODUCTION_AUTHORITY
 
 
 @dataclass(frozen=True)
@@ -283,21 +351,16 @@ class FullRebuildLimitsV2:
 @dataclass(frozen=True)
 class FullRebuildConfigV2:
     run_id: str
-    archive_root: Path
-    state_path: Path
-    queue_path: Path
-    baseline_dir: Path
-    baseline_sha256: str
-    expected_state_sha256: str
-    expected_queue_sha256: str
-    expected_entry_count: int
-    expected_entry_set_sha256: str
-    expected_entries: tuple[EntryBindingV2, ...]
-    guild_id: str
-    timezone_name: str
-    adapter_code_sha256: str
-    configuration_sha256: str
-    limits: FullRebuildLimitsV2 = FullRebuildLimitsV2()
+    approved_baseline: ApprovedRebuildBaselineV2
+
+    def __getattr__(self, name: str) -> Any:
+        # Keep request-building call sites narrow while ensuring every value is
+        # sourced from one immutable approved baseline, never duplicated CLI
+        # fields that can drift independently.
+        baseline = object.__getattribute__(self, "approved_baseline")
+        if hasattr(baseline, name):
+            return getattr(baseline, name)
+        raise AttributeError(name)
 
 
 @dataclass(frozen=True)
@@ -314,7 +377,11 @@ class FullRebuildBeginRequestV3:
     state_sha256: str
     queue_sha256: str
     adapter_code_sha256: str
+    rich_core_code_sha256: str
+    coordinator_code_sha256: str
     configuration_sha256: str
+    expected_entries_artifact_sha256: str
+    runtime_manifest_sha256: str
     limits: tuple[tuple[str, int], ...]
 
 
@@ -422,10 +489,25 @@ class CompatibilityPublishRequestV2:
     expected_entry_set_sha256: str
 
 
+@dataclass(frozen=True)
+class CommittedRunInspectionRequestV2:
+    run_id: str
+    expected_entry_count: int
+    expected_entry_set_sha256: str
+    run_manifest_sha256: str
+    full_run_binding_sha256: str
+    prior_pointer_sha256: str | None
+    new_pointer_sha256: str
+    final_receipt_sha256: str
+
+
 class FullRebuildSessionV2:
     """Nominal full-run port.  Base methods always fail closed."""
 
     contract = SUPPORTED_RICH_CORE_CONTRACT
+
+    def assert_canonical_lock_held(self) -> None:
+        raise AdapterOperationError("rich_core_contract_pending")
 
     def verify_immutable_baseline(
         self, request: BaselineVerificationRequestV2
@@ -548,6 +630,12 @@ class FullRebuildSessionV2:
         published: RootCurrentCapabilityV2,
     ) -> RootCommitGrantV2:
         del request, ready, published
+        raise AdapterOperationError("rich_core_contract_pending")
+
+    def inspect_committed_full_rebuild(
+        self, request: CommittedRunInspectionRequestV2
+    ) -> CommittedRunInspectionCapabilityV2:
+        del request
         raise AdapterOperationError("rich_core_contract_pending")
 
     def publish_compatibility_currents(
@@ -843,14 +931,62 @@ def _validate_limits(limits: FullRebuildLimitsV2) -> None:
         raise FullRebuildError("rich_asset_budget_exhausted")
 
 
-def validate_config(config: FullRebuildConfigV2) -> FullRebuildConfigV2:
-    if not isinstance(config.run_id, str) or not RUN_ID_RE.fullmatch(config.run_id):
-        raise FullRebuildError("invalid_run_id")
-    _reject_controls(config.run_id)
-    archive_root = _require_safe_directory(config.archive_root)
-    state_path = _require_safe_file(config.state_path)
-    queue_path = _require_safe_file(config.queue_path)
-    baseline_dir = _require_safe_directory(config.baseline_dir)
+def _require_integrity_file(path: Path) -> Path:
+    safe = _require_safe_file(path)
+    info = safe.lstat()
+    if info.st_mode & 0o022 or info.st_nlink != 1:
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    return safe
+
+
+def _require_integrity_component_path(*, skill_root: Path, path: Path) -> Path:
+    root = _require_safe_directory(skill_root)
+    root_info = root.lstat()
+    if root_info.st_mode & 0o022:
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    candidate = _lexical_absolute(path)
+    if not _contains(root, candidate) or candidate == root:
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    current = root
+    parts = candidate.relative_to(root).parts
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError as exc:
+            raise FullRebuildError("rich_core_integrity_mismatch") from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+            or index < len(parts) - 1
+            and not stat.S_ISDIR(info.st_mode)
+        ):
+            raise FullRebuildError("rich_core_integrity_mismatch")
+    return _require_integrity_file(candidate)
+
+
+def _validate_approved_baseline(
+    baseline: ApprovedRebuildBaselineV2,
+) -> ApprovedRebuildBaselineV2:
+    if (
+        not isinstance(baseline, ApprovedRebuildBaselineV2)
+        or baseline.schema_version != APPROVED_BASELINE_SCHEMA
+        or baseline.authority_mode not in {"TEST_ONLY", "INTEGRITY_BOUND_V1"}
+    ):
+        raise FullRebuildError("rich_core_contract_unsupported")
+    production = baseline.production_authorized
+    if production != (baseline.authority_mode == "INTEGRITY_BOUND_V1"):
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    if production and baseline.expected_entry_count != PRODUCTION_ENTRY_COUNT:
+        raise FullRebuildError("expected_entry_count_mismatch")
+    if not production and baseline.component_bindings:
+        raise FullRebuildError("rich_core_integrity_mismatch")
+
+    archive_root = _require_safe_directory(baseline.archive_root)
+    state_path = _require_safe_file(baseline.state_path)
+    queue_path = _require_safe_file(baseline.queue_path)
+    baseline_dir = _require_safe_directory(baseline.baseline_dir)
     if state_path == queue_path:
         raise FullRebuildError("unsafe_input_path")
     if (
@@ -863,36 +999,182 @@ def validate_config(config: FullRebuildConfigV2) -> FullRebuildConfigV2:
     ):
         raise FullRebuildError("unsafe_input_path")
     for value in (
-        config.baseline_sha256,
-        config.expected_state_sha256,
-        config.expected_queue_sha256,
-        config.expected_entry_set_sha256,
-        config.adapter_code_sha256,
-        config.configuration_sha256,
+        baseline.baseline_sha256,
+        baseline.expected_state_sha256,
+        baseline.expected_queue_sha256,
+        baseline.expected_entry_set_sha256,
+        baseline.adapter_code_sha256,
+        baseline.rich_core_code_sha256,
+        baseline.coordinator_code_sha256,
+        baseline.configuration_sha256,
+        baseline.expected_entries_artifact_sha256,
+        baseline.runtime_manifest_sha256,
     ):
         _require_hash(value, "invalid_expected_entries")
-    if not isinstance(config.guild_id, str) or not SNOWFLAKE_RE.fullmatch(config.guild_id):
+    if (
+        not isinstance(baseline.guild_id, str)
+        or not SNOWFLAKE_RE.fullmatch(baseline.guild_id)
+        or not isinstance(baseline.timezone_name, str)
+        or not baseline.timezone_name.strip()
+    ):
         raise FullRebuildError("invalid_expected_entries")
-    if not isinstance(config.timezone_name, str) or not config.timezone_name.strip():
-        raise FullRebuildError("invalid_expected_entries")
-    _reject_controls(config.timezone_name)
+    _reject_controls(baseline.timezone_name)
     entries = validate_expected_entries(
-        [entry.audit_record() for entry in config.expected_entries],
-        expected_count=config.expected_entry_count,
+        [entry.audit_record() for entry in baseline.expected_entries],
+        expected_count=baseline.expected_entry_count,
     )
-    if entry_set_sha256(entries) != config.expected_entry_set_sha256:
+    if entry_set_sha256(entries) != baseline.expected_entry_set_sha256:
         raise FullRebuildError("expected_entry_set_digest_mismatch")
-    _validate_limits(config.limits)
-    return FullRebuildConfigV2(
+    _validate_limits(baseline.limits)
+
+    bindings: tuple[RuntimeComponentBindingV1, ...] = ()
+    manifest_path: Path | None = None
+    if production:
+        if baseline.runtime_manifest_path is None:
+            raise FullRebuildError("rich_core_integrity_mismatch")
+        manifest_path = _require_integrity_file(baseline.runtime_manifest_path)
+        if file_sha256(manifest_path) != baseline.runtime_manifest_sha256:
+            raise FullRebuildError("rich_core_integrity_mismatch")
+        if {binding.name for binding in baseline.component_bindings} != set(
+            RUNTIME_COMPONENT_PATHS
+        ):
+            raise FullRebuildError("rich_core_integrity_mismatch")
+        checked: list[RuntimeComponentBindingV1] = []
+        for binding in baseline.component_bindings:
+            if not isinstance(binding, RuntimeComponentBindingV1):
+                raise FullRebuildError("rich_core_integrity_mismatch")
+            expected_suffix = PurePosixPath(RUNTIME_COMPONENT_PATHS[binding.name])
+            safe_path = _require_integrity_file(binding.path)
+            if tuple(safe_path.parts[-len(expected_suffix.parts):]) != expected_suffix.parts:
+                raise FullRebuildError("rich_core_integrity_mismatch")
+            _require_hash(binding.sha256, "rich_core_integrity_mismatch")
+            if file_sha256(safe_path) != binding.sha256:
+                raise FullRebuildError("rich_core_integrity_mismatch")
+            checked.append(RuntimeComponentBindingV1(binding.name, safe_path, binding.sha256))
+        bindings = tuple(sorted(checked, key=lambda item: item.name))
+
+    return ApprovedRebuildBaselineV2(
         **{
-            **config.__dict__,
+            **baseline.__dict__,
             "archive_root": archive_root,
             "state_path": state_path,
             "queue_path": queue_path,
             "baseline_dir": baseline_dir,
             "expected_entries": entries,
+            "runtime_manifest_path": manifest_path,
+            "component_bindings": bindings,
         }
     )
+
+
+def validate_config(config: FullRebuildConfigV2) -> FullRebuildConfigV2:
+    if not isinstance(config.run_id, str) or not RUN_ID_RE.fullmatch(config.run_id):
+        raise FullRebuildError("invalid_run_id")
+    _reject_controls(config.run_id)
+    return FullRebuildConfigV2(
+        run_id=config.run_id,
+        approved_baseline=_validate_approved_baseline(config.approved_baseline),
+    )
+
+
+def _assert_canonical_lock(session: FullRebuildSessionV2) -> None:
+    result = _call_adapter(session.assert_canonical_lock_held)
+    if result is not None:
+        raise FullRebuildError("rich_core_authority_invalid")
+
+
+def _canonical_config_audit(baseline: ApprovedRebuildBaselineV2) -> dict[str, Any]:
+    return {
+        "schemaVersion": "openclaw-discord-full-rich-rebuild-config.v1",
+        "archiveRoot": str(baseline.archive_root),
+        "statePath": str(baseline.state_path),
+        "queuePath": str(baseline.queue_path),
+        "baselineDir": str(baseline.baseline_dir),
+        "baselineSha256": baseline.baseline_sha256,
+        "stateSha256": baseline.expected_state_sha256,
+        "queueSha256": baseline.expected_queue_sha256,
+        "expectedEntryCount": baseline.expected_entry_count,
+        "expectedEntrySetSha256": baseline.expected_entry_set_sha256,
+        "expectedEntriesArtifactSha256": baseline.expected_entries_artifact_sha256,
+        "guildId": baseline.guild_id,
+        "timezone": baseline.timezone_name,
+        "limits": dict(baseline.limits.as_tuple()),
+    }
+
+
+def _expected_entries_artifact_audit(
+    baseline: ApprovedRebuildBaselineV2,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": "openclaw-discord-full-rich-rebuild-entries.v1",
+        "entryCount": baseline.expected_entry_count,
+        "entrySetSha256": baseline.expected_entry_set_sha256,
+        "entries": [entry.audit_record() for entry in baseline.expected_entries],
+    }
+
+
+def _verify_runtime_authority_under_lock(
+    config: FullRebuildConfigV2,
+    *,
+    session: FullRebuildSessionV2,
+) -> None:
+    """Recheck the production trust bundle only after lock acquisition."""
+
+    _assert_canonical_lock(session)
+    baseline = config.approved_baseline
+    if not baseline.production_authorized:
+        return
+    if baseline.expected_entry_count != PRODUCTION_ENTRY_COUNT:
+        raise FullRebuildError("expected_entry_count_mismatch")
+    bindings = {binding.name: binding for binding in baseline.component_bindings}
+    if set(bindings) != set(RUNTIME_COMPONENT_PATHS):
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    assert baseline.runtime_manifest_path is not None
+    skill_root = bindings["coordinator"].path.parent.parent
+    manifest_file = _require_integrity_component_path(
+        skill_root=skill_root,
+        path=baseline.runtime_manifest_path,
+    )
+    if file_sha256(manifest_file) != baseline.runtime_manifest_sha256:
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    expected_hashes = {
+        "adapter": baseline.adapter_code_sha256,
+        "richCore": baseline.rich_core_code_sha256,
+        "coordinator": baseline.coordinator_code_sha256,
+        "canonicalConfig": baseline.configuration_sha256,
+        "expectedEntries": baseline.expected_entries_artifact_sha256,
+    }
+    for name, expected_hash in expected_hashes.items():
+        binding = bindings[name]
+        safe = _require_integrity_component_path(
+            skill_root=skill_root,
+            path=binding.path,
+        )
+        actual_hash = file_sha256(safe)
+        if binding.sha256 != expected_hash or actual_hash != expected_hash:
+            raise FullRebuildError("rich_core_integrity_mismatch")
+    coordinator = bindings["coordinator"].path
+    current = _require_integrity_component_path(
+        skill_root=skill_root,
+        path=Path(__file__),
+    )
+    coordinator_info = coordinator.stat()
+    current_info = current.stat()
+    if (coordinator_info.st_dev, coordinator_info.st_ino) != (
+        current_info.st_dev,
+        current_info.st_ino,
+    ):
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    canonical_config = _load_json(
+        bindings["canonicalConfig"].path, "rich_core_integrity_mismatch"
+    )
+    expected_entries = _load_json(
+        bindings["expectedEntries"].path, "rich_core_integrity_mismatch"
+    )
+    if canonical_config != _canonical_config_audit(baseline):
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    if expected_entries != _expected_entries_artifact_audit(baseline):
+        raise FullRebuildError("rich_core_integrity_mismatch")
 
 
 def _exact_contract(value: Any) -> bool:
@@ -933,6 +1215,7 @@ CAPABILITY_TYPES: dict[str, type[CoreCapability]] = {
     "ready": FullRunReadyCapabilityV2,
     "root_current": RootCurrentCapabilityV2,
     "root_grant": RootCommitGrantV2,
+    "committed_inspection": CommittedRunInspectionCapabilityV2,
 }
 
 
@@ -1143,6 +1426,17 @@ class DurableJournal:
                 raise FullRebuildError("receipt_chain_corrupt")
             return
         _exclusive_private_json(self.final_receipt_path, value)
+
+    def load_final_receipt(self) -> tuple[dict[str, Any], str]:
+        safe = _require_safe_file(self.final_receipt_path)
+        raw = _safe_read_bytes(safe)
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FullRebuildError("committed_readback_failed") from exc
+        if not isinstance(value, dict):
+            raise FullRebuildError("committed_readback_failed")
+        return value, bytes_sha256(raw)
 
     def _validate_receipt_chain(self, journal: Mapping[str, Any]) -> None:
         chain = journal.get("receiptChain")
@@ -1654,6 +1948,38 @@ def _validate_compatibility_audit(
     return deepcopy(dict(value))
 
 
+def _validate_committed_inspection_audit(
+    value: Mapping[str, Any],
+    *,
+    config: FullRebuildConfigV2,
+    root: Mapping[str, Any],
+    final_receipt_sha256: str,
+) -> dict[str, Any]:
+    required = {
+        "schemaVersion", "runId", "readOnly", "runManifestSha256",
+        "fullRunBindingSha256", "priorPointerSha256", "newPointerSha256",
+        "selectedEntryCount", "entrySetSha256", "readerIndexerCanary",
+        "finalReceiptSha256", "stateQueueInvariant",
+    }
+    _exact_keys(value, required)
+    if (
+        value.get("schemaVersion") != COMMITTED_READBACK_AUDIT_SCHEMA
+        or value.get("runId") != config.run_id
+        or value.get("readOnly") is not True
+        or value.get("runManifestSha256") != root.get("runManifestSha256")
+        or value.get("fullRunBindingSha256") != root.get("fullRunBindingSha256")
+        or value.get("priorPointerSha256") != root.get("priorPointerSha256")
+        or value.get("newPointerSha256") != root.get("newPointerSha256")
+        or value.get("selectedEntryCount") != config.expected_entry_count
+        or value.get("entrySetSha256") != config.expected_entry_set_sha256
+        or value.get("readerIndexerCanary") is not True
+        or value.get("finalReceiptSha256") != final_receipt_sha256
+        or value.get("stateQueueInvariant") is not True
+    ):
+        raise FullRebuildError("committed_readback_failed")
+    return deepcopy(dict(value))
+
+
 def _call_adapter(operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     try:
         return operation(*args, **kwargs)
@@ -1686,7 +2012,11 @@ def _binding_for_journal(config: FullRebuildConfigV2) -> dict[str, Any]:
         "stateSha256": config.expected_state_sha256,
         "queueSha256": config.expected_queue_sha256,
         "adapterCodeSha256": config.adapter_code_sha256,
+        "richCoreCodeSha256": config.rich_core_code_sha256,
+        "coordinatorCodeSha256": config.coordinator_code_sha256,
         "configurationSha256": config.configuration_sha256,
+        "expectedEntriesArtifactSha256": config.expected_entries_artifact_sha256,
+        "runtimeManifestSha256": config.runtime_manifest_sha256,
         "limits": dict(config.limits.as_tuple()),
     }
 
@@ -1791,7 +2121,6 @@ class FullRichRebuildCoordinatorV2:
         return state, queue
 
     def _load_or_create_journal(self) -> dict[str, Any]:
-        self.ledger.ensure_layout()
         if self.ledger.exists():
             journal = self.ledger.load()
             _validate_journal_binding(journal, self.config)
@@ -1811,18 +2140,28 @@ class FullRichRebuildCoordinatorV2:
                     ),
                 )
             return journal
+        self.ledger.ensure_layout()
         return self.ledger.create(_binding_for_journal(self.config))
 
     def _record_failure(
-        self, journal: Mapping[str, Any] | None, reason: str, *, paused: bool = False
+        self,
+        session: FullRebuildSessionV2,
+        journal: Mapping[str, Any] | None,
+        reason: str,
+        *,
+        paused: bool = False,
     ) -> None:
         if journal is None or not self.ledger.exists():
             return
         try:
+            _assert_canonical_lock(session)
             current_phase = journal.get("phase")
             if current_phase in TERMINAL_PHASES:
                 current_phase = journal.get("resumePhase")
             if current_phase not in PHASES:
+                return
+            if current_phase == "COMMITTED":
+                # A committed rerun is a strictly read-only verification path.
                 return
             self.ledger.record(
                 journal,
@@ -1962,6 +2301,98 @@ class FullRichRebuildCoordinatorV2:
                 raise FullRebuildError("journal_binding_mismatch")
             capabilities.append(capability)
         return capabilities
+
+    def _final_payload(
+        self,
+        *,
+        journal: Mapping[str, Any],
+        root_summary: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        round_hashes = [record["roundAuditSha256"] for record in journal["rounds"]]
+        return {
+            "runId": self.config.run_id,
+            "phase": "COMMITTED",
+            "entryCount": self.config.expected_entry_count,
+            "entrySetSha256": self.config.expected_entry_set_sha256,
+            "stateBeforeSha256": self.config.expected_state_sha256,
+            "stateAfterSha256": self.config.expected_state_sha256,
+            "queueBeforeSha256": self.config.expected_queue_sha256,
+            "queueAfterSha256": self.config.expected_queue_sha256,
+            "roundAuditSha256s": round_hashes,
+            "zeroRoundStreak": 2,
+            **deepcopy(dict(root_summary)),
+        }
+
+    def _verify_committed(
+        self,
+        session: FullRebuildSessionV2,
+        *,
+        journal: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Read-only idempotent verification for an already committed run."""
+
+        _assert_canonical_lock(session)
+        root = journal.get("root")
+        required_root = {
+            "readyAuditSha256", "publishedAuditSha256", "grantAuditSha256",
+            "compatibilityAuditSha256", "runManifestSha256",
+            "fullRunBindingSha256", "priorPointerSha256", "newPointerSha256",
+        }
+        if (
+            not isinstance(root, dict)
+            or set(root) != required_root
+            or journal.get("zeroRoundStreak") != 2
+            or len(journal.get("rounds", [])) < 4
+        ):
+            raise FullRebuildError("committed_readback_failed")
+        for key in required_root - {"priorPointerSha256"}:
+            _require_hash(root.get(key), "committed_readback_failed")
+        prior = root.get("priorPointerSha256")
+        if prior is not None:
+            _require_hash(prior, "committed_readback_failed")
+        expected_payload = self._final_payload(journal=journal, root_summary=root)
+        expected_receipt = {
+            "schemaVersion": FINAL_RECEIPT_SCHEMA,
+            "status": "AUDIT_ONLY",
+            **expected_payload,
+        }
+        actual_receipt, final_receipt_sha256 = self.ledger.load_final_receipt()
+        if actual_receipt != expected_receipt:
+            raise FullRebuildError("committed_readback_failed")
+        request = CommittedRunInspectionRequestV2(
+            run_id=self.config.run_id,
+            expected_entry_count=self.config.expected_entry_count,
+            expected_entry_set_sha256=self.config.expected_entry_set_sha256,
+            run_manifest_sha256=root["runManifestSha256"],
+            full_run_binding_sha256=root["fullRunBindingSha256"],
+            prior_pointer_sha256=prior,
+            new_pointer_sha256=root["newPointerSha256"],
+            final_receipt_sha256=final_receipt_sha256,
+        )
+        value = _call_adapter(session.inspect_committed_full_rebuild, request)
+        inspection = self.tracker.accept(value, "committed_inspection")
+        assert isinstance(inspection, CommittedRunInspectionCapabilityV2)
+        _validate_committed_inspection_audit(
+            _describe(session, inspection),
+            config=self.config,
+            root=root,
+            final_receipt_sha256=final_receipt_sha256,
+        )
+        _assert_state_queue(
+            self.config,
+            state_sha256=self.config.expected_state_sha256,
+            queue_sha256=self.config.expected_queue_sha256,
+        )
+        return {
+            "ok": True,
+            "status": "committed",
+            "idempotentReadback": True,
+            "runId": self.config.run_id,
+            "entryCount": self.config.expected_entry_count,
+            "zeroRounds": 2,
+            "runManifestSha256": root["runManifestSha256"],
+            "fullRunBindingSha256": root["fullRunBindingSha256"],
+        }
 
     def _execute_round(
         self,
@@ -2221,8 +2652,11 @@ class FullRichRebuildCoordinatorV2:
         return journal, round_capability
 
     def _run_locked(self, session: FullRebuildSessionV2) -> dict[str, Any]:
+        _verify_runtime_authority_under_lock(self.config, session=session)
         self._state_queue_bytes()
         journal = self._load_or_create_journal()
+        if journal.get("phase") == "COMMITTED":
+            return self._verify_committed(session, journal=journal)
         baseline, baseline_audit = self._baseline(session)
         baseline_hash = json_sha256(baseline_audit)
         journal = self.ledger.record(
@@ -2296,7 +2730,6 @@ class FullRichRebuildCoordinatorV2:
                 1 for record in journal["rounds"] if record["roundKind"] == "zero"
             )
             if next_kind == "zero" and zero_attempts >= self.config.limits.max_convergence_rounds:
-                self._record_failure(journal, "rich_convergence_exhausted", paused=True)
                 raise FullRebuildError("rich_convergence_exhausted")
             prior = round_capabilities[-1] if round_capabilities else None
             journal, round_capability = self._execute_round(
@@ -2433,6 +2866,7 @@ class FullRichRebuildCoordinatorV2:
             "compatibilityAuditSha256": json_sha256(compatibility_audit),
             "runManifestSha256": grant_audit["runManifestSha256"],
             "fullRunBindingSha256": grant_audit["fullRunBindingSha256"],
+            "priorPointerSha256": published_audit["priorPointerSha256"],
             "newPointerSha256": grant_audit["newPointerSha256"],
         }
         journal = self.ledger.record(
@@ -2444,19 +2878,10 @@ class FullRichRebuildCoordinatorV2:
                 _set_phase(changed, "COMMITTED"),
             ),
         )
-        final_payload = {
-            "runId": self.config.run_id,
-            "phase": "COMMITTED",
-            "entryCount": self.config.expected_entry_count,
-            "entrySetSha256": self.config.expected_entry_set_sha256,
-            "stateBeforeSha256": self.config.expected_state_sha256,
-            "stateAfterSha256": self.config.expected_state_sha256,
-            "queueBeforeSha256": self.config.expected_queue_sha256,
-            "queueAfterSha256": self.config.expected_queue_sha256,
-            "roundAuditSha256s": list(round_hashes),
-            "zeroRoundStreak": 2,
-            **root_summary,
-        }
+        final_payload = self._final_payload(
+            journal=journal,
+            root_summary=root_summary,
+        )
         self.ledger.write_final_receipt(final_payload)
         return {
             "ok": True,
@@ -2469,109 +2894,258 @@ class FullRichRebuildCoordinatorV2:
         }
 
     def run(self) -> dict[str, Any]:
-        journal: dict[str, Any] | None = None
         lock_path = self.config.archive_root / ".channel_backup.lock"
-        manager: Any = None
-        try:
-            manager = _call_adapter(
-                self.adapter.open_slot,
+        manager = _call_adapter(
+            self.adapter.open_slot,
+            archive_root=self.config.archive_root,
+            lock_path=lock_path,
+        )
+        if not isinstance(manager, AbstractContextManager):
+            raise FullRebuildError("rich_core_contract_unsupported")
+        with manager as slot_value:
+            slot = require_slot(slot_value)
+            # Mutable state/queue are first opened only after the canonical
+            # archive-root lock slot has entered.
+            self._state_queue_bytes()
+            begin = FullRebuildBeginRequestV3(
+                schema_version=COORDINATOR_SCHEMA,
+                run_id=self.config.run_id,
                 archive_root=self.config.archive_root,
-                lock_path=lock_path,
+                expected_entry_count=self.config.expected_entry_count,
+                expected_entry_set_sha256=self.config.expected_entry_set_sha256,
+                expected_entries=self.config.expected_entries,
+                guild_id=self.config.guild_id,
+                timezone_name=self.config.timezone_name,
+                baseline_sha256=self.config.baseline_sha256,
+                state_sha256=self.config.expected_state_sha256,
+                queue_sha256=self.config.expected_queue_sha256,
+                adapter_code_sha256=self.config.adapter_code_sha256,
+                rich_core_code_sha256=self.config.rich_core_code_sha256,
+                coordinator_code_sha256=self.config.coordinator_code_sha256,
+                configuration_sha256=self.config.configuration_sha256,
+                expected_entries_artifact_sha256=(
+                    self.config.expected_entries_artifact_sha256
+                ),
+                runtime_manifest_sha256=self.config.runtime_manifest_sha256,
+                limits=self.config.limits.as_tuple(),
             )
-            if not isinstance(manager, AbstractContextManager):
+            session_manager = _call_adapter(slot.begin_full_rebuild, begin)
+            if not isinstance(session_manager, AbstractContextManager):
                 raise FullRebuildError("rich_core_contract_unsupported")
-            with manager as slot_value:
-                slot = require_slot(slot_value)
-                # Mutable state/queue are first opened only after the canonical
-                # archive-root lock slot has entered.
-                self._state_queue_bytes()
-                begin = FullRebuildBeginRequestV3(
-                    schema_version=COORDINATOR_SCHEMA,
-                    run_id=self.config.run_id,
-                    archive_root=self.config.archive_root,
-                    expected_entry_count=self.config.expected_entry_count,
-                    expected_entry_set_sha256=self.config.expected_entry_set_sha256,
-                    expected_entries=self.config.expected_entries,
-                    guild_id=self.config.guild_id,
-                    timezone_name=self.config.timezone_name,
-                    baseline_sha256=self.config.baseline_sha256,
-                    state_sha256=self.config.expected_state_sha256,
-                    queue_sha256=self.config.expected_queue_sha256,
-                    adapter_code_sha256=self.config.adapter_code_sha256,
-                    configuration_sha256=self.config.configuration_sha256,
-                    limits=self.config.limits.as_tuple(),
-                )
-                session_manager = _call_adapter(slot.begin_full_rebuild, begin)
-                if not isinstance(session_manager, AbstractContextManager):
-                    raise FullRebuildError("rich_core_contract_unsupported")
-                with session_manager as session_value:
-                    session = require_session(session_value)
-                    result = self._run_locked(session)
-                    return result
-        except FullRebuildError as exc:
-            if self.ledger.exists():
+            with session_manager as session_value:
+                session = require_session(session_value)
                 try:
-                    journal = self.ledger.load()
-                except FullRebuildError:
-                    journal = None
-            self._record_failure(
-                journal,
-                exc.reason,
-                paused=exc.reason == "rich_convergence_exhausted",
-            )
-            raise
-        except AdapterOperationError as exc:
-            error = FullRebuildError(exc.reason)
-            if self.ledger.exists():
-                try:
-                    journal = self.ledger.load()
-                except FullRebuildError:
-                    journal = None
-            self._record_failure(journal, error.reason)
-            raise error from exc
+                    return self._run_locked(session)
+                except FullRebuildError as exc:
+                    try:
+                        journal = self.ledger.load() if self.ledger.exists() else None
+                    except FullRebuildError:
+                        journal = None
+                    self._record_failure(
+                        session,
+                        journal,
+                        exc.reason,
+                        paused=exc.reason == "rich_convergence_exhausted",
+                    )
+                    raise
+                except AdapterOperationError as exc:
+                    error = FullRebuildError(exc.reason)
+                    try:
+                        journal = self.ledger.load() if self.ledger.exists() else None
+                    except FullRebuildError:
+                        journal = None
+                    self._record_failure(session, journal, error.reason)
+                    raise error from exc
+                except Exception as exc:
+                    error = FullRebuildError("unexpected_error")
+                    try:
+                        journal = self.ledger.load() if self.ledger.exists() else None
+                    except FullRebuildError:
+                        journal = None
+                    self._record_failure(session, journal, error.reason)
+                    raise error from exc
 
 
-def _load_production_adapter() -> ManagedRichCoreAdapterV3:
-    """Load one integrity-bound sibling adapter; never search or fall back."""
+@dataclass(frozen=True)
+class ProductionRuntimeBundleV1:
+    adapter: ManagedRichCoreAdapterV3
+    approved_baseline: ApprovedRebuildBaselineV2
 
-    here = Path(__file__).resolve().parent
-    adapter_path = here / "rich_core_adapter_v3.py"
-    manifest_path = here.parent / "manifests" / "runtime-components.v1.json"
-    if not adapter_path.exists() or not manifest_path.exists():
-        raise FullRebuildError("rich_core_contract_pending")
-    _require_safe_file(adapter_path)
-    _require_safe_file(manifest_path)
-    adapter_info = adapter_path.lstat()
-    if adapter_info.st_mode & 0o022 or adapter_info.st_nlink != 1:
+
+def _component_bindings_from_manifest(
+    *,
+    skill_root: Path,
+    components: Mapping[str, Any],
+) -> tuple[RuntimeComponentBindingV1, ...]:
+    if set(components) != set(RUNTIME_COMPONENT_PATHS):
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    bindings: list[RuntimeComponentBindingV1] = []
+    for name, expected_relative in RUNTIME_COMPONENT_PATHS.items():
+        record = components.get(name)
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "sha256"}
+            or record.get("path") != expected_relative
+            or not HASH_RE.fullmatch(str(record.get("sha256") or ""))
+        ):
+            raise FullRebuildError("rich_core_integrity_mismatch")
+        path = _lexical_absolute(skill_root / PurePosixPath(expected_relative))
+        if not _contains(skill_root, path):
+            raise FullRebuildError("rich_core_integrity_mismatch")
+        safe = _require_integrity_component_path(skill_root=skill_root, path=path)
+        if file_sha256(safe) != record["sha256"]:
+            raise FullRebuildError("rich_core_integrity_mismatch")
+        bindings.append(RuntimeComponentBindingV1(name, safe, record["sha256"]))
+    return tuple(sorted(bindings, key=lambda item: item.name))
+
+
+def _limits_from_canonical(value: Any) -> FullRebuildLimitsV2:
+    if not isinstance(value, dict) or set(value) != {
+        name for name, _default in FullRebuildLimitsV2().as_tuple()
+    }:
         raise FullRebuildError("rich_core_integrity_mismatch")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        limits = FullRebuildLimitsV2(
+            max_convergence_rounds=value["maxConvergenceRounds"],
+            max_runtime_seconds=value["maxRuntimeSeconds"],
+            max_requests=value["maxRequests"],
+            max_retries=value["maxRetries"],
+            max_asset_files=value["maxAssetFiles"],
+            max_asset_bytes=value["maxAssetBytes"],
+            minimum_free_space_bytes=value["minimumFreeSpaceBytes"],
+        )
+        _validate_limits(limits)
+        return limits
+    except (KeyError, TypeError, FullRebuildError) as exc:
         raise FullRebuildError("rich_core_integrity_mismatch") from exc
-    components = manifest.get("components") if isinstance(manifest, dict) else None
-    record = components.get("rich_core_adapter_v3.py") if isinstance(components, dict) else None
+
+
+def _approved_baseline_from_integrity_bundle(
+    *,
+    manifest_path: Path,
+    manifest_sha256: str,
+    bindings: tuple[RuntimeComponentBindingV1, ...],
+) -> ApprovedRebuildBaselineV2:
+    by_name = {binding.name: binding for binding in bindings}
+    config_value = _load_json(
+        by_name["canonicalConfig"].path, "rich_core_integrity_mismatch"
+    )
+    entries_value = _load_json(
+        by_name["expectedEntries"].path, "rich_core_integrity_mismatch"
+    )
+    config_keys = {
+        "schemaVersion", "archiveRoot", "statePath", "queuePath",
+        "baselineDir", "baselineSha256", "stateSha256", "queueSha256",
+        "expectedEntryCount", "expectedEntrySetSha256",
+        "expectedEntriesArtifactSha256", "guildId", "timezone", "limits",
+    }
+    entries_keys = {"schemaVersion", "entryCount", "entrySetSha256", "entries"}
     if (
-        manifest.get("schemaVersion") != "openclaw-discord-runtime-components.v1"
-        or not isinstance(record, dict)
-        or set(record) != {"sha256", "contractVersion", "exports"}
-        or record.get("contractVersion") != RICH_CORE_ADAPTER_VERSION
-        or record.get("exports") != ["ADAPTER_V3"]
-        or not HASH_RE.fullmatch(str(record.get("sha256") or ""))
-        or file_sha256(adapter_path) != record.get("sha256")
+        not isinstance(config_value, dict)
+        or set(config_value) != config_keys
+        or config_value.get("schemaVersion")
+        != "openclaw-discord-full-rich-rebuild-config.v1"
+        or config_value.get("expectedEntryCount") != PRODUCTION_ENTRY_COUNT
+        or config_value.get("expectedEntriesArtifactSha256")
+        != by_name["expectedEntries"].sha256
+        or not isinstance(entries_value, dict)
+        or set(entries_value) != entries_keys
+        or entries_value.get("schemaVersion")
+        != "openclaw-discord-full-rich-rebuild-entries.v1"
+        or entries_value.get("entryCount") != PRODUCTION_ENTRY_COUNT
+        or entries_value.get("entrySetSha256")
+        != config_value.get("expectedEntrySetSha256")
+        or not isinstance(entries_value.get("entries"), list)
     ):
         raise FullRebuildError("rich_core_integrity_mismatch")
-    module_name = "openclaw_managed_rich_core_adapter_v3"
-    spec = importlib.util.spec_from_file_location(module_name, adapter_path)
-    if spec is None or spec.loader is None:
+    entries = validate_expected_entries(
+        entries_value["entries"], expected_count=PRODUCTION_ENTRY_COUNT
+    )
+    if entry_set_sha256(entries) != config_value["expectedEntrySetSha256"]:
+        raise FullRebuildError("expected_entry_set_digest_mismatch")
+    baseline = ApprovedRebuildBaselineV2(
+        schema_version=APPROVED_BASELINE_SCHEMA,
+        authority_mode="INTEGRITY_BOUND_V1",
+        archive_root=_lexical_absolute(config_value["archiveRoot"]),
+        state_path=_lexical_absolute(config_value["statePath"]),
+        queue_path=_lexical_absolute(config_value["queuePath"]),
+        baseline_dir=_lexical_absolute(config_value["baselineDir"]),
+        baseline_sha256=config_value["baselineSha256"],
+        expected_state_sha256=config_value["stateSha256"],
+        expected_queue_sha256=config_value["queueSha256"],
+        expected_entry_count=PRODUCTION_ENTRY_COUNT,
+        expected_entry_set_sha256=config_value["expectedEntrySetSha256"],
+        expected_entries=entries,
+        guild_id=config_value["guildId"],
+        timezone_name=config_value["timezone"],
+        adapter_code_sha256=by_name["adapter"].sha256,
+        rich_core_code_sha256=by_name["richCore"].sha256,
+        coordinator_code_sha256=by_name["coordinator"].sha256,
+        configuration_sha256=by_name["canonicalConfig"].sha256,
+        expected_entries_artifact_sha256=by_name["expectedEntries"].sha256,
+        runtime_manifest_path=manifest_path,
+        runtime_manifest_sha256=manifest_sha256,
+        component_bindings=bindings,
+        limits=_limits_from_canonical(config_value["limits"]),
+        _authority=_PRODUCTION_AUTHORITY,
+    )
+    validated = _validate_approved_baseline(baseline)
+    if _canonical_config_audit(validated) != config_value:
         raise FullRebuildError("rich_core_integrity_mismatch")
-    module = importlib.util.module_from_spec(spec)
+    if _expected_entries_artifact_audit(validated) != entries_value:
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    return validated
+
+
+def _load_production_bundle() -> ProductionRuntimeBundleV1:
+    """Load one fixed, integrity-bound adapter/config/core bundle."""
+
+    here = _require_safe_directory(Path(__file__).parent)
+    skill_root = _require_safe_directory(here.parent)
+    manifest_path = skill_root / "manifests" / "runtime-components.v1.json"
+    if not manifest_path.exists():
+        raise FullRebuildError("rich_core_contract_pending")
+    manifest_path = _require_integrity_component_path(
+        skill_root=skill_root,
+        path=manifest_path,
+    )
+    manifest_sha256 = file_sha256(manifest_path)
+    manifest = _load_json(manifest_path, "rich_core_integrity_mismatch")
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schemaVersion", "adapterContract", "components"}
+        or manifest.get("schemaVersion") != RUNTIME_MANIFEST_SCHEMA
+        or manifest.get("adapterContract") != RICH_CORE_ADAPTER_VERSION
+        or not isinstance(manifest.get("components"), dict)
+    ):
+        raise FullRebuildError("rich_core_integrity_mismatch")
+    bindings = _component_bindings_from_manifest(
+        skill_root=skill_root,
+        components=manifest["components"],
+    )
+    baseline = _approved_baseline_from_integrity_bundle(
+        manifest_path=manifest_path,
+        manifest_sha256=manifest_sha256,
+        bindings=bindings,
+    )
+    adapter_path = {binding.name: binding for binding in bindings}["adapter"].path
+    module_name = "openclaw_managed_rich_core_adapter_v3"
+    module = types.ModuleType(module_name)
+    module.__file__ = str(adapter_path)
+    module.__package__ = ""
     sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
+        # Compile the exact bytes whose SHA-256 was checked above.  The normal
+        # import machinery may accept a timestamp-valid .pyc that is not part
+        # of the runtime manifest.
+        source = _safe_read_bytes(adapter_path)
+        code = compile(source, str(adapter_path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+    except Exception as exc:  # noqa: S102 - integrity-bound fixed component
         sys.modules.pop(module_name, None)
         raise FullRebuildError("rich_core_integrity_mismatch") from exc
-    return require_adapter(getattr(module, "ADAPTER_V3", None))
+    adapter = require_adapter(getattr(module, "ADAPTER_V3", None))
+    return ProductionRuntimeBundleV1(adapter=adapter, approved_baseline=baseline)
 
 
 def _load_json(path: Path, reason: str) -> Any:
@@ -2583,52 +3157,37 @@ def _load_json(path: Path, reason: str) -> Any:
         raise FullRebuildError(reason) from exc
 
 
-def config_from_args(args: argparse.Namespace) -> FullRebuildConfigV2:
-    entries_path = _require_safe_file(_lexical_absolute(args.expected_entries))
-    value = _load_json(entries_path, "invalid_expected_entries")
-    if isinstance(value, dict):
-        values = value.get("entries")
-    else:
-        values = value
-    if not isinstance(values, list):
-        raise FullRebuildError("invalid_expected_entries")
-    entries = validate_expected_entries(values, expected_count=args.expected_entry_count)
-    return validate_config(FullRebuildConfigV2(
-        run_id=args.run_id,
-        archive_root=_lexical_absolute(args.archive_root),
-        state_path=_lexical_absolute(args.state),
-        queue_path=_lexical_absolute(args.queue),
-        baseline_dir=_lexical_absolute(args.baseline_dir),
-        baseline_sha256=args.baseline_sha256,
-        expected_state_sha256=args.state_sha256,
-        expected_queue_sha256=args.queue_sha256,
-        expected_entry_count=args.expected_entry_count,
-        expected_entry_set_sha256=args.expected_entry_set_sha256,
-        expected_entries=entries,
-        guild_id=args.guild_id,
-        timezone_name=args.timezone,
-        adapter_code_sha256=args.adapter_code_sha256,
-        configuration_sha256=args.configuration_sha256,
-        limits=FullRebuildLimitsV2(
-            max_convergence_rounds=args.max_convergence_rounds,
-            max_runtime_seconds=args.max_runtime_seconds,
-            max_requests=args.max_requests,
-            max_retries=args.max_retries,
-            max_asset_files=args.max_asset_files,
-            max_asset_bytes=args.max_asset_bytes,
-            minimum_free_space_bytes=args.minimum_free_space_bytes,
-        ),
-    ))
+def config_from_args(
+    args: argparse.Namespace,
+    *,
+    approved_baseline: ApprovedRebuildBaselineV2,
+) -> FullRebuildConfigV2:
+    return validate_config(
+        FullRebuildConfigV2(
+            run_id=args.run_id,
+            approved_baseline=approved_baseline,
+        )
+    )
 
 
 def execute(
     args: argparse.Namespace,
     *,
     adapter: ManagedRichCoreAdapterV3 | None = None,
+    approved_baseline: ApprovedRebuildBaselineV2 | None = None,
     fault_injector: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    config = config_from_args(args)
-    selected_adapter = adapter if adapter is not None else _load_production_adapter()
+    if (adapter is None) != (approved_baseline is None):
+        raise FullRebuildError("rich_core_contract_unsupported")
+    if adapter is None:
+        bundle = _load_production_bundle()
+        selected_adapter = bundle.adapter
+        selected_baseline = bundle.approved_baseline
+    else:
+        selected_adapter = adapter
+        assert approved_baseline is not None
+        selected_baseline = approved_baseline
+    config = config_from_args(args, approved_baseline=selected_baseline)
     return FullRichRebuildCoordinatorV2(
         config,
         adapter=selected_adapter,
@@ -2641,27 +3200,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Coordinate one exact, resumable full rich Discord archive rebuild."
     )
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--archive-root", required=True)
-    parser.add_argument("--state", required=True)
-    parser.add_argument("--queue", required=True)
-    parser.add_argument("--baseline-dir", required=True)
-    parser.add_argument("--baseline-sha256", required=True)
-    parser.add_argument("--state-sha256", required=True)
-    parser.add_argument("--queue-sha256", required=True)
-    parser.add_argument("--expected-entries", required=True)
-    parser.add_argument("--expected-entry-count", type=int, required=True)
-    parser.add_argument("--expected-entry-set-sha256", required=True)
-    parser.add_argument("--guild-id", required=True)
-    parser.add_argument("--timezone", required=True)
-    parser.add_argument("--adapter-code-sha256", required=True)
-    parser.add_argument("--configuration-sha256", required=True)
-    parser.add_argument("--max-convergence-rounds", type=int, default=8)
-    parser.add_argument("--max-runtime-seconds", type=int, default=86_400)
-    parser.add_argument("--max-requests", type=int, default=200_000)
-    parser.add_argument("--max-retries", type=int, default=10_000)
-    parser.add_argument("--max-asset-files", type=int, default=1_000_000)
-    parser.add_argument("--max-asset-bytes", type=int, default=1_099_511_627_776)
-    parser.add_argument("--minimum-free-space-bytes", type=int, default=10_737_418_240)
     return parser.parse_args(argv)
 
 
@@ -2685,9 +3223,12 @@ if __name__ == "__main__":
 
 __all__ = [
     "AdapterOperationError",
+    "ApprovedRebuildBaselineV2",
     "BaselineCapabilityV2",
     "BaselineVerificationRequestV2",
     "CompatibilityPublishRequestV2",
+    "CommittedRunInspectionCapabilityV2",
+    "CommittedRunInspectionRequestV2",
     "EntryBindingV2",
     "EntryStageRequestV3",
     "FullRebuildBeginRequestV3",
@@ -2711,6 +3252,7 @@ __all__ = [
     "RootCommitGrantV2",
     "RootCurrentCapabilityV2",
     "RootPublishRequestV2",
+    "RuntimeComponentBindingV1",
     "RunResourcesCapabilityV2",
     "SUPPORTED_RICH_CORE_CONTRACT",
     "SealedFullEntryCapabilityV2",

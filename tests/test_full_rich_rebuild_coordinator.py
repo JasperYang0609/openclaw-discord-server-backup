@@ -58,8 +58,9 @@ def make_config(tmp_path: Path, *, count: int = 3, max_zero_rounds: int = 8):
     state.write_bytes(b'{"entries":{}}\n')
     queue.write_bytes(b'{"items":[]}\n')
     entries = full.validate_expected_entries(entry_values(count), expected_count=count)
-    return full.FullRebuildConfigV2(
-        run_id="run-20260905",
+    approved = full.ApprovedRebuildBaselineV2(
+        schema_version=full.APPROVED_BASELINE_SCHEMA,
+        authority_mode="TEST_ONLY",
         archive_root=archive,
         state_path=state,
         queue_path=queue,
@@ -73,7 +74,13 @@ def make_config(tmp_path: Path, *, count: int = 3, max_zero_rounds: int = 8):
         guild_id="1476493755426017414",
         timezone_name="Asia/Taipei",
         adapter_code_sha256=HASH_B,
+        rich_core_code_sha256=HASH_A,
+        coordinator_code_sha256=HASH_D,
         configuration_sha256=HASH_C,
+        expected_entries_artifact_sha256=HASH_D,
+        runtime_manifest_path=None,
+        runtime_manifest_sha256=HASH_A,
+        component_bindings=(),
         limits=full.FullRebuildLimitsV2(
             max_convergence_rounds=max_zero_rounds,
             max_runtime_seconds=3600,
@@ -84,6 +91,102 @@ def make_config(tmp_path: Path, *, count: int = 3, max_zero_rounds: int = 8):
             minimum_free_space_bytes=0,
         ),
     )
+    return full.FullRebuildConfigV2(
+        run_id="run-20260905",
+        approved_baseline=approved,
+    )
+
+
+def make_integrity_bound_runtime(tmp_path: Path, monkeypatch):
+    skill_root = tmp_path / "installed-skill"
+    scripts = skill_root / "scripts"
+    manifests = skill_root / "manifests"
+    scripts.mkdir(parents=True, mode=0o700)
+    manifests.mkdir(mode=0o700)
+    archive = tmp_path / "archive"
+    baseline_dir = tmp_path / "baseline"
+    archive.mkdir(mode=0o700)
+    baseline_dir.mkdir(mode=0o700)
+    state = tmp_path / "state.json"
+    queue = tmp_path / "queue.json"
+    state.write_bytes(b'{"entries":{}}\n')
+    queue.write_bytes(b'{"items":[]}\n')
+
+    entries = full.validate_expected_entries(
+        entry_values(full.PRODUCTION_ENTRY_COUNT),
+        expected_count=full.PRODUCTION_ENTRY_COUNT,
+    )
+    entry_digest = full.entry_set_sha256(entries)
+    entries_path = manifests / "full-rich-rebuild-entries.v1.json"
+    entries_payload = {
+        "schemaVersion": "openclaw-discord-full-rich-rebuild-entries.v1",
+        "entryCount": full.PRODUCTION_ENTRY_COUNT,
+        "entrySetSha256": entry_digest,
+        "entries": [entry.audit_record() for entry in entries],
+    }
+    entries_path.write_bytes(full.canonical_json_bytes(entries_payload) + b"\n")
+    entries_path.chmod(0o600)
+
+    limits = full.FullRebuildLimitsV2(minimum_free_space_bytes=0)
+    config_path = manifests / "full-rich-rebuild-config.v1.json"
+    config_payload = {
+        "schemaVersion": "openclaw-discord-full-rich-rebuild-config.v1",
+        "archiveRoot": str(archive),
+        "statePath": str(state),
+        "queuePath": str(queue),
+        "baselineDir": str(baseline_dir),
+        "baselineSha256": HASH_A,
+        "stateSha256": digest_bytes(state.read_bytes()),
+        "queueSha256": digest_bytes(queue.read_bytes()),
+        "expectedEntryCount": full.PRODUCTION_ENTRY_COUNT,
+        "expectedEntrySetSha256": entry_digest,
+        "expectedEntriesArtifactSha256": full.file_sha256(entries_path),
+        "guildId": "1476493755426017414",
+        "timezone": "Asia/Taipei",
+        "limits": dict(limits.as_tuple()),
+    }
+    config_path.write_bytes(full.canonical_json_bytes(config_payload) + b"\n")
+    config_path.chmod(0o600)
+
+    coordinator_path = scripts / "run_full_rich_rebuild_v2.py"
+    coordinator_path.write_bytes(SCRIPT.read_bytes())
+    coordinator_path.chmod(0o700)
+    rich_core_path = scripts / "rich_message_archive.py"
+    rich_core_path.write_text("# integrity-bound rich core fixture\n", encoding="utf-8")
+    rich_core_path.chmod(0o600)
+    adapter_path = scripts / "rich_core_adapter_v3.py"
+    adapter_path.write_text(
+        "import run_full_rich_rebuild_v2 as coordinator\n"
+        "class Adapter(coordinator.ManagedRichCoreAdapterV3):\n"
+        "    pass\n"
+        "ADAPTER_V3 = Adapter()\n",
+        encoding="utf-8",
+    )
+    adapter_path.chmod(0o600)
+
+    component_paths = {
+        "adapter": adapter_path,
+        "richCore": rich_core_path,
+        "coordinator": coordinator_path,
+        "canonicalConfig": config_path,
+        "expectedEntries": entries_path,
+    }
+    runtime_manifest = {
+        "schemaVersion": full.RUNTIME_MANIFEST_SCHEMA,
+        "adapterContract": full.RICH_CORE_ADAPTER_VERSION,
+        "components": {
+            name: {
+                "path": full.RUNTIME_COMPONENT_PATHS[name],
+                "sha256": full.file_sha256(path),
+            }
+            for name, path in component_paths.items()
+        },
+    }
+    manifest_path = manifests / "runtime-components.v1.json"
+    manifest_path.write_bytes(full.canonical_json_bytes(runtime_manifest) + b"\n")
+    manifest_path.chmod(0o600)
+    monkeypatch.setattr(full, "__file__", str(coordinator_path))
+    return component_paths
 
 
 class CapabilityMixin:
@@ -139,6 +242,12 @@ class RootGrant(CapabilityMixin, full.RootCommitGrantV2):
     pass
 
 
+class CommittedInspection(
+    CapabilityMixin, full.CommittedRunInspectionCapabilityV2
+):
+    pass
+
+
 class Manager(AbstractContextManager):
     def __init__(self, value):
         self.value = value
@@ -155,6 +264,13 @@ class FakeSession(full.FullRebuildSessionV2):
         self.adapter = adapter
         self.begin = begin
         self.current_round_entries = []
+
+    def assert_canonical_lock_held(self):
+        held = self.adapter.lock_entered
+        self.adapter.lock_observations.append(held)
+        if not held:
+            raise full.AdapterOperationError("rich_core_authority_invalid")
+        return None
 
     def describe_capability(self, capability):
         return capability.audit
@@ -414,7 +530,7 @@ class FakeSession(full.FullRebuildSessionV2):
             "published": True,
             "runManifestSha256": ready.audit["runManifestSha256"],
             "fullRunBindingSha256": ready.audit["fullRunBindingSha256"],
-            "priorPointerSha256": None,
+            "priorPointerSha256": self.adapter.prior_pointer_sha256,
             "newPointerSha256": HASH_C,
             "directoryFsync": True,
             "rollbackPrepared": True,
@@ -434,6 +550,28 @@ class FakeSession(full.FullRebuildSessionV2):
             "entrySetSha256": request.expected_entry_set_sha256,
             "readerIndexerCanary": True,
             "rollbackVerified": True,
+        })
+
+    def inspect_committed_full_rebuild(self, request):
+        self.adapter.calls.append(("committed_readback", request.run_id))
+        prior = (
+            self.adapter.committed_prior_pointer_override
+            if self.adapter.committed_prior_pointer_override is not None
+            else request.prior_pointer_sha256
+        )
+        return CommittedInspection({
+            "schemaVersion": full.COMMITTED_READBACK_AUDIT_SCHEMA,
+            "runId": request.run_id,
+            "readOnly": True,
+            "runManifestSha256": request.run_manifest_sha256,
+            "fullRunBindingSha256": request.full_run_binding_sha256,
+            "priorPointerSha256": prior,
+            "newPointerSha256": request.new_pointer_sha256,
+            "selectedEntryCount": request.expected_entry_count,
+            "entrySetSha256": request.expected_entry_set_sha256,
+            "readerIndexerCanary": True,
+            "finalReceiptSha256": request.final_receipt_sha256,
+            "stateQueueInvariant": True,
         })
 
     def publish_compatibility_currents(self, request, *, grant):
@@ -484,6 +622,9 @@ class FakeAdapter(full.ManagedRichCoreAdapterV3):
         self.root_readback = False
         self.compatibility_published = False
         self.lock_entered = False
+        self.lock_observations = []
+        self.prior_pointer_sha256 = HASH_D
+        self.committed_prior_pointer_override = None
 
     def open_slot(self, *, archive_root, lock_path):
         assert lock_path == archive_root / ".channel_backup.lock"
@@ -494,6 +635,12 @@ class FakeAdapter(full.ManagedRichCoreAdapterV3):
             def __enter__(self):
                 adapter.lock_entered = True
                 return super().__enter__()
+
+            def __exit__(self, exc_type, exc, traceback):
+                try:
+                    return super().__exit__(exc_type, exc, traceback)
+                finally:
+                    adapter.lock_entered = False
 
         return SlotManager(FakeSlot(self))
 
@@ -557,6 +704,22 @@ def test_exact_inventory_rejects_177_or_179_against_expected_178(tmp_path, actua
     assert not adapter.root_published
 
 
+def test_self_consistent_177_entry_production_authority_is_rejected(tmp_path):
+    test_config = make_config(tmp_path, count=177)
+    values = dict(test_config.approved_baseline.__dict__)
+    values.update({
+        "authority_mode": "INTEGRITY_BOUND_V1",
+        "_authority": full._PRODUCTION_AUTHORITY,
+    })
+    production_baseline = full.ApprovedRebuildBaselineV2(**values)
+    config = full.FullRebuildConfigV2(
+        run_id=test_config.run_id,
+        approved_baseline=production_baseline,
+    )
+    with pytest.raises(full.FullRebuildError, match="expected_entry_count_mismatch"):
+        full.FullRichRebuildCoordinatorV2(config, adapter=FakeAdapter())
+
+
 def test_inventory_drift_and_non_terminal_pagination_fail_closed(tmp_path):
     config = make_config(tmp_path / "identity")
     adapter = FakeAdapter()
@@ -572,6 +735,22 @@ def test_inventory_drift_and_non_terminal_pagination_fail_closed(tmp_path):
         run(config, adapter)
     assert not adapter.root_published
 
+
+def test_failure_receipt_is_written_before_canonical_lock_release(tmp_path):
+    config = make_config(tmp_path)
+    adapter = FakeAdapter()
+    adapter.message_content_missing = True
+    with pytest.raises(full.FullRebuildError, match="message_content_unavailable"):
+        run(config, adapter)
+    journal = full._load_envelope(
+        config.archive_root / "runs" / config.run_id / "run-journal.json",
+        full.JOURNAL_ENVELOPE_SCHEMA,
+        "journal_corrupt",
+    )
+    assert journal["receiptChain"][-1]["event"] == "run_failed"
+    assert adapter.lock_observations
+    assert all(adapter.lock_observations)
+    assert adapter.lock_entered is False
 
 def test_inventory_drift_at_round_seal_blocks_cutover(tmp_path):
     config = make_config(tmp_path)
@@ -751,6 +930,67 @@ def test_crash_after_root_publish_retries_idempotently_before_compatibility(tmp_
     assert adapter.root_readback and adapter.compatibility_published
 
 
+def test_committed_rerun_is_read_only_and_idempotent(tmp_path):
+    config = make_config(tmp_path)
+    adapter = FakeAdapter()
+    run(config, adapter)
+    journal_path = config.archive_root / "runs" / config.run_id / "run-journal.json"
+    receipt_path = (
+        config.archive_root
+        / "runs"
+        / config.run_id
+        / "receipts/coordinator/full-rebuild-run.json"
+    )
+    events_path = receipt_path.parent / "events"
+    before = (
+        journal_path.read_bytes(),
+        receipt_path.read_bytes(),
+        sorted(path.name for path in events_path.iterdir()),
+    )
+    call_offset = len(adapter.calls)
+    result, _adapter = run(config, adapter)
+    after_calls = adapter.calls[call_offset:]
+    after = (
+        journal_path.read_bytes(),
+        receipt_path.read_bytes(),
+        sorted(path.name for path in events_path.iterdir()),
+    )
+    assert result["idempotentReadback"] is True
+    assert before == after
+    assert [call[0] for call in after_calls if call[0] in {
+        "root_publish", "root_readback", "compatibility", "finalize",
+    }] == []
+    assert [call[0] for call in after_calls].count("committed_readback") == 1
+
+
+def test_committed_rerun_changed_prior_pointer_fails_without_mutation(tmp_path):
+    config = make_config(tmp_path)
+    adapter = FakeAdapter()
+    run(config, adapter)
+    journal_path = config.archive_root / "runs" / config.run_id / "run-journal.json"
+    receipt_path = (
+        config.archive_root
+        / "runs"
+        / config.run_id
+        / "receipts/coordinator/full-rebuild-run.json"
+    )
+    events_path = receipt_path.parent / "events"
+    before = (
+        journal_path.read_bytes(),
+        receipt_path.read_bytes(),
+        sorted(path.name for path in events_path.iterdir()),
+    )
+    adapter.committed_prior_pointer_override = HASH_A
+    with pytest.raises(full.FullRebuildError, match="committed_readback_failed"):
+        run(config, adapter)
+    after = (
+        journal_path.read_bytes(),
+        receipt_path.read_bytes(),
+        sorted(path.name for path in events_path.iterdir()),
+    )
+    assert before == after
+
+
 def test_finalizer_rejects_177_of_178_even_after_rounds(tmp_path):
     config = make_config(tmp_path, count=178)
     adapter = FakeAdapter()
@@ -761,32 +1001,54 @@ def test_finalizer_rejects_177_of_178_even_after_rounds(tmp_path):
 
 
 def test_production_entrypoint_fails_closed_without_exact_adapter_v3(tmp_path):
-    config = make_config(tmp_path)
-    entries_path = tmp_path / "expected.json"
-    entries_path.write_text(
-        json.dumps({"entries": [entry.audit_record() for entry in config.expected_entries]}),
-        encoding="utf-8",
-    )
-    args = full.parse_args([
-        "--run-id", config.run_id,
-        "--archive-root", str(config.archive_root),
-        "--state", str(config.state_path),
-        "--queue", str(config.queue_path),
-        "--baseline-dir", str(config.baseline_dir),
-        "--baseline-sha256", config.baseline_sha256,
-        "--state-sha256", config.expected_state_sha256,
-        "--queue-sha256", config.expected_queue_sha256,
-        "--expected-entries", str(entries_path),
-        "--expected-entry-count", str(config.expected_entry_count),
-        "--expected-entry-set-sha256", config.expected_entry_set_sha256,
-        "--guild-id", config.guild_id,
-        "--timezone", config.timezone_name,
-        "--adapter-code-sha256", config.adapter_code_sha256,
-        "--configuration-sha256", config.configuration_sha256,
-        "--minimum-free-space-bytes", "0",
-    ])
+    del tmp_path
+    args = full.parse_args(["--run-id", "run-20260905"])
     with pytest.raises(full.FullRebuildError, match="rich_core_contract_pending"):
         full.execute(args)
+
+
+def test_integrity_bundle_binds_all_components_and_rechecks_under_lock(
+    tmp_path, monkeypatch
+):
+    paths = make_integrity_bound_runtime(tmp_path, monkeypatch)
+    bundle = full._load_production_bundle()
+    baseline = bundle.approved_baseline
+    assert baseline.production_authorized
+    assert baseline.expected_entry_count == full.PRODUCTION_ENTRY_COUNT
+    assert {binding.name for binding in baseline.component_bindings} == set(
+        full.RUNTIME_COMPONENT_PATHS
+    )
+    config = full.FullRebuildConfigV2(
+        run_id="run-20260905",
+        approved_baseline=baseline,
+    )
+    adapter = FakeAdapter()
+    adapter.lock_entered = True
+    session = FakeSession(adapter, None)
+    full._verify_runtime_authority_under_lock(config, session=session)
+    paths["adapter"].write_text("# post-load tamper\n", encoding="utf-8")
+    paths["adapter"].chmod(0o600)
+    with pytest.raises(full.FullRebuildError, match="rich_core_integrity_mismatch"):
+        full._verify_runtime_authority_under_lock(config, session=session)
+
+
+def test_integrity_bundle_rejects_group_writable_component(tmp_path, monkeypatch):
+    paths = make_integrity_bound_runtime(tmp_path, monkeypatch)
+    paths["richCore"].chmod(0o620)
+    with pytest.raises(full.FullRebuildError, match="rich_core_integrity_mismatch"):
+        full._load_production_bundle()
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--adapter-code-sha256", "f" * 64),
+        ("--configuration-sha256", "e" * 64),
+    ],
+)
+def test_cli_rejects_caller_supplied_authority_hashes(flag, value):
+    with pytest.raises(SystemExit):
+        full.parse_args(["--run-id", "run-20260905", flag, value])
 
 
 def test_structural_duck_adapter_is_rejected(tmp_path):
