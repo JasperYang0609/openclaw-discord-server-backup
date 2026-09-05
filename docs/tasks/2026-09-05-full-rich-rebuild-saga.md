@@ -22,6 +22,85 @@ The current accepted entry baseline is exactly 178 stable Discord channel/thread
 - An immutable pre-repair baseline and a `legacy-retained` projection; no destructive cleanup.
 - Tests and evidence required by `docs/security/2026-09-05-full-rich-rebuild-saga-owasp.md`.
 
+## Round 3 authority and crash-closure decision
+
+The approved remediation is one pinned authority bundle plus a receipt-first
+two-phase root commit. Scattered path checks are insufficient because they can
+validate one pathname or one byte sequence and later execute a different one.
+The coordinator must therefore use the following single authority chain.
+
+### Production runtime authority
+
+The production runtime manifest has one exact, closed component set:
+
+- `scripts/rich_core_adapter_v3.py`;
+- `scripts/rich_message_archive.py`;
+- `scripts/run_full_rich_rebuild_v2.py`;
+- `scripts/run_daily_sync_v3.py`;
+- `scripts/run_managed_component.py`;
+- `manifests/full-rich-rebuild-config.v1.json`;
+- `manifests/full-rich-rebuild-entries.v1.json`.
+
+For every component, the loader opens the reviewed path with no-follow
+semantics, verifies regular-file type, one link, owner, allowed private mode,
+device, inode, size, and digest, and reads through that same descriptor. Python
+is compiled from those exact read bytes. A runtime module identity binds the
+module object, descriptor identity, and compiled-byte digest. While the shared
+backup lock is held, the coordinator revalidates both path-to-descriptor
+identity and the loaded runtime identity. Restoring reviewed pathname bytes
+after a swapped payload was compiled must not satisfy this gate.
+
+The deterministic package, source tree, extracted installed layout, post-run
+manifest, and production runtime manifest must contain that exact set and exact
+bytes. `run_full_rich_rebuild_v2.py` is a required packaged file. Missing,
+extra, renamed, linked, or digest-mismatched components block before mutation.
+
+### Filesystem authority
+
+Before the first mutation, the coordinator pins the approved archive root as a
+directory descriptor and pins the approved state and queue as read-only file
+descriptors. The authority records device, inode, owner, type, link count, mode,
+and initial byte digest. The archive root, baseline root, and run-owned private
+directories must be exactly `0700`; state, queue, journal, final receipt, and
+other run-owned authority files must be exactly `0600`. Existing `0770`
+directories or `0660` files fail before any journal, receipt, pointer, state, or
+queue write.
+
+All coordinator-owned run-journal and final-receipt reads, temporary writes,
+renames, and directory fsyncs are relative to pinned directory descriptors.
+Each mutation rechecks that the configured pathname still names the pinned
+device/inode after the fault hook and immediately before the descriptor-relative
+operation. Renaming the archive root and recreating an identical-looking path
+must fail before either the original or replacement tree is changed. State and
+queue are read through their pinned descriptors and must remain byte-identical;
+path replacement, hard-link substitution, permission drift, or inode drift is
+fatal.
+
+### Receipt-first root commit
+
+`COMMIT_PREPARED` is the only new durable phase between `READY_TO_COMMIT` and
+`COMMITTED`:
+
+- root publication, exact root readback, and compatibility publication finish
+  under the same rich-core authority;
+- the journal durably records the verified root summary and enters
+  `COMMIT_PREPARED` without claiming completion;
+- the deterministic final receipt is created or exact-read back and its byte
+  digest is verified;
+- only then may the journal transition to `COMMITTED`, binding that exact final
+  receipt digest;
+- committed readback independently verifies the root selection, receipt,
+  journal binding, state/queue bytes, and runtime component authority.
+
+A restart in `COMMIT_PREPARED` performs committed-root readback and converges
+the exact final receipt and final journal transition without republishing the
+root or compatibility pointers. A restart in `COMMITTED` is verification-only
+and performs zero filesystem mutation. A crash before, during, or after final
+receipt creation must never leave a `COMMITTED` journal without its exact
+receipt. Existing receipt bytes that differ from the deterministic payload,
+prior-root drift, state/queue drift, archive-root identity drift, or runtime
+authority drift fail closed without changing the journal.
+
 ## Non-goals
 
 - Do not delete, rewrite in place, or deduplicate the legacy Markdown archive.
@@ -179,6 +258,9 @@ The durable state machine is monotonic:
 - `DELTA_CONVERGING`: post-baseline new IDs and bounded same-ID mutable observations are merged.
 - `VERIFYING`: run manifest and all four coverage dimensions are recomputed independently.
 - `READY_TO_COMMIT`: transient runtime PASS exists for every entry and the root binding.
+- `COMMIT_PREPARED`: the selected root and compatibility readback are durable,
+  the deterministic final receipt is the only remaining commit artifact, and
+  resume is forbidden from republishing either pointer set.
 - `COMMITTED`: `RUN_CURRENT.json` replacement, directory fsync, and exact readback succeeded.
 - `PAUSED` or `FAILED`: no new root selection; reason and safe resume point are durable.
 
@@ -330,6 +412,16 @@ After pointer replacement, exact readback and an isolated reader/indexer canary 
 - Resume skips only independently verified sealed entries and rechecks every referenced hash.
 - Cursor/state/queue bytes remain exact before, during, after success, and after failure/rollback.
 - Root readback and reader/indexer restore canary across all 178 bindings.
+- Runtime component swap after manifest verification but before compilation;
+  compiled bytes, descriptor identity, and locked runtime identity must all
+  reject the swap even if the pathname is restored afterward.
+- Archive-root rename/replacement after preflight and immediately before every
+  journal or receipt boundary; neither inode may be mutated on rejection.
+- Crash before/after `COMMIT_PREPARED`, before/during/after final receipt
+  creation, and before/after the final `COMMITTED` journal transition. Resume
+  must converge idempotently, and `COMMITTED` resume must be zero-mutation.
+- Exact-mode negatives for archive/baseline/run directories at `0770` and
+  state/queue/ledger files at `0660`; all must fail before the first mutation.
 
 ### Security and packaging
 

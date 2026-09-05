@@ -49,6 +49,41 @@ Security invariants:
 - No entry worker owns independent global quotas, disk reservations, or lock authority.
 - Any unknown, truncated, stale, permission-denied, or unclassified condition fails closed.
 
+## ROUND3_P1_CLOSURE_CONTROLS
+
+The approved Round 3 design closes five release-blocking authority and recovery
+gaps without changing the Adapter V3 contract.
+
+- **Closed runtime set:** the integrity manifest must bind the adapter, rich
+  core, full coordinator, daily runner, managed dispatcher, canonical config,
+  and approved entries. Source, deterministic package, extracted install,
+  post-run verification, and the locked runtime must be byte-identical.
+- **Verify equals use:** runtime components are opened once with no-follow
+  semantics. The same descriptor bytes are hashed and compiled. Device/inode,
+  byte digest, module object identity, and adapter type identity are rechecked
+  under the shared backup lock. A verify-then-swap-then-restore race fails.
+- **Pinned storage authority:** archive-root, state, and queue identities are
+  descriptor-bound. Coordinator ledger operations use descriptor-relative
+  reads, atomic writes, renames, and fsyncs. Archive, baseline, and run
+  directories are exactly `0700`; state, queue, journal, receipt, and authority
+  files are exactly `0600`. Path, inode, link, owner, type, or mode drift fails
+  before mutation.
+- **Receipt-first commit:** `COMMIT_PREPARED` durably binds verified root
+  readback before the deterministic final receipt. The journal becomes
+  `COMMITTED` only after exact receipt readback and stores its digest. Resume
+  from `COMMIT_PREPARED` never republishes root or compatibility pointers;
+  resume from `COMMITTED` performs zero writes.
+- **Crash closure:** injected crashes at every root-summary, receipt, journal,
+  rename, and fsync boundary must resume to one verified commit or fail closed
+  without altering the prior journal. A `COMMITTED` journal without its exact
+  receipt is impossible by construction and rejected if externally forged.
+
+Required adversarial evidence is independent of happy-path tests: component
+swap between verification and compile, archive-root rename plus path recreation,
+state/queue inode substitution, permissive-mode inputs, crash at each
+`COMMIT_PREPARED` boundary, deterministic package omission/tamper, and
+verification-only committed reruns.
+
 ## BUSINESS_LOGIC_ABUSE_CASES
 
 - Supply an archive root or baseline through traversal, Unicode controls, symlink, hardlink, mount/inode swap, or workspace overlap.
