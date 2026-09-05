@@ -52,6 +52,7 @@ FULL_RUN_RECEIPT_SCHEMA = "openclaw-discord-full-rebuild-run.v1"
 ASSET_RESERVATION_SCHEMA = "openclaw-discord-full-run-asset-reservation.v1"
 STAGE_BASE_SCHEMA = "openclaw-discord-stage-base-current.v1"
 SOURCE_CENSUS_SCHEMA = "openclaw-discord-source-census.v2"
+CANONICAL_ARCHIVE_LOCK_NAME = ".channel_backup.lock"
 DEFAULT_LIVE_EVIDENCE_TTL_SECONDS = 300.0
 MAX_LIVE_EVIDENCE_TTL_SECONDS = 900.0
 TZ_TAIPEI = timezone(timedelta(hours=8))
@@ -1400,6 +1401,13 @@ def contained_path(root: Path, relative: str) -> Path:
     return candidate
 
 
+def canonical_archive_lock_path(archive_root: Path) -> Path:
+    """Return the one core-owned cross-process mutation lock for an archive."""
+    archive_root = _lexical_absolute(archive_root)
+    reject_symlink_path(archive_root)
+    return contained_path(archive_root, CANONICAL_ARCHIVE_LOCK_NAME)
+
+
 def _regular_single_link(path: Path) -> bool:
     try:
         info = path.lstat()
@@ -2259,6 +2267,11 @@ def _mint_run_context(
     archive_root = _lexical_absolute(archive_root)
     reject_symlink_path(archive_root)
     lock_identity = _validated_lock_token_identity(lock_token)
+    canonical_lock_path = canonical_archive_lock_path(archive_root)
+    if lock_identity["path"] != canonical_lock_path:
+        raise RichArchiveError(
+            "archive run requires the core-derived canonical backup lock path"
+        )
     identities = [dict(row) for row in entries]
     digest = json_sha256(identities)
     expected_identities = [dict(row) for row in (expected_entries or identities)]
@@ -2427,58 +2440,131 @@ def _require_run_context(
     return registration
 
 
+def _begin_run_context_lease(
+    context: ArchiveRunContext | None,
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    """Borrow a run and its bound canonical lock for one run-wide decision."""
+    owner = threading.get_ident()
+    with _RUN_CONTEXT_REGISTRY_MUTEX:
+        registration = _require_run_context(context, kind=kind)
+        owners = registration["borrowOwners"]
+        if registration.get("closing") and owners.get(owner, 0) == 0:
+            raise RichArchiveError("archive run context is closing")
+        owners[owner] = owners.get(owner, 0) + 1
+        registration["borrowCount"] += 1
+        lock_owner = RichArchiveStore(
+            registration["archiveRoot"],
+            lock_path=registration["lockPath"],
+        )
+        try:
+            lock_lease = lock_owner._begin_lock_lease(registration["lockToken"])
+        except BaseException:
+            owners[owner] -= 1
+            if owners[owner] == 0:
+                owners.pop(owner)
+            registration["borrowCount"] -= 1
+            raise
+        return {
+            "nonce": context._nonce,
+            "owner": owner,
+            "registration": registration,
+            "context": context,
+            "lockOwner": lock_owner,
+            "lockLease": lock_lease,
+        }
+
+
+def _end_run_context_lease(lease: Mapping[str, Any]) -> None:
+    lock_token: ArchiveLockToken | None = None
+    try:
+        lease["lockOwner"]._end_lock_lease(lease["lockLease"])
+    finally:
+        with _RUN_CONTEXT_REGISTRY_MUTEX:
+            nonce = str(lease["nonce"])
+            registration = _RUN_CONTEXT_REGISTRY.get(nonce)
+            if registration is not lease["registration"]:
+                raise RichArchiveError("archive run lease registry changed during finalization")
+            owners = registration["borrowOwners"]
+            owner = int(lease["owner"])
+            if owners.get(owner, 0) < 1 or registration.get("borrowCount", 0) < 1:
+                raise RichArchiveError("archive run lease count underflow")
+            owners[owner] -= 1
+            if owners[owner] == 0:
+                owners.pop(owner)
+            registration["borrowCount"] -= 1
+            if registration["borrowCount"] == 0 and registration.get("closing"):
+                lock_token = _remove_run_context_registration_locked(nonce)
+    if lock_token is not None:
+        lock_token.close()
+
+
 def finalize_full_rebuild_run(context: FullRebuildRunContext | None) -> dict[str, Any]:
     """Consume a full-run context and prove every inventoried entry published."""
-    registration = _require_run_context(context, kind="full_rebuild")
-    expected = sorted(
-        (row["channelId"] for row in registration["expectedEntries"]), key=int,
-    )
-    processed = sorted(registration["processed"], key=int)
-    errors = [] if processed == expected else ["not_all_inventory_entries_published"]
-    reservation_ids = {
-        channel_id: str(receipt.get("reservationId") or "")
-        for channel_id, receipt in registration["assetReservations"].items()
-    }
-    if (
-        sorted(reservation_ids, key=int) != expected
-        or set(reservation_ids.values()) != registration["usedAssetReservations"]
-    ):
-        errors.append("not_all_asset_reservations_consumed")
-    current_hashes: dict[str, str | None] = {}
-    for identity in registration["expectedEntries"]:
-        channel_id = identity["channelId"]
-        key = (channel_id, identity["normalizedRelativePath"])
-        actual_hash: str | None = None
+    run_lease = _begin_run_context_lease(context, kind="full_rebuild")
+    registration = run_lease["registration"]
+    lock_token = registration["lockToken"]
+    try:
+        registration = _require_run_context(
+            context,
+            kind="full_rebuild",
+            lock_token=lock_token,
+        )
+        expected = sorted(
+            (row["channelId"] for row in registration["expectedEntries"]), key=int,
+        )
+        processed = sorted(registration["processed"], key=int)
+        errors = [] if processed == expected else ["not_all_inventory_entries_published"]
+        reservation_ids = {
+            channel_id: str(receipt.get("reservationId") or "")
+            for channel_id, receipt in registration["assetReservations"].items()
+        }
+        if (
+            sorted(reservation_ids, key=int) != expected
+            or set(reservation_ids.values()) != registration["usedAssetReservations"]
+        ):
+            errors.append("not_all_asset_reservations_consumed")
+        current_hashes: dict[str, str | None] = {}
+        for identity in registration["expectedEntries"]:
+            channel_id = identity["channelId"]
+            key = (channel_id, identity["normalizedRelativePath"])
+            actual_hash: str | None = None
+            try:
+                current = RichArchiveStore(registration["entryRoots"][key]).resolve_current()
+                if current is not None:
+                    actual_hash = verify_generation(current)["generationSha256"]
+            except (RichArchiveError, OSError, ValueError):
+                errors.append(f"current_generation_readback_failed:{channel_id}")
+            current_hashes[channel_id] = actual_hash
+            if registration["processed"].get(channel_id) != actual_hash:
+                errors.append(f"current_generation_hash_mismatch:{channel_id}")
+        budget = registration["budget"]
+        receipt: dict[str, Any] = {
+            "schemaVersion": FULL_RUN_RECEIPT_SCHEMA,
+            "gateStatus": "PASS" if not errors else "FAIL",
+            "runContextId": registration["runContextId"],
+            "archiveRootSha256": registration["archiveRootSha256"],
+            "inventoryDigest": registration["inventoryDigest"],
+            "expectedEntriesDigest": registration["expectedEntriesDigest"],
+            "inventoryResponseSha256": json_sha256(registration["inventoryResponse"]),
+            "expectedEntryCount": len(expected),
+            "processedEntryCount": len(processed),
+            "processedGenerationSha256ByChannel": dict(registration["processed"]),
+            "assetReservationIdByChannel": reservation_ids,
+            "currentGenerationSha256ByChannel": current_hashes,
+            "assetFileCount": budget.file_count,
+            "assetDeclaredBytes": budget.declared_bytes,
+            "errors": sorted(set(errors)),
+        }
+        receipt["receiptSha256"] = json_sha256(receipt)
+        return receipt
+    finally:
         try:
-            current = RichArchiveStore(registration["entryRoots"][key]).resolve_current()
-            if current is not None:
-                actual_hash = verify_generation(current)["generationSha256"]
-        except (RichArchiveError, OSError, ValueError):
-            errors.append(f"current_generation_readback_failed:{channel_id}")
-        current_hashes[channel_id] = actual_hash
-        if registration["processed"].get(channel_id) != actual_hash:
-            errors.append(f"current_generation_hash_mismatch:{channel_id}")
-    budget = registration["budget"]
-    receipt: dict[str, Any] = {
-        "schemaVersion": FULL_RUN_RECEIPT_SCHEMA,
-        "gateStatus": "PASS" if not errors else "FAIL",
-        "runContextId": registration["runContextId"],
-        "archiveRootSha256": registration["archiveRootSha256"],
-        "inventoryDigest": registration["inventoryDigest"],
-        "expectedEntriesDigest": registration["expectedEntriesDigest"],
-        "inventoryResponseSha256": json_sha256(registration["inventoryResponse"]),
-        "expectedEntryCount": len(expected),
-        "processedEntryCount": len(processed),
-        "processedGenerationSha256ByChannel": dict(registration["processed"]),
-        "assetReservationIdByChannel": reservation_ids,
-        "currentGenerationSha256ByChannel": current_hashes,
-        "assetFileCount": budget.file_count,
-        "assetDeclaredBytes": budget.declared_bytes,
-        "errors": sorted(set(errors)),
-    }
-    receipt["receiptSha256"] = json_sha256(receipt)
-    context.close()
-    return receipt
+            _end_run_context_lease(run_lease)
+        finally:
+            if isinstance(context, FullRebuildRunContext):
+                context.close()
 
 
 _LIVE_EVIDENCE_GUARD = object()
@@ -4602,15 +4688,17 @@ class RichArchiveStore:
 
 __all__ = [
     "ArchiveLockToken", "ArchiveRunContext", "AssetDownloadError", "AssetDownloader",
-    "AssetLimits", "AssetProbeBudget", "ASSET_RESERVATION_SCHEMA", "DEFAULT_CDN_HOSTS",
+    "AssetLimits", "AssetProbeBudget", "ASSET_RESERVATION_SCHEMA",
+    "CANONICAL_ARCHIVE_LOCK_NAME", "DEFAULT_CDN_HOSTS",
     "DISCORD_INVENTORY_RESPONSE_SCHEMA", "DISCORD_PAGE_RESPONSE_SCHEMA", "ENTRY_RECEIPT_SCHEMA",
     "FULL_RUN_RECEIPT_SCHEMA", "FullRebuildRunContext", "GENERATION_MANIFEST_SCHEMA",
     "GenerationError", "IncrementalRunContext", "LIVE_EVIDENCE_SCHEMA", "RECORD_SCHEMA",
     "LiveEvidenceToken", "RichArchiveError", "RichArchiveStore", "SOURCE_CENSUS_SCHEMA",
     "STAGE_BASE_SCHEMA",
     "SourceBoundsError", "SourceCensusError", "apply_asset_results", "atomic_json",
-    "atomic_jsonl", "begin_full_rebuild_run", "begin_incremental_run", "canonical_day",
-    "collect_live_evidence", "contained_path", "file_sha256", "finalize_full_rebuild_run",
+    "atomic_jsonl", "begin_full_rebuild_run", "begin_incremental_run",
+    "canonical_archive_lock_path", "canonical_day", "collect_live_evidence",
+    "contained_path", "file_sha256", "finalize_full_rebuild_run",
     "generation_inventory",
     "inventory_assets", "json_sha256", "load_jsonl",
     "merge_day_records", "merge_message_records", "normalize_message",

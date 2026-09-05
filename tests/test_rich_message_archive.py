@@ -2,9 +2,12 @@ import gc
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 import os
+import queue
 import sys
 import threading
+import time
 import types
 import urllib.error
 import weakref
@@ -23,7 +26,7 @@ spec.loader.exec_module(rich)
 
 
 OBSERVED = "2026-09-05T04:00:00Z"
-LOCK_NAME = ".channel-backup.lock"
+LOCK_NAME = rich.CANONICAL_ARCHIVE_LOCK_NAME
 
 
 def message(**overrides):
@@ -128,12 +131,62 @@ def inventory_entry(*, channel_id="1490000000000000001", relative_path="test/ent
 def archive_run_lock(archive_root):
     return rich.RichArchiveStore(
         Path(archive_root) / ".run-lock-owner",
-        lock_path=Path(archive_root) / LOCK_NAME,
+        lock_path=rich.canonical_archive_lock_path(Path(archive_root)),
     ).acquire_lock()
 
 
 def context_lock_token(run_context):
     return rich._require_run_context(run_context)["lockToken"]
+
+
+def _cross_process_merge_worker(
+    archive_root_text,
+    lock_name,
+    label,
+    message_id,
+    generation_id,
+    ready,
+    release,
+    result_queue,
+):
+    """Independent-process lost-update regression worker."""
+    archive_root = Path(archive_root_text)
+    entry_root = archive_root / "test/entry"
+    store = rich.RichArchiveStore(entry_root, lock_path=archive_root / lock_name)
+    lock_token = None
+    run_context = None
+    try:
+        lock_token = store.acquire_lock()
+        run_context = rich.begin_incremental_run(
+            entries=[inventory_entry()],
+            archive_root=archive_root,
+            lock_token=lock_token,
+        )
+        original = rich.RichArchiveStore._require_stage_base_current_unchanged
+
+        def gated_compare(self, stage):
+            original(self, stage)
+            ready.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("multiprocess publish gate timed out")
+
+        rich.RichArchiveStore._require_stage_base_current_unchanged = gated_compare
+        outcome = store.merge_messages(
+            [message(id=message_id, content=f"{label} concurrent update")],
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            observed_at=OBSERVED,
+            generation_id=generation_id,
+            run_context=run_context,
+        )
+        result_queue.put((label, "ok", message_id, outcome.get("verified")))
+    except BaseException as exc:
+        result_queue.put((label, "error", type(exc).__name__, str(exc)))
+    finally:
+        if run_context is not None:
+            run_context.close()
+        elif lock_token is not None:
+            lock_token.close()
 
 
 def full_run_context(archive_root, entries=None, *, limits=None):
@@ -1377,6 +1430,75 @@ def test_incomplete_full_run_receipt_fails_and_consumes_context(tmp_path):
         rich.finalize_full_rebuild_run(run_context)
 
 
+@pytest.mark.parametrize("close_target", ["context", "bound_lock_token"])
+def test_finalize_holds_run_and_lock_until_readback_decision(
+    monkeypatch,
+    tmp_path,
+    close_target,
+):
+    store = make_store(tmp_path)
+    write_initial_generation(store, tmp_path, normalize())
+    run_context = full_run_context(tmp_path)
+    lock_token = context_lock_token(run_context)
+    entered = threading.Event()
+    release = threading.Event()
+    receipts = []
+    errors = []
+    original_resolve_current = rich.RichArchiveStore.resolve_current
+
+    def blocking_resolve_current(self):
+        if self.entry_root == store.entry_root and threading.current_thread().name == "finalizer":
+            entered.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("finalize readback gate timed out")
+        return original_resolve_current(self)
+
+    monkeypatch.setattr(
+        rich.RichArchiveStore,
+        "resolve_current",
+        blocking_resolve_current,
+    )
+
+    def finalize():
+        try:
+            receipts.append(rich.finalize_full_rebuild_run(run_context))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=finalize, name="finalizer")
+    worker.start()
+    deferred_close = False
+    second_run_rejected = False
+    try:
+        assert entered.wait(timeout=10)
+        if close_target == "context":
+            run_context.close()
+        else:
+            lock_token.close()
+        deferred_close = not run_context.closed and not lock_token.closed
+        try:
+            second_context = incremental_run_context(tmp_path)
+        except rich.RichArchiveError:
+            second_run_rejected = True
+        else:
+            second_context.close()
+    finally:
+        release.set()
+        worker.join(timeout=10)
+        run_context.close()
+
+    assert not worker.is_alive()
+    assert deferred_close
+    assert second_run_rejected
+    assert not errors
+    assert len(receipts) == 1
+    assert receipts[0]["gateStatus"] == "FAIL"
+    assert run_context.closed
+    assert lock_token.closed
+    with incremental_run_context(tmp_path):
+        pass
+
+
 def test_merge_requires_module_minted_run_context_without_leaking_the_shared_lock(tmp_path):
     store = make_store(tmp_path)
     with pytest.raises(TypeError, match="run_context"):
@@ -1917,6 +2039,77 @@ def test_incremental_run_cannot_lost_update_through_two_lock_paths(tmp_path):
         assert successes[0][0] in ids
     finally:
         run_context.close()
+
+
+def test_cross_process_alternate_lock_cannot_publish_lost_update(tmp_path):
+    store = make_store(tmp_path)
+    write_initial_generation(store, tmp_path, normalize())
+    context = multiprocessing.get_context("fork")
+    release = context.Event()
+    canonical_ready = context.Event()
+    alternate_ready = context.Event()
+    result_queue = context.Queue()
+    canonical_message_id = "1540000000000000002"
+    alternate_message_id = "1540000000000000003"
+    workers = [
+        context.Process(
+            target=_cross_process_merge_worker,
+            args=(
+                str(tmp_path), LOCK_NAME, "canonical", canonical_message_id,
+                "cross-process-canonical", canonical_ready, release, result_queue,
+            ),
+        ),
+        context.Process(
+            target=_cross_process_merge_worker,
+            args=(
+                str(tmp_path), "alternate.lock", "alternate", alternate_message_id,
+                "cross-process-alternate", alternate_ready, release, result_queue,
+            ),
+        ),
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        assert canonical_ready.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while workers[1].is_alive() and not alternate_ready.is_set():
+            if time.monotonic() >= deadline:
+                pytest.fail("alternate-lock worker did not reach a bounded decision")
+            time.sleep(0.01)
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(timeout=10)
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=5)
+
+    assert all(worker.exitcode == 0 for worker in workers)
+    results = {}
+    for _ in workers:
+        try:
+            row = result_queue.get(timeout=5)
+        except queue.Empty:
+            pytest.fail("multiprocess worker omitted its result")
+        results[row[0]] = row[1:]
+    assert results["canonical"] == ("ok", canonical_message_id, True)
+    assert results["alternate"][0] == "error"
+    assert "canonical" in results["alternate"][2].lower()
+    assert not alternate_ready.is_set()
+
+    current = store.resolve_current()
+    assert current is not None
+    final_ids = {
+        row["messageId"]
+        for path in (current / "canonical").glob("*.jsonl")
+        for row in rich.load_jsonl(path)
+    }
+    successful_ids = {
+        result[1] for result in results.values() if result[0] == "ok"
+    }
+    assert successful_ids <= final_ids
+    assert alternate_message_id not in final_ids
 
 
 def test_parallel_asset_reservation_failure_does_not_poison_shared_budget(tmp_path):
