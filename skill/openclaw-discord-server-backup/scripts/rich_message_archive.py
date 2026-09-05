@@ -2167,8 +2167,8 @@ def _remove_run_context_registration_locked(
     nonce: str,
     *,
     expected_context: ArchiveRunContext | None = None,
-) -> ArchiveLockToken | None:
-    """Remove an idle run registration while the registry mutex is held."""
+) -> dict[str, Any] | None:
+    """Remove an idle run while its canonical lock remains run-pinned."""
     registration = _RUN_CONTEXT_REGISTRY.get(nonce)
     if registration is None:
         if expected_context is not None:
@@ -2190,7 +2190,7 @@ def _remove_run_context_registration_locked(
             _ACTIVE_ENTRY_ROOT_RUNS.pop(entry_key, None)
     if context is not None:
         context._closed = True
-    return registration["lockToken"]
+    return registration["lockRunPin"]
 
 
 def _release_run_context_registration(
@@ -2201,7 +2201,7 @@ def _release_run_context_registration(
     """Release an idle run, or defer release until active operations finish."""
     with _RUN_CONTEXT_REGISTRY_MUTEX:
         existed = nonce in _RUN_CONTEXT_REGISTRY
-        lock_token = _remove_run_context_registration_locked(
+        lock_run_pin = _remove_run_context_registration_locked(
             nonce,
             expected_context=expected_context,
         )
@@ -2209,8 +2209,10 @@ def _release_run_context_registration(
         if not existed and expected_context is not None:
             expected_context._closed = True
             removed = True
-    if lock_token is not None:
-        lock_token.close()
+    # The run registry and entry ownership are gone before the pin can release
+    # the canonical flock.  This preserves the run-registry -> lock-registry order.
+    if lock_run_pin is not None:
+        _release_run_lock_pin(lock_run_pin)
     return removed
 
 
@@ -2288,51 +2290,57 @@ def _mint_run_context(
             raise RichArchiveError("archive root already has an active backup run")
         if any(key in _ACTIVE_ENTRY_ROOT_RUNS for key in entry_keys):
             raise RichArchiveError("archive entry already belongs to an active backup run")
-        context_type = FullRebuildRunContext if kind == "full_rebuild" else IncrementalRunContext
-        context = context_type(kind=kind, guard=_RUN_CONTEXT_GUARD)
-        context_nonce = context._nonce
-        context_ref = weakref.ref(
-            context,
-            lambda _reference, nonce=context_nonce: _release_run_context_registration(nonce),
-        )
-        _RUN_CONTEXT_REGISTRY[context._nonce] = {
-            "context": context_ref,
-            "pid": os.getpid(),
-            "kind": kind,
-            "runContextId": secrets.token_hex(32),
-            "archiveRoot": archive_root,
-            "archiveRootSha256": json_sha256(str(archive_root)),
-            "lockToken": lock_token,
-            "lockTokenNonce": lock_identity["nonce"],
-            "lockPath": lock_identity["path"],
-            "lockPathSha256": json_sha256(str(lock_identity["path"])),
-            "lockDevice": lock_identity["device"],
-            "lockInode": lock_identity["inode"],
-            "entries": identities,
-            "expectedEntries": expected_identities,
-            "expectedEntriesDigest": json_sha256(expected_identities),
-            "entryKeys": {
-                (row["channelId"], row["normalizedRelativePath"])
-                for row in expected_identities
-            },
-            "entryRoots": entry_roots,
-            "inventoryDigest": digest,
-            "inventoryResponse": (
-                json.loads(json.dumps(inventory_response, ensure_ascii=False))
-                if inventory_response is not None else None
-            ),
-            "mutex": threading.RLock(),
-            "borrowCount": 0,
-            "borrowOwners": {},
-            "closing": False,
-            "budget": AssetRunBudget.from_limits(limits),
-            "assetReservations": {},
-            "usedAssetReservations": set(),
-            "processed": {},
-        }
-        _ACTIVE_ARCHIVE_ROOT_RUNS[archive_key] = context._nonce
-        for key in entry_keys:
-            _ACTIVE_ENTRY_ROOT_RUNS[key] = context._nonce
+        lock_run_pin = _pin_lock_token_for_run(lock_token)
+        try:
+            context_type = FullRebuildRunContext if kind == "full_rebuild" else IncrementalRunContext
+            context = context_type(kind=kind, guard=_RUN_CONTEXT_GUARD)
+            context_nonce = context._nonce
+            context_ref = weakref.ref(
+                context,
+                lambda _reference, nonce=context_nonce: _release_run_context_registration(nonce),
+            )
+            _RUN_CONTEXT_REGISTRY[context._nonce] = {
+                "context": context_ref,
+                "pid": os.getpid(),
+                "kind": kind,
+                "runContextId": secrets.token_hex(32),
+                "archiveRoot": archive_root,
+                "archiveRootSha256": json_sha256(str(archive_root)),
+                "lockToken": lock_token,
+                "lockRunPin": lock_run_pin,
+                "lockTokenNonce": lock_identity["nonce"],
+                "lockPath": lock_identity["path"],
+                "lockPathSha256": json_sha256(str(lock_identity["path"])),
+                "lockDevice": lock_identity["device"],
+                "lockInode": lock_identity["inode"],
+                "entries": identities,
+                "expectedEntries": expected_identities,
+                "expectedEntriesDigest": json_sha256(expected_identities),
+                "entryKeys": {
+                    (row["channelId"], row["normalizedRelativePath"])
+                    for row in expected_identities
+                },
+                "entryRoots": entry_roots,
+                "inventoryDigest": digest,
+                "inventoryResponse": (
+                    json.loads(json.dumps(inventory_response, ensure_ascii=False))
+                    if inventory_response is not None else None
+                ),
+                "mutex": threading.RLock(),
+                "borrowCount": 0,
+                "borrowOwners": {},
+                "closing": False,
+                "budget": AssetRunBudget.from_limits(limits),
+                "assetReservations": {},
+                "usedAssetReservations": set(),
+                "processed": {},
+            }
+            _ACTIVE_ARCHIVE_ROOT_RUNS[archive_key] = context._nonce
+            for key in entry_keys:
+                _ACTIVE_ENTRY_ROOT_RUNS[key] = context._nonce
+        except BaseException:
+            _release_run_lock_pin(lock_run_pin, request_close=False)
+            raise
     return context
 
 
@@ -2477,7 +2485,7 @@ def _begin_run_context_lease(
 
 
 def _end_run_context_lease(lease: Mapping[str, Any]) -> None:
-    lock_token: ArchiveLockToken | None = None
+    lock_run_pin: dict[str, Any] | None = None
     try:
         lease["lockOwner"]._end_lock_lease(lease["lockLease"])
     finally:
@@ -2495,9 +2503,9 @@ def _end_run_context_lease(lease: Mapping[str, Any]) -> None:
                 owners.pop(owner)
             registration["borrowCount"] -= 1
             if registration["borrowCount"] == 0 and registration.get("closing"):
-                lock_token = _remove_run_context_registration_locked(nonce)
-    if lock_token is not None:
-        lock_token.close()
+                lock_run_pin = _remove_run_context_registration_locked(nonce)
+    if lock_run_pin is not None:
+        _release_run_lock_pin(lock_run_pin)
 
 
 def finalize_full_rebuild_run(context: FullRebuildRunContext | None) -> dict[str, Any]:
@@ -3609,6 +3617,54 @@ def _validated_lock_token_identity(
         }
 
 
+def _pin_lock_token_for_run(lock_token: ArchiveLockToken) -> dict[str, Any]:
+    """Create a non-thread-affine pin that keeps the canonical flock held."""
+    with _LOCK_TOKEN_REGISTRY_MUTEX:
+        _validated_lock_token_identity(lock_token)
+        registration = _LOCK_TOKEN_REGISTRY.get(lock_token._nonce)
+        if (
+            registration is None
+            or registration.get("token")() is not lock_token
+            or registration.get("closing")
+            or registration.get("closeRequested")
+        ):
+            raise RichArchiveError("backup lock cannot be pinned for a new archive run")
+        pin_nonce = secrets.token_hex(32)
+        registration["runPins"].add(pin_nonce)
+        return {
+            "pinNonce": pin_nonce,
+            "tokenNonce": lock_token._nonce,
+            "registration": registration,
+            "token": lock_token,
+        }
+
+
+def _release_run_lock_pin(
+    pin: Mapping[str, Any],
+    *,
+    request_close: bool = True,
+) -> None:
+    """Drop one run pin; a close request releases flock only after the last pin."""
+    with _LOCK_TOKEN_REGISTRY_MUTEX:
+        token = pin["token"]
+        token_nonce = str(pin["tokenNonce"])
+        registration = _LOCK_TOKEN_REGISTRY.get(token_nonce)
+        if (
+            registration is not pin["registration"]
+            or registration.get("token")() is not token
+            or pin["pinNonce"] not in registration.get("runPins", set())
+        ):
+            raise RichArchiveError("archive run lock pin registry changed during release")
+        registration["runPins"].remove(pin["pinNonce"])
+        if request_close:
+            registration["closeRequested"] = True
+        if not registration["runPins"] and registration.get("closeRequested"):
+            if registration.get("borrowCount", 0) > 0:
+                registration["closing"] = True
+            else:
+                _release_lock_registration(token_nonce, expected_token=token)
+
+
 def _active_run_registration_for_entry(entry_root: Path) -> dict[str, Any] | None:
     entry_key = str(_lexical_absolute(entry_root))
     with _RUN_CONTEXT_REGISTRY_MUTEX:
@@ -3620,9 +3676,9 @@ def _active_run_registration_for_entry(entry_root: Path) -> dict[str, Any] | Non
             _ACTIVE_ENTRY_ROOT_RUNS.pop(entry_key, None)
             return None
         if registration.get("context")() is None:
-            lock_token = _remove_run_context_registration_locked(nonce)
-            if lock_token is not None:
-                lock_token.close()
+            lock_run_pin = _remove_run_context_registration_locked(nonce)
+            if lock_run_pin is not None:
+                _release_run_lock_pin(lock_run_pin)
             return None
         return registration
 
@@ -3667,9 +3723,9 @@ def _begin_active_run_entry_lease(
         registration = _RUN_CONTEXT_REGISTRY.get(nonce)
         context = registration.get("context")() if registration is not None else None
         if registration is None or context is None:
-            token = _remove_run_context_registration_locked(nonce)
-            if token is not None:
-                token.close()
+            lock_run_pin = _remove_run_context_registration_locked(nonce)
+            if lock_run_pin is not None:
+                _release_run_lock_pin(lock_run_pin)
             return None
         _require_active_run_entry_lock(entry_root, lock_token)
         owners = registration["borrowOwners"]
@@ -3688,7 +3744,7 @@ def _begin_active_run_entry_lease(
 def _end_active_run_entry_lease(lease: Mapping[str, Any] | None) -> None:
     if lease is None:
         return
-    lock_token: ArchiveLockToken | None = None
+    lock_run_pin: dict[str, Any] | None = None
     with _RUN_CONTEXT_REGISTRY_MUTEX:
         registration = _RUN_CONTEXT_REGISTRY.get(str(lease["nonce"]))
         if registration is not lease["registration"]:
@@ -3702,9 +3758,9 @@ def _end_active_run_entry_lease(lease: Mapping[str, Any] | None) -> None:
             owners.pop(owner)
         registration["borrowCount"] -= 1
         if registration["borrowCount"] == 0 and registration.get("closing"):
-            lock_token = _remove_run_context_registration_locked(str(lease["nonce"]))
-    if lock_token is not None:
-        lock_token.close()
+            lock_run_pin = _remove_run_context_registration_locked(str(lease["nonce"]))
+    if lock_run_pin is not None:
+        _release_run_lock_pin(lock_run_pin)
 
 
 @contextmanager
@@ -3759,6 +3815,9 @@ def _release_lock_registration(
             return True
         token = registration.get("token")()
         if expected_token is not None and token is not expected_token:
+            return False
+        registration["closeRequested"] = True
+        if registration.get("runPins"):
             return False
         if registration.get("borrowCount", 0) > 0:
             registration["closing"] = True
@@ -3838,6 +3897,8 @@ class RichArchiveStore:
                 "handle": handle,
                 "borrowCount": 0,
                 "borrowOwners": {},
+                "runPins": set(),
+                "closeRequested": False,
                 "closing": False,
             }
         return token
@@ -3961,7 +4022,11 @@ class RichArchiveStore:
             if owners[owner] == 0:
                 owners.pop(owner)
             current["borrowCount"] -= 1
-            if current["borrowCount"] == 0 and current.get("closing"):
+            if (
+                current["borrowCount"] == 0
+                and not current.get("runPins")
+                and current.get("closeRequested")
+            ):
                 _release_lock_registration(lock_token._nonce, expected_token=lock_token)
 
     def _require_active_lock_lease(self, lock_token: ArchiveLockToken | None) -> None:
@@ -3972,6 +4037,31 @@ class RichArchiveStore:
             )
             if registration.get("borrowOwners", {}).get(threading.get_ident(), 0) < 1:
                 raise RichArchiveError("active shared backup lock operation lease is required")
+
+    def _managed_run_registration(
+        self,
+        run_context: ArchiveRunContext | None,
+        lock_token: ArchiveLockToken | None,
+    ) -> tuple[dict[str, Any], ArchiveLockToken]:
+        """Bind one public managed mutation to its module-minted run and lock."""
+        registration = _require_run_context(
+            run_context,
+            entry_root=self.entry_root,
+        )
+        bound_token = registration["lockToken"]
+        if lock_token is None:
+            lock_token = bound_token
+        registration = _require_run_context(
+            run_context,
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        if self.lock_path != registration["lockPath"]:
+            raise RichArchiveError(
+                "managed archive mutation requires the core-derived canonical backup lock path"
+            )
+        assert isinstance(lock_token, ArchiveLockToken)
+        return registration, lock_token
 
     def _pointer_body(self, generation_id: str, generation_sha256: str) -> dict[str, str]:
         return {
@@ -4125,7 +4215,9 @@ class RichArchiveStore:
         *,
         copy_current: bool = True,
         lock_token: ArchiveLockToken | None = None,
+        run_context: ArchiveRunContext | None = None,
     ) -> Path:
+        _, lock_token = self._managed_run_registration(run_context, lock_token)
         run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
         try:
             with self._borrow_lock(lock_token):
@@ -4271,7 +4363,10 @@ class RichArchiveStore:
                 )
                 budget_reservation = (budget, exact_capacity)
             stage = self.create_stage(
-                generation_id, copy_current=True, lock_token=lock_token,
+                generation_id,
+                copy_current=True,
+                lock_token=lock_token,
+                run_context=run_context,
             )
             self._require_active_lock_lease(lock_token)
             if downloader is not None:
@@ -4305,7 +4400,11 @@ class RichArchiveStore:
             if not local["ok"]:
                 raise GenerationError("staged generation failed local verification")
             self.publish_stage(
-                stage, generation_id, manifest["generationSha256"], lock_token=lock_token,
+                stage,
+                generation_id,
+                manifest["generationSha256"],
+                lock_token=lock_token,
+                run_context=run_context,
             )
             published = True
             return {"generationId": generation_id, "verified": True, **local}
@@ -4513,6 +4612,7 @@ class RichArchiveStore:
         require_full_gate: bool = False,
         live_evidence_token: LiveEvidenceToken | None = None,
         lock_token: ArchiveLockToken | None = None,
+        run_context: ArchiveRunContext | None = None,
     ) -> None:
         full_registration: dict[str, Any] | None = None
         run_registration: dict[str, Any] | None = None
@@ -4521,18 +4621,24 @@ class RichArchiveStore:
         lease: dict[str, Any] | None = None
         run_lease: dict[str, Any] | None = None
         try:
-            if require_full_gate and lock_token is None:
+            if require_full_gate:
                 initial_full_registration = _require_live_evidence_token(
                     live_evidence_token,
                     root=stage,
                     allowed_states={"prepared"},
                 )
-                initial_run_registration = _require_run_context(
-                    initial_full_registration["runContext"](),
+                evidence_run_context = initial_full_registration["runContext"]()
+                if run_context is not None and run_context is not evidence_run_context:
+                    raise RichArchiveError(
+                        "full publish run context does not match live evidence"
+                    )
+                run_context = evidence_run_context
+                _require_run_context(
+                    run_context,
                     kind="full_rebuild",
                     entry_root=initial_full_registration["entryRoot"],
                 )
-                lock_token = initial_run_registration["lockToken"]
+            _, lock_token = self._managed_run_registration(run_context, lock_token)
             run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
             lease = self._begin_lock_lease(lock_token)
             generation_id = _validated_generation_id(generation_id)
@@ -4634,7 +4740,13 @@ class RichArchiveStore:
                     if require_full_gate:
                         _consume_live_evidence_token(live_evidence_token)
 
-    def recover_journal(self, *, lock_token: ArchiveLockToken | None = None) -> dict[str, Any]:
+    def recover_journal(
+        self,
+        *,
+        lock_token: ArchiveLockToken | None = None,
+        run_context: ArchiveRunContext | None = None,
+    ) -> dict[str, Any]:
+        _, lock_token = self._managed_run_registration(run_context, lock_token)
         with _borrow_active_run_entry(self.entry_root, lock_token), self._borrow_lock(lock_token):
             _require_active_run_entry_lock(self.entry_root, lock_token)
             return self._recover_journal_under_lease(lock_token=lock_token)

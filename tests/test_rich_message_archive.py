@@ -189,6 +189,60 @@ def _cross_process_merge_worker(
             lock_token.close()
 
 
+def _cross_process_publish_worker(
+    archive_root_text,
+    lock_name,
+    label,
+    stage_text,
+    generation_id,
+    generation_sha256,
+    ready,
+    release,
+    result_queue,
+    use_run_context,
+):
+    """Race public publish through canonical versus caller-selected lock paths."""
+    archive_root = Path(archive_root_text)
+    store = rich.RichArchiveStore(
+        archive_root / "test/entry",
+        lock_path=archive_root / lock_name,
+    )
+    lock_token = None
+    run_context = None
+    try:
+        lock_token = store.acquire_lock()
+        if use_run_context:
+            run_context = rich.begin_incremental_run(
+                entries=[inventory_entry()],
+                archive_root=archive_root,
+                lock_token=lock_token,
+            )
+            original = rich.RichArchiveStore._require_stage_base_current_unchanged
+
+            def gated_compare(self, stage):
+                original(self, stage)
+                ready.set()
+                if not release.wait(timeout=10):
+                    raise RuntimeError("multiprocess public publish gate timed out")
+
+            rich.RichArchiveStore._require_stage_base_current_unchanged = gated_compare
+        store.publish_stage(
+            Path(stage_text),
+            generation_id,
+            generation_sha256,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
+        result_queue.put((label, "ok"))
+    except BaseException as exc:
+        result_queue.put((label, "error", type(exc).__name__, str(exc)))
+    finally:
+        if run_context is not None:
+            run_context.close()
+        elif lock_token is not None:
+            lock_token.close()
+
+
 def full_run_context(archive_root, entries=None, *, limits=None):
     rows = list(entries if entries is not None else [inventory_entry()])
     lock_token = archive_run_lock(archive_root)
@@ -842,8 +896,19 @@ def test_downloader_rejects_oversize_and_truncated_stream(tmp_path):
 
 
 def write_initial_generation(store, tmp_path, record):
-    with store.acquire_lock() as lock_token:
-        stage = store.create_stage("initial", copy_current=False, lock_token=lock_token)
+    relative_path = store.entry_root.relative_to(Path(tmp_path).absolute()).as_posix()
+    run_context = incremental_run_context(tmp_path, entries=[inventory_entry(
+        channel_id=record["channelId"],
+        relative_path=relative_path,
+    )])
+    try:
+        lock_token = context_lock_token(run_context)
+        stage = store.create_stage(
+            "initial",
+            copy_current=False,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
         rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
         rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
         rich.atomic_json(stage / "receipts/rich-archive-latest.json", {
@@ -858,7 +923,10 @@ def write_initial_generation(store, tmp_path, record):
             "initial",
             manifest["generationSha256"],
             lock_token=lock_token,
+            run_context=run_context,
         )
+    finally:
+        run_context.close()
 
 
 def test_generation_pointer_is_atomic_checksummed_and_never_claims_full_pass(tmp_path):
@@ -903,7 +971,12 @@ def test_real_full_pass_receipt_binds_non_self_referential_content_hash(tmp_path
     run_context = full_run_context(tmp_path)
     try:
         lock_token = context_lock_token(run_context)
-        stage = store.create_stage("full-pass", copy_current=False, lock_token=lock_token)
+        stage = store.create_stage(
+            "full-pass",
+            copy_current=False,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
         rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
         rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
         store.reserve_full_stage_assets(
@@ -952,8 +1025,12 @@ def test_cross_generation_install_rejects_and_consumes_bound_token(tmp_path):
     store = make_store(tmp_path)
     with full_run_context(tmp_path) as run_context:
         lock_token = context_lock_token(run_context)
-        bound_stage = store.create_stage("bound", copy_current=False, lock_token=lock_token)
-        wrong_stage = store.create_stage("wrong", copy_current=False, lock_token=lock_token)
+        bound_stage = store.create_stage(
+            "bound", copy_current=False, lock_token=lock_token, run_context=run_context,
+        )
+        wrong_stage = store.create_stage(
+            "wrong", copy_current=False, lock_token=lock_token, run_context=run_context,
+        )
         token = live_evidence(store, "bound", run_context, [])
         with pytest.raises(rich.GenerationError, match="another transaction"):
             store.install_full_pass_evidence(
@@ -975,7 +1052,12 @@ def test_publish_failure_consumes_token_and_blocks_replay(tmp_path):
     record = normalize()
     with full_run_context(tmp_path) as run_context:
         lock_token = context_lock_token(run_context)
-        stage = store.create_stage("publish-failure", copy_current=False, lock_token=lock_token)
+        stage = store.create_stage(
+            "publish-failure",
+            copy_current=False,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
         rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
         rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
         store.reserve_full_stage_assets(
@@ -1015,8 +1097,12 @@ def test_publish_failure_consumes_token_and_blocks_replay(tmp_path):
 def test_forged_pass_receipt_is_rejected(tmp_path):
     store = make_store(tmp_path)
     record = normalize()
-    with store.acquire_lock() as lock_token:
-        stage = store.create_stage("forged", copy_current=False, lock_token=lock_token)
+    with incremental_run_context(tmp_path) as run_context:
+        stage = store.create_stage(
+            "forged",
+            copy_current=False,
+            run_context=run_context,
+        )
     rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
     rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
     rich.atomic_json(stage / "receipts/rich-archive-latest.json", {
@@ -1046,8 +1132,14 @@ def test_generation_journal_recovery_does_not_publish_unselected_generation(tmp_
     store = make_store(tmp_path)
     record = normalize()
     write_initial_generation(store, tmp_path, record)
-    with store.acquire_lock() as lock_token:
-        stage = store.create_stage("next", copy_current=True, lock_token=lock_token)
+    with incremental_run_context(tmp_path) as run_context:
+        lock_token = context_lock_token(run_context)
+        stage = store.create_stage(
+            "next",
+            copy_current=True,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
         manifest = rich.generation_inventory(stage)
         rich.atomic_json(stage / "generation-manifest.json", manifest)
         final = store.generations / "next"
@@ -1059,7 +1151,10 @@ def test_generation_journal_recovery_does_not_publish_unselected_generation(tmp_
             "generationSha256": manifest["generationSha256"],
         }))
 
-        outcome = store.recover_journal(lock_token=lock_token)
+        outcome = store.recover_journal(
+            lock_token=lock_token,
+            run_context=run_context,
+        )
     assert outcome["action"] == "retain_unpublished_generation"
     assert store.resolve_current().name == "initial"
 
@@ -1074,9 +1169,9 @@ def test_journal_checksum_and_generation_path_are_fail_closed(tmp_path):
         "generationSha256": "a" * 64,
         "journalSha256": "b" * 64,
     })
-    with store.acquire_lock() as lock_token:
+    with incremental_run_context(tmp_path) as run_context:
         with pytest.raises(rich.GenerationError):
-            store.recover_journal(lock_token=lock_token)
+            store.recover_journal(run_context=run_context)
 
 
 def test_shared_lock_rejects_symlink_and_insecure_mode(tmp_path):
@@ -1221,34 +1316,113 @@ def test_historical_observation_render_preserves_full_source_payload():
 )
 def test_reserved_generation_ids_are_rejected(generation_id, tmp_path):
     store = make_store(tmp_path)
-    with store.acquire_lock() as lock_token:
+    with incremental_run_context(tmp_path) as run_context:
         with pytest.raises(rich.GenerationError, match="unsafe"):
             store.create_stage(
                 generation_id,
                 copy_current=False,
-                lock_token=lock_token,
+                run_context=run_context,
             )
 
 
 def test_mutation_apis_require_live_matching_lock_token(tmp_path):
     store = make_store(tmp_path)
-    with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
+    with pytest.raises(rich.RichArchiveError, match="run context"):
         store.create_stage("one", copy_current=False)
-    with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
+    with pytest.raises(rich.RichArchiveError, match="run context"):
         store.recover_journal()
 
     token = store.acquire_lock()
     token.close()
-    with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
-        store.create_stage("closed", copy_current=False, lock_token=token)
+    with pytest.raises(rich.RichArchiveError, match="held backup lock token"):
+        rich.begin_incremental_run(
+            entries=[inventory_entry()],
+            archive_root=tmp_path,
+            lock_token=token,
+        )
 
     other = rich.RichArchiveStore(
         tmp_path / "other-entry",
         lock_path=tmp_path / "other.lock",
     )
-    with store.acquire_lock() as valid:
-        with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
-            other.create_stage("wrong-lock", copy_current=False, lock_token=valid)
+    with incremental_run_context(
+        tmp_path,
+        entries=[inventory_entry(relative_path="other-entry")],
+    ) as run_context:
+        with pytest.raises(rich.RichArchiveError, match="canonical backup lock"):
+            other.create_stage(
+                "wrong-lock",
+                copy_current=False,
+                run_context=run_context,
+            )
+        with pytest.raises(rich.RichArchiveError, match="canonical backup lock"):
+            other.publish_stage(
+                tmp_path / "nonexistent-stage",
+                "wrong-lock-publish",
+                "0" * 64,
+                run_context=run_context,
+            )
+        with pytest.raises(rich.RichArchiveError, match="canonical backup lock"):
+            other.recover_journal(run_context=run_context)
+    assert not other.entry_root.exists()
+
+
+def test_public_create_stage_requires_run_capability_before_filesystem_mutation(tmp_path):
+    store = make_store(tmp_path)
+    with store.acquire_lock() as lock_token:
+        with pytest.raises(rich.RichArchiveError, match="run context"):
+            store.create_stage(
+                "unscoped-create",
+                copy_current=False,
+                lock_token=lock_token,
+                run_context=None,
+            )
+    assert not store.entry_root.exists()
+
+
+def test_public_publish_stage_requires_run_capability_before_managed_mutation(tmp_path):
+    store = make_store(tmp_path)
+    with store.acquire_lock() as lock_token:
+        lease = store._begin_lock_lease(lock_token)
+        try:
+            stage = store._create_stage_under_lease(
+                "unscoped-publish",
+                copy_current=False,
+                lock_token=lock_token,
+            )
+        finally:
+            store._end_lock_lease(lease)
+        rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [normalize()])
+        rich._atomic_bytes(
+            stage / "raw/2026-09-05.md",
+            rich.render_day([normalize()]).encode(),
+        )
+        rich.atomic_json(stage / "receipts/rich-archive-latest.json", {
+            "schemaVersion": rich.ENTRY_RECEIPT_SCHEMA,
+            "gateStatus": "INCOMPLETE",
+            "reason": "capability-regression",
+        })
+        manifest = rich.generation_inventory(stage)
+        rich.atomic_json(stage / "generation-manifest.json", manifest)
+        with pytest.raises(rich.RichArchiveError, match="run context"):
+            store.publish_stage(
+                stage,
+                "unscoped-publish",
+                manifest["generationSha256"],
+                lock_token=lock_token,
+                run_context=None,
+            )
+    assert not store.pointer_path.exists()
+    assert not store.journal_path.exists()
+    assert not (store.generations / "unscoped-publish").exists()
+
+
+def test_public_recover_journal_requires_run_capability_before_mutation(tmp_path):
+    store = make_store(tmp_path)
+    with store.acquire_lock() as lock_token:
+        with pytest.raises(rich.RichArchiveError, match="run context"):
+            store.recover_journal(lock_token=lock_token, run_context=None)
+    assert not store.entry_root.exists()
 
 
 def test_unregistered_same_inode_lock_token_is_rejected_even_with_private_guard(tmp_path):
@@ -1256,15 +1430,22 @@ def test_unregistered_same_inode_lock_token_is_rejected_even_with_private_guard(
     store.lock_path.touch(mode=0o600)
     forged = rich.ArchiveLockToken(guard=rich._LOCK_TOKEN_GUARD)
     try:
-        with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
-            store.create_stage("forged-lock", copy_current=False, lock_token=forged)
+        with incremental_run_context(tmp_path) as run_context:
+            with pytest.raises(rich.RichArchiveError, match="bound lock token"):
+                store.create_stage(
+                    "forged-lock",
+                    copy_current=False,
+                    lock_token=forged,
+                    run_context=run_context,
+                )
     finally:
         forged.close()
 
 
 def test_registered_lock_token_object_identity_cannot_be_copied(tmp_path):
     store = make_store(tmp_path)
-    with store.acquire_lock() as valid:
+    with incremental_run_context(tmp_path) as run_context:
+        valid = context_lock_token(run_context)
         for forbidden in ("path", "_path", "handle", "_handle", "descriptor", "_descriptor", "fd", "_fd"):
             assert not hasattr(valid, forbidden)
         copied = object.__new__(rich.ArchiveLockToken)
@@ -1272,8 +1453,13 @@ def test_registered_lock_token_object_identity_cannot_be_copied(tmp_path):
         copied._pid = valid._pid
         copied._closed = valid._closed
         try:
-            with pytest.raises(rich.RichArchiveError, match="lock ownership token"):
-                store.create_stage("copied-lock", copy_current=False, lock_token=copied)
+            with pytest.raises(rich.RichArchiveError, match="bound lock token"):
+                store.create_stage(
+                    "copied-lock",
+                    copy_current=False,
+                    lock_token=copied,
+                    run_context=run_context,
+                )
         finally:
             copied.close()
 
@@ -1283,13 +1469,13 @@ def test_symlinked_entry_ancestor_is_rejected_before_archive_mutation(tmp_path):
     outside.mkdir()
     linked = tmp_path / "linked"
     linked.symlink_to(outside, target_is_directory=True)
-    store = rich.RichArchiveStore(
-        linked / "entry",
-        lock_path=tmp_path / LOCK_NAME,
-    )
-    with store.acquire_lock() as lock_token:
+    with archive_run_lock(tmp_path) as lock_token:
         with pytest.raises(rich.RichArchiveError, match="symlinked"):
-            store.create_stage("blocked", copy_current=False, lock_token=lock_token)
+            rich.begin_incremental_run(
+                entries=[inventory_entry(relative_path="linked/entry")],
+                archive_root=tmp_path,
+                lock_token=lock_token,
+            )
     assert not (outside / "entry").exists()
 
 
@@ -1311,7 +1497,12 @@ def test_full_pass_receipt_recomputes_counts_and_rejects_tampering(tmp_path):
     record = normalize()
     with full_run_context(tmp_path) as run_context:
         lock_token = context_lock_token(run_context)
-        stage = store.create_stage("tamper-pass", copy_current=False, lock_token=lock_token)
+        stage = store.create_stage(
+            "tamper-pass",
+            copy_current=False,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
         rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
         rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
         store.reserve_full_stage_assets(
@@ -1343,7 +1534,12 @@ def test_live_evidence_identity_cutoff_fingerprint_and_immutable_binding_fail_cl
     record = normalize()
     with full_run_context(tmp_path) as run_context:
         lock_token = context_lock_token(run_context)
-        stage = store.create_stage(f"bad-{mutation}", copy_current=False, lock_token=lock_token)
+        stage = store.create_stage(
+            f"bad-{mutation}",
+            copy_current=False,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
         rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
         rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
         store.reserve_full_stage_assets(
@@ -1382,7 +1578,12 @@ def test_truly_empty_full_pass_requires_concrete_terminal_inventory_evidence(tmp
     store = make_store(tmp_path)
     with full_run_context(tmp_path) as run_context:
         lock_token = context_lock_token(run_context)
-        stage = store.create_stage("empty-pass", copy_current=False, lock_token=lock_token)
+        stage = store.create_stage(
+            "empty-pass",
+            copy_current=False,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
         store.reserve_full_stage_assets(
             stage,
             run_context=run_context,
@@ -1592,8 +1793,13 @@ def test_one_asset_budget_is_consumed_across_two_entry_merges(tmp_path):
     assert len(opener.requests) == 1
 
 
-def _write_incomplete_stage(store, generation_id, record, lock_token):
-    stage = store.create_stage(generation_id, copy_current=False, lock_token=lock_token)
+def _write_incomplete_stage(store, generation_id, record, lock_token, run_context):
+    stage = store.create_stage(
+        generation_id,
+        copy_current=False,
+        lock_token=lock_token,
+        run_context=run_context,
+    )
     rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
     rich._atomic_bytes(stage / "raw/2026-09-05.md", rich.render_day([record]).encode())
     rich.atomic_json(stage / "receipts/rich-archive-latest.json", {
@@ -1654,7 +1860,7 @@ def test_live_evidence_expiry_during_runtime_verify_blocks_first_mutation(monkey
         lock_token = context_lock_token(run_context)
         with store._borrow_lock(lock_token):
             stage, _manifest = _write_incomplete_stage(
-                store, "expires-during-verify", record, lock_token,
+                store, "expires-during-verify", record, lock_token, run_context,
             )
             store.reserve_full_stage_assets(
                 stage,
@@ -1705,9 +1911,10 @@ def test_live_evidence_expiry_during_runtime_verify_blocks_first_mutation(monkey
 
 def test_lock_close_waits_for_inflight_publish_before_unlock(monkeypatch, tmp_path):
     store = make_store(tmp_path)
-    lock_token = store.acquire_lock()
+    run_context = incremental_run_context(tmp_path)
+    lock_token = context_lock_token(run_context)
     stage, manifest = _write_incomplete_stage(
-        store, "close-during-publish", normalize(), lock_token,
+        store, "close-during-publish", normalize(), lock_token, run_context,
     )
     original_verify = rich.verify_generation
     entered = threading.Event()
@@ -1730,6 +1937,7 @@ def test_lock_close_waits_for_inflight_publish_before_unlock(monkeypatch, tmp_pa
                 "close-during-publish",
                 manifest["generationSha256"],
                 lock_token=lock_token,
+                run_context=run_context,
             )
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
@@ -1745,7 +1953,7 @@ def test_lock_close_waits_for_inflight_publish_before_unlock(monkeypatch, tmp_pa
     finally:
         release.set()
         worker.join(timeout=5)
-        lock_token.close()
+        run_context.close()
     assert not worker.is_alive()
     assert errors == []
     assert lock_token.closed
@@ -1777,7 +1985,10 @@ def test_materialized_stage_cannot_bypass_zero_full_run_asset_quota(tmp_path):
         lock_token = context_lock_token(run_context)
         with store._borrow_lock(lock_token):
             stage = store.create_stage(
-                "manual-materialized-asset", copy_current=False, lock_token=lock_token,
+                "manual-materialized-asset",
+                copy_current=False,
+                lock_token=lock_token,
+                run_context=run_context,
             )
             record = rich.apply_asset_results(normalize(source), downloader, stage)
             rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", [record])
@@ -1813,9 +2024,10 @@ def test_materialized_stage_cannot_bypass_zero_full_run_asset_quota(tmp_path):
 
 def test_same_lock_token_rejects_concurrent_cross_thread_mutation(monkeypatch, tmp_path):
     store = make_store(tmp_path)
-    lock_token = store.acquire_lock()
+    run_context = incremental_run_context(tmp_path)
+    lock_token = context_lock_token(run_context)
     stage, manifest = _write_incomplete_stage(
-        store, "first-thread-publish", normalize(), lock_token,
+        store, "first-thread-publish", normalize(), lock_token, run_context,
     )
     original_verify = rich.verify_generation
     entered = threading.Event()
@@ -1838,6 +2050,7 @@ def test_same_lock_token_rejects_concurrent_cross_thread_mutation(monkeypatch, t
                 "first-thread-publish",
                 manifest["generationSha256"],
                 lock_token=lock_token,
+                run_context=run_context,
             )
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
@@ -1851,11 +2064,12 @@ def test_same_lock_token_rejects_concurrent_cross_thread_mutation(monkeypatch, t
                 "second-thread-stage",
                 copy_current=False,
                 lock_token=lock_token,
+                run_context=run_context,
             )
     finally:
         release.set()
         worker.join(timeout=5)
-        lock_token.close()
+        run_context.close()
     assert not worker.is_alive()
     assert errors == []
     assert store.resolve_current().name == "first-thread-publish"
@@ -1918,6 +2132,90 @@ def test_run_context_close_waits_for_inflight_merge(monkeypatch, tmp_path):
     assert lock_token.closed
     assert str(tmp_path.absolute()) not in rich._ACTIVE_ARCHIVE_ROOT_RUNS
     assert store.resolve_current().name == "run-close-merge"
+    with incremental_run_context(tmp_path):
+        pass
+
+
+def test_open_run_pins_bound_lock_across_direct_token_close_request(tmp_path):
+    store = make_store(tmp_path)
+    write_initial_generation(store, tmp_path, normalize())
+    run_context = incremental_run_context(tmp_path)
+    lock_token = context_lock_token(run_context)
+    try:
+        lock_token.close()
+        assert not lock_token.closed
+        assert rich._require_run_context(run_context) is not None
+        with pytest.raises(rich.RichArchiveError, match="busy"):
+            archive_run_lock(tmp_path)
+        result = store.merge_messages(
+            [message(id="1540000000000000002", content="pinned run survives close request")],
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            observed_at=OBSERVED,
+            generation_id="pinned-close-request",
+            run_context=run_context,
+        )
+        assert result["verified"] is True
+    finally:
+        run_context.close()
+    assert run_context.closed
+    assert lock_token.closed
+    assert store.resolve_current().name == "pinned-close-request"
+    with incremental_run_context(tmp_path):
+        pass
+
+
+def test_finalize_removes_run_registry_before_last_lock_pin_release(
+    monkeypatch,
+    tmp_path,
+):
+    run_context = full_run_context(tmp_path)
+    lock_token = context_lock_token(run_context)
+    registration = rich._require_run_context(run_context)
+    entered = threading.Event()
+    release = threading.Event()
+    receipts = []
+    errors = []
+    original_release_pin = rich._release_run_lock_pin
+
+    def blocking_release_pin(pin, *, request_close=True):
+        if pin is registration["lockRunPin"] and request_close:
+            assert str(tmp_path.absolute()) not in rich._ACTIVE_ARCHIVE_ROOT_RUNS
+            assert run_context.closed
+            assert not lock_token.closed
+            entered.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("run-pin cleanup gate timed out")
+        return original_release_pin(pin, request_close=request_close)
+
+    monkeypatch.setattr(rich, "_release_run_lock_pin", blocking_release_pin)
+    lock_token.close()
+    assert not lock_token.closed
+
+    def finalize():
+        try:
+            receipts.append(rich.finalize_full_rebuild_run(run_context))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=finalize, name="run-pin-finalizer")
+    worker.start()
+    try:
+        assert entered.wait(timeout=10)
+        assert str(tmp_path.absolute()) not in rich._ACTIVE_ARCHIVE_ROOT_RUNS
+        assert not lock_token.closed
+        with pytest.raises(rich.RichArchiveError, match="busy"):
+            archive_run_lock(tmp_path)
+    finally:
+        release.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert not errors
+    assert len(receipts) == 1
+    assert receipts[0]["gateStatus"] == "FAIL"
+    assert run_context.closed
+    assert lock_token.closed
     with incremental_run_context(tmp_path):
         pass
 
@@ -2112,6 +2410,120 @@ def test_cross_process_alternate_lock_cannot_publish_lost_update(tmp_path):
     assert alternate_message_id not in final_ids
 
 
+def test_cross_process_public_publish_rejects_alternate_requested_lock(tmp_path):
+    store = make_store(tmp_path)
+    write_initial_generation(store, tmp_path, normalize())
+    with incremental_run_context(tmp_path) as setup_context:
+        canonical_stage = store.create_stage(
+            "public-race-canonical",
+            run_context=setup_context,
+        )
+        alternate_stage = store.create_stage(
+            "public-race-alternate",
+            run_context=setup_context,
+        )
+
+        def populate(stage, source):
+            rows = rich.merge_day_records(
+                rich.load_jsonl(stage / "canonical/2026-09-05.jsonl"),
+                [normalize(source)],
+            )
+            rich.atomic_jsonl(stage / "canonical/2026-09-05.jsonl", rows)
+            rich._atomic_bytes(
+                stage / "raw/2026-09-05.md",
+                rich.render_day(rows).encode(),
+            )
+            manifest = rich.generation_inventory(stage)
+            rich.atomic_json(stage / "generation-manifest.json", manifest)
+            return manifest
+
+        canonical_id = "1540000000000000002"
+        alternate_id = "1540000000000000003"
+        canonical_manifest = populate(
+            canonical_stage,
+            message(id=canonical_id, content="canonical public publish"),
+        )
+        alternate_manifest = populate(
+            alternate_stage,
+            message(id=alternate_id, content="alternate public publish"),
+        )
+
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    release = context.Event()
+    result_queue = context.Queue()
+    canonical_worker = context.Process(
+        target=_cross_process_publish_worker,
+        args=(
+            str(tmp_path),
+            LOCK_NAME,
+            "canonical",
+            str(canonical_stage),
+            "public-race-canonical",
+            canonical_manifest["generationSha256"],
+            ready,
+            release,
+            result_queue,
+            True,
+        ),
+    )
+    alternate_worker = context.Process(
+        target=_cross_process_publish_worker,
+        args=(
+            str(tmp_path),
+            "alternate.lock",
+            "alternate",
+            str(alternate_stage),
+            "public-race-alternate",
+            alternate_manifest["generationSha256"],
+            context.Event(),
+            release,
+            result_queue,
+            False,
+        ),
+    )
+    canonical_worker.start()
+    try:
+        assert ready.wait(timeout=10)
+        alternate_worker.start()
+        alternate_worker.join(timeout=10)
+        assert not alternate_worker.is_alive()
+    finally:
+        release.set()
+        canonical_worker.join(timeout=10)
+        if canonical_worker.is_alive():
+            canonical_worker.terminate()
+            canonical_worker.join(timeout=5)
+        if alternate_worker.pid is not None and alternate_worker.is_alive():
+            alternate_worker.terminate()
+            alternate_worker.join(timeout=5)
+
+    assert canonical_worker.exitcode == 0
+    assert alternate_worker.exitcode == 0
+    results = {}
+    for _ in range(2):
+        try:
+            row = result_queue.get(timeout=5)
+        except queue.Empty:
+            pytest.fail("public publish worker omitted its result")
+        results[row[0]] = row[1:]
+    assert results["canonical"] == ("ok",)
+    assert results["alternate"][0] == "error"
+    assert "run context" in results["alternate"][2].lower()
+    assert alternate_stage.is_dir()
+    assert not (store.generations / "public-race-alternate").exists()
+
+    current = store.resolve_current()
+    assert current is not None and current.name == "public-race-canonical"
+    final_ids = {
+        row["messageId"]
+        for path in (current / "canonical").glob("*.jsonl")
+        for row in rich.load_jsonl(path)
+    }
+    assert canonical_id in final_ids
+    assert alternate_id not in final_ids
+
+
 def test_parallel_asset_reservation_failure_does_not_poison_shared_budget(tmp_path):
     limits = rich.AssetLimits(
         full_run_files=1,
@@ -2156,12 +2568,19 @@ def test_parallel_asset_reservation_failure_does_not_poison_shared_budget(tmp_pa
 def test_publish_rejects_stage_when_current_changed_after_copy(tmp_path):
     store = make_store(tmp_path)
     write_initial_generation(store, tmp_path, normalize())
-    with store.acquire_lock() as lock_token:
+    with incremental_run_context(tmp_path) as run_context:
+        lock_token = context_lock_token(run_context)
         first_stage = store.create_stage(
-            "stale-cas-first", copy_current=True, lock_token=lock_token,
+            "stale-cas-first",
+            copy_current=True,
+            lock_token=lock_token,
+            run_context=run_context,
         )
         second_stage = store.create_stage(
-            "stale-cas-second", copy_current=True, lock_token=lock_token,
+            "stale-cas-second",
+            copy_current=True,
+            lock_token=lock_token,
+            run_context=run_context,
         )
         stage_data = [
             (first_stage, normalize(message(id="1540000000000000002", content="first"))),
@@ -2186,6 +2605,7 @@ def test_publish_rejects_stage_when_current_changed_after_copy(tmp_path):
             "stale-cas-first",
             manifests[0]["generationSha256"],
             lock_token=lock_token,
+            run_context=run_context,
         )
         with pytest.raises(rich.GenerationError, match="CURRENT.*changed|stale"):
             store.publish_stage(
@@ -2193,6 +2613,7 @@ def test_publish_rejects_stage_when_current_changed_after_copy(tmp_path):
                 "stale-cas-second",
                 manifests[1]["generationSha256"],
                 lock_token=lock_token,
+                run_context=run_context,
             )
 
     current = store.resolve_current()
