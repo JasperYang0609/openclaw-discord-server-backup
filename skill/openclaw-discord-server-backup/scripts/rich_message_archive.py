@@ -34,7 +34,7 @@ import urllib.request
 import weakref
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -50,6 +50,7 @@ DISCORD_PAGE_RESPONSE_SCHEMA = "openclaw-discord-page-response.v1"
 DISCORD_INVENTORY_RESPONSE_SCHEMA = "openclaw-discord-inventory-response.v1"
 FULL_RUN_RECEIPT_SCHEMA = "openclaw-discord-full-rebuild-run.v1"
 ASSET_RESERVATION_SCHEMA = "openclaw-discord-full-run-asset-reservation.v1"
+STAGE_BASE_SCHEMA = "openclaw-discord-stage-base-current.v1"
 SOURCE_CENSUS_SCHEMA = "openclaw-discord-source-census.v2"
 DEFAULT_LIVE_EVIDENCE_TTL_SECONDS = 300.0
 MAX_LIVE_EVIDENCE_TTL_SECONDS = 900.0
@@ -1481,6 +1482,11 @@ class AssetRunBudget:
     probe_budget: AssetProbeBudget
     file_count: int = 0
     declared_bytes: int = 0
+    _mutex: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def from_limits(cls, limits: AssetLimits) -> "AssetRunBudget":
@@ -1494,25 +1500,80 @@ class AssetRunBudget:
         assume_unknown_max: bool,
         assets_materialized: bool = False,
     ) -> dict[str, int]:
-        return preflight_asset_capacity(
-            assets,
-            destination_root,
-            limits=self.limits,
-            run_file_count=self.file_count,
-            run_declared_bytes=self.declared_bytes,
-            assume_unknown_max=assume_unknown_max,
-            assets_materialized=assets_materialized,
-        )
+        with self._mutex:
+            return preflight_asset_capacity(
+                assets,
+                destination_root,
+                limits=self.limits,
+                run_file_count=self.file_count,
+                run_declared_bytes=self.declared_bytes,
+                assume_unknown_max=assume_unknown_max,
+                assets_materialized=assets_materialized,
+            )
 
     def commit_entry(self, result: Mapping[str, Any]) -> None:
         files = result.get("files")
         declared = result.get("declaredBytes")
-        if not isinstance(files, int) or not isinstance(declared, int):
+        if (
+            not isinstance(files, int)
+            or isinstance(files, bool)
+            or files < 0
+            or not isinstance(declared, int)
+            or isinstance(declared, bool)
+            or declared < 0
+        ):
             raise AssetDownloadError("asset run budget cannot commit invalid preflight totals")
-        self.file_count += files
-        self.declared_bytes += declared
-        if self.file_count > self.limits.full_run_files or self.declared_bytes > self.limits.full_run_bytes:
-            raise AssetDownloadError("full-run asset quota exceeded")
+        with self._mutex:
+            next_file_count = self.file_count + files
+            next_declared_bytes = self.declared_bytes + declared
+            if (
+                next_file_count > self.limits.full_run_files
+                or next_declared_bytes > self.limits.full_run_bytes
+            ):
+                raise AssetDownloadError("full-run asset quota exceeded")
+            self.file_count = next_file_count
+            self.declared_bytes = next_declared_bytes
+
+    def reserve_entry(
+        self,
+        assets: Sequence[Mapping[str, Any]],
+        destination_root: Path,
+        *,
+        assume_unknown_max: bool,
+        assets_materialized: bool = False,
+    ) -> dict[str, int]:
+        """Atomically preflight and consume one entry's cumulative quota."""
+        with self._mutex:
+            result = preflight_asset_capacity(
+                assets,
+                destination_root,
+                limits=self.limits,
+                run_file_count=self.file_count,
+                run_declared_bytes=self.declared_bytes,
+                assume_unknown_max=assume_unknown_max,
+                assets_materialized=assets_materialized,
+            )
+            self.commit_entry(result)
+            return result
+
+    def release_entry(self, result: Mapping[str, Any]) -> None:
+        """Roll back a prior file/byte reservation without restoring probes."""
+        files = result.get("files")
+        declared = result.get("declaredBytes")
+        if (
+            not isinstance(files, int)
+            or isinstance(files, bool)
+            or files < 0
+            or not isinstance(declared, int)
+            or isinstance(declared, bool)
+            or declared < 0
+        ):
+            raise AssetDownloadError("asset run budget cannot release invalid totals")
+        with self._mutex:
+            if files > self.file_count or declared > self.declared_bytes:
+                raise AssetDownloadError("asset run budget release would underflow")
+            self.file_count -= files
+            self.declared_bytes -= declared
 
 
 def preflight_asset_capacity(
@@ -2089,6 +2150,60 @@ def _validated_page_response(
 
 _RUN_CONTEXT_GUARD = object()
 _RUN_CONTEXT_REGISTRY: dict[str, dict[str, Any]] = {}
+_RUN_CONTEXT_REGISTRY_MUTEX = threading.RLock()
+_ACTIVE_ARCHIVE_ROOT_RUNS: dict[str, str] = {}
+_ACTIVE_ENTRY_ROOT_RUNS: dict[str, str] = {}
+
+
+def _remove_run_context_registration_locked(
+    nonce: str,
+    *,
+    expected_context: ArchiveRunContext | None = None,
+) -> ArchiveLockToken | None:
+    """Remove an idle run registration while the registry mutex is held."""
+    registration = _RUN_CONTEXT_REGISTRY.get(nonce)
+    if registration is None:
+        if expected_context is not None:
+            expected_context._closed = True
+        return None
+    context = registration.get("context")()
+    if expected_context is not None and context is not expected_context:
+        return None
+    if registration.get("borrowCount", 0) > 0:
+        registration["closing"] = True
+        return None
+    _RUN_CONTEXT_REGISTRY.pop(nonce, None)
+    archive_key = str(registration["archiveRoot"])
+    if _ACTIVE_ARCHIVE_ROOT_RUNS.get(archive_key) == nonce:
+        _ACTIVE_ARCHIVE_ROOT_RUNS.pop(archive_key, None)
+    for entry_root in registration["entryRoots"].values():
+        entry_key = str(entry_root)
+        if _ACTIVE_ENTRY_ROOT_RUNS.get(entry_key) == nonce:
+            _ACTIVE_ENTRY_ROOT_RUNS.pop(entry_key, None)
+    if context is not None:
+        context._closed = True
+    return registration["lockToken"]
+
+
+def _release_run_context_registration(
+    nonce: str,
+    *,
+    expected_context: ArchiveRunContext | None = None,
+) -> bool:
+    """Release an idle run, or defer release until active operations finish."""
+    with _RUN_CONTEXT_REGISTRY_MUTEX:
+        existed = nonce in _RUN_CONTEXT_REGISTRY
+        lock_token = _remove_run_context_registration_locked(
+            nonce,
+            expected_context=expected_context,
+        )
+        removed = existed and nonce not in _RUN_CONTEXT_REGISTRY
+        if not existed and expected_context is not None:
+            expected_context._closed = True
+            removed = True
+    if lock_token is not None:
+        lock_token.close()
+    return removed
 
 
 class ArchiveRunContext:
@@ -2109,10 +2224,12 @@ class ArchiveRunContext:
         return self._closed
 
     def close(self) -> None:
-        registration = _RUN_CONTEXT_REGISTRY.get(self._nonce)
-        if registration is not None and registration.get("context")() is self:
-            _RUN_CONTEXT_REGISTRY.pop(self._nonce, None)
-        self._closed = True
+        if self._closed:
+            return
+        _release_run_context_registration(
+            self._nonce,
+            expected_context=self,
+        )
 
     def __enter__(self) -> "ArchiveRunContext":
         return self
@@ -2134,14 +2251,14 @@ def _mint_run_context(
     kind: str,
     entries: Sequence[Mapping[str, str]],
     archive_root: Path,
+    lock_token: ArchiveLockToken,
     limits: AssetLimits,
     inventory_response: Mapping[str, Any] | None,
     expected_entries: Sequence[Mapping[str, str]] | None = None,
 ) -> ArchiveRunContext:
-    context_type = FullRebuildRunContext if kind == "full_rebuild" else IncrementalRunContext
-    context = context_type(kind=kind, guard=_RUN_CONTEXT_GUARD)
     archive_root = _lexical_absolute(archive_root)
     reject_symlink_path(archive_root)
+    lock_identity = _validated_lock_token_identity(lock_token)
     identities = [dict(row) for row in entries]
     digest = json_sha256(identities)
     expected_identities = [dict(row) for row in (expected_entries or identities)]
@@ -2151,31 +2268,58 @@ def _mint_run_context(
         )
         for row in expected_identities
     }
-    _RUN_CONTEXT_REGISTRY[context._nonce] = {
-        "context": weakref.ref(context),
-        "pid": os.getpid(),
-        "kind": kind,
-        "runContextId": secrets.token_hex(32),
-        "archiveRoot": archive_root,
-        "archiveRootSha256": json_sha256(str(archive_root)),
-        "entries": identities,
-        "expectedEntries": expected_identities,
-        "expectedEntriesDigest": json_sha256(expected_identities),
-        "entryKeys": {
-            (row["channelId"], row["normalizedRelativePath"])
-            for row in expected_identities
-        },
-        "entryRoots": entry_roots,
-        "inventoryDigest": digest,
-        "inventoryResponse": (
-            json.loads(json.dumps(inventory_response, ensure_ascii=False))
-            if inventory_response is not None else None
-        ),
-        "budget": AssetRunBudget.from_limits(limits),
-        "assetReservations": {},
-        "usedAssetReservations": set(),
-        "processed": {},
-    }
+    archive_key = str(archive_root)
+    entry_keys = [str(root) for root in entry_roots.values()]
+    with _RUN_CONTEXT_REGISTRY_MUTEX:
+        if archive_key in _ACTIVE_ARCHIVE_ROOT_RUNS:
+            raise RichArchiveError("archive root already has an active backup run")
+        if any(key in _ACTIVE_ENTRY_ROOT_RUNS for key in entry_keys):
+            raise RichArchiveError("archive entry already belongs to an active backup run")
+        context_type = FullRebuildRunContext if kind == "full_rebuild" else IncrementalRunContext
+        context = context_type(kind=kind, guard=_RUN_CONTEXT_GUARD)
+        context_nonce = context._nonce
+        context_ref = weakref.ref(
+            context,
+            lambda _reference, nonce=context_nonce: _release_run_context_registration(nonce),
+        )
+        _RUN_CONTEXT_REGISTRY[context._nonce] = {
+            "context": context_ref,
+            "pid": os.getpid(),
+            "kind": kind,
+            "runContextId": secrets.token_hex(32),
+            "archiveRoot": archive_root,
+            "archiveRootSha256": json_sha256(str(archive_root)),
+            "lockToken": lock_token,
+            "lockTokenNonce": lock_identity["nonce"],
+            "lockPath": lock_identity["path"],
+            "lockPathSha256": json_sha256(str(lock_identity["path"])),
+            "lockDevice": lock_identity["device"],
+            "lockInode": lock_identity["inode"],
+            "entries": identities,
+            "expectedEntries": expected_identities,
+            "expectedEntriesDigest": json_sha256(expected_identities),
+            "entryKeys": {
+                (row["channelId"], row["normalizedRelativePath"])
+                for row in expected_identities
+            },
+            "entryRoots": entry_roots,
+            "inventoryDigest": digest,
+            "inventoryResponse": (
+                json.loads(json.dumps(inventory_response, ensure_ascii=False))
+                if inventory_response is not None else None
+            ),
+            "mutex": threading.RLock(),
+            "borrowCount": 0,
+            "borrowOwners": {},
+            "closing": False,
+            "budget": AssetRunBudget.from_limits(limits),
+            "assetReservations": {},
+            "usedAssetReservations": set(),
+            "processed": {},
+        }
+        _ACTIVE_ARCHIVE_ROOT_RUNS[archive_key] = context._nonce
+        for key in entry_keys:
+            _ACTIVE_ENTRY_ROOT_RUNS[key] = context._nonce
     return context
 
 
@@ -2184,6 +2328,7 @@ def begin_full_rebuild_run(
     fetch_inventory: Callable[[], Mapping[str, Any]],
     expected_entries: Sequence[Mapping[str, Any]],
     archive_root: Path,
+    lock_token: ArchiveLockToken,
     limits: AssetLimits | None = None,
 ) -> FullRebuildRunContext:
     expected = _inventory_identities(expected_entries)
@@ -2197,6 +2342,7 @@ def begin_full_rebuild_run(
         entries=entries,
         expected_entries=expected,
         archive_root=archive_root,
+        lock_token=lock_token,
         limits=limits or AssetLimits(),
         inventory_response=response,
     )
@@ -2208,6 +2354,7 @@ def begin_incremental_run(
     *,
     entries: Sequence[Mapping[str, Any]],
     archive_root: Path,
+    lock_token: ArchiveLockToken,
     limits: AssetLimits | None = None,
 ) -> IncrementalRunContext:
     identities = _inventory_identities(entries)
@@ -2215,6 +2362,7 @@ def begin_incremental_run(
         kind="incremental",
         entries=identities,
         archive_root=archive_root,
+        lock_token=lock_token,
         limits=limits or AssetLimits(),
         inventory_response=None,
     )
@@ -2228,29 +2376,54 @@ def _require_run_context(
     kind: str | None = None,
     identity: Mapping[str, str] | None = None,
     entry_root: Path | None = None,
+    lock_token: ArchiveLockToken | None = None,
 ) -> dict[str, Any]:
-    registration = (
-        _RUN_CONTEXT_REGISTRY.get(context._nonce)
-        if isinstance(context, ArchiveRunContext)
-        else None
-    )
-    if (
-        not isinstance(context, ArchiveRunContext)
-        or context.closed
-        or context._pid != os.getpid()
-        or registration is None
-        or registration.get("context")() is not context
-        or registration.get("pid") != os.getpid()
-        or registration.get("kind") != context._kind
-        or (kind is not None and registration.get("kind") != kind)
-    ):
-        raise RichArchiveError("valid module-minted archive run context is required")
-    if identity is not None:
-        key = (identity["channelId"], identity["normalizedRelativePath"])
-        if key not in registration["entryKeys"]:
-            raise RichArchiveError("archive entry is outside the run context inventory")
-        if entry_root is not None and _lexical_absolute(entry_root) != registration["entryRoots"][key]:
-            raise RichArchiveError("archive entry root does not match the run context identity")
+    with _RUN_CONTEXT_REGISTRY_MUTEX:
+        registration = (
+            _RUN_CONTEXT_REGISTRY.get(context._nonce)
+            if isinstance(context, ArchiveRunContext)
+            else None
+        )
+        if (
+            not isinstance(context, ArchiveRunContext)
+            or context.closed
+            or context._pid != os.getpid()
+            or registration is None
+            or registration.get("context")() is not context
+            or registration.get("pid") != os.getpid()
+            or registration.get("kind") != context._kind
+            or (kind is not None and registration.get("kind") != kind)
+            or _ACTIVE_ARCHIVE_ROOT_RUNS.get(str(registration["archiveRoot"])) != context._nonce
+        ):
+            raise RichArchiveError("valid module-minted archive run context is required")
+        owner_count = registration.get("borrowOwners", {}).get(threading.get_ident(), 0)
+        if registration.get("closing") and owner_count == 0:
+            raise RichArchiveError("archive run context is closing")
+        if identity is not None:
+            key = (identity["channelId"], identity["normalizedRelativePath"])
+            if key not in registration["entryKeys"]:
+                raise RichArchiveError("archive entry is outside the run context inventory")
+            if entry_root is not None and _lexical_absolute(entry_root) != registration["entryRoots"][key]:
+                raise RichArchiveError("archive entry root does not match the run context identity")
+        elif (
+            entry_root is not None
+            and _lexical_absolute(entry_root) not in registration["entryRoots"].values()
+        ):
+            raise RichArchiveError("archive entry root is outside the run context inventory")
+        bound_token = registration["lockToken"]
+        if lock_token is not None and lock_token is not bound_token:
+            raise RichArchiveError("archive run mutation requires its bound lock token")
+        lock_identity = _validated_lock_token_identity(
+            bound_token,
+            allow_closing_owner=True,
+        )
+        if (
+            lock_identity["nonce"] != registration["lockTokenNonce"]
+            or lock_identity["path"] != registration["lockPath"]
+            or lock_identity["device"] != registration["lockDevice"]
+            or lock_identity["inode"] != registration["lockInode"]
+        ):
+            raise RichArchiveError("archive run lock identity changed")
     return registration
 
 
@@ -3279,6 +3452,187 @@ _LOCK_TOKEN_REGISTRY: dict[str, dict[str, Any]] = {}
 _LOCK_TOKEN_REGISTRY_MUTEX = threading.RLock()
 
 
+def _validated_lock_token_identity(
+    lock_token: ArchiveLockToken | None,
+    *,
+    allow_closing_owner: bool = False,
+) -> dict[str, Any]:
+    """Return immutable identity only for a module-issued, currently held lock."""
+    with _LOCK_TOKEN_REGISTRY_MUTEX:
+        registration = (
+            _LOCK_TOKEN_REGISTRY.get(lock_token._nonce)
+            if isinstance(lock_token, ArchiveLockToken)
+            else None
+        )
+        owner_count = (
+            registration.get("borrowOwners", {}).get(threading.get_ident(), 0)
+            if registration is not None else 0
+        )
+        if (
+            not isinstance(lock_token, ArchiveLockToken)
+            or lock_token.closed
+            or lock_token._pid != os.getpid()
+            or registration is None
+            or registration.get("token")() is not lock_token
+            or registration.get("pid") != os.getpid()
+            or (
+                registration.get("closing")
+                and not (allow_closing_owner and owner_count > 0)
+            )
+        ):
+            raise RichArchiveError("valid held backup lock token is required to begin a run")
+        path = registration.get("path")
+        handle = registration.get("handle")
+        if not isinstance(path, Path):
+            raise RichArchiveError("backup lock token path identity is invalid")
+        try:
+            descriptor_info = os.fstat(handle.fileno())
+            path_info = path.lstat()
+        except (AttributeError, OSError, ValueError) as exc:
+            raise RichArchiveError("backup lock token is no longer held") from exc
+        if (
+            descriptor_info.st_dev != registration.get("device")
+            or descriptor_info.st_ino != registration.get("inode")
+            or path_info.st_dev != registration.get("device")
+            or path_info.st_ino != registration.get("inode")
+            or not stat.S_ISREG(path_info.st_mode)
+            or path_info.st_nlink != 1
+            or handle.fileno() != registration.get("descriptor")
+        ):
+            raise RichArchiveError("backup lock token identity no longer matches its file")
+        probe_descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            try:
+                fcntl.flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise RichArchiveError("backup lock ownership probe failed") from exc
+            else:
+                fcntl.flock(probe_descriptor, fcntl.LOCK_UN)
+                raise RichArchiveError("backup lock token does not hold its lock")
+        finally:
+            os.close(probe_descriptor)
+        return {
+            "nonce": lock_token._nonce,
+            "path": path,
+            "device": descriptor_info.st_dev,
+            "inode": descriptor_info.st_ino,
+        }
+
+
+def _active_run_registration_for_entry(entry_root: Path) -> dict[str, Any] | None:
+    entry_key = str(_lexical_absolute(entry_root))
+    with _RUN_CONTEXT_REGISTRY_MUTEX:
+        nonce = _ACTIVE_ENTRY_ROOT_RUNS.get(entry_key)
+        if nonce is None:
+            return None
+        registration = _RUN_CONTEXT_REGISTRY.get(nonce)
+        if registration is None:
+            _ACTIVE_ENTRY_ROOT_RUNS.pop(entry_key, None)
+            return None
+        if registration.get("context")() is None:
+            lock_token = _remove_run_context_registration_locked(nonce)
+            if lock_token is not None:
+                lock_token.close()
+            return None
+        return registration
+
+
+def _require_active_run_entry_lock(
+    entry_root: Path,
+    lock_token: ArchiveLockToken | None,
+) -> dict[str, Any] | None:
+    registration = _active_run_registration_for_entry(entry_root)
+    if registration is None:
+        return None
+    if lock_token is not registration["lockToken"]:
+        raise RichArchiveError("active archive run requires its bound lock token")
+    owner_count = registration.get("borrowOwners", {}).get(threading.get_ident(), 0)
+    if registration.get("closing") and owner_count == 0:
+        raise RichArchiveError("active archive run is closing")
+    identity = _validated_lock_token_identity(
+        lock_token,
+        allow_closing_owner=True,
+    )
+    if (
+        identity["nonce"] != registration["lockTokenNonce"]
+        or identity["path"] != registration["lockPath"]
+        or identity["device"] != registration["lockDevice"]
+        or identity["inode"] != registration["lockInode"]
+    ):
+        raise RichArchiveError("active archive run lock identity changed")
+    return registration
+
+
+def _begin_active_run_entry_lease(
+    entry_root: Path,
+    lock_token: ArchiveLockToken | None,
+) -> dict[str, Any] | None:
+    """Keep an active run registered until one entry operation fully exits."""
+    entry_key = str(_lexical_absolute(entry_root))
+    owner = threading.get_ident()
+    with _RUN_CONTEXT_REGISTRY_MUTEX:
+        nonce = _ACTIVE_ENTRY_ROOT_RUNS.get(entry_key)
+        if nonce is None:
+            return None
+        registration = _RUN_CONTEXT_REGISTRY.get(nonce)
+        context = registration.get("context")() if registration is not None else None
+        if registration is None or context is None:
+            token = _remove_run_context_registration_locked(nonce)
+            if token is not None:
+                token.close()
+            return None
+        _require_active_run_entry_lock(entry_root, lock_token)
+        owners = registration["borrowOwners"]
+        if registration.get("closing") and owners.get(owner, 0) == 0:
+            raise RichArchiveError("active archive run is closing")
+        owners[owner] = owners.get(owner, 0) + 1
+        registration["borrowCount"] += 1
+        return {
+            "nonce": nonce,
+            "owner": owner,
+            "registration": registration,
+            "context": context,
+        }
+
+
+def _end_active_run_entry_lease(lease: Mapping[str, Any] | None) -> None:
+    if lease is None:
+        return
+    lock_token: ArchiveLockToken | None = None
+    with _RUN_CONTEXT_REGISTRY_MUTEX:
+        registration = _RUN_CONTEXT_REGISTRY.get(str(lease["nonce"]))
+        if registration is not lease["registration"]:
+            raise RichArchiveError("archive run lease registry changed during operation")
+        owners = registration["borrowOwners"]
+        owner = int(lease["owner"])
+        if owners.get(owner, 0) < 1 or registration.get("borrowCount", 0) < 1:
+            raise RichArchiveError("archive run lease count underflow")
+        owners[owner] -= 1
+        if owners[owner] == 0:
+            owners.pop(owner)
+        registration["borrowCount"] -= 1
+        if registration["borrowCount"] == 0 and registration.get("closing"):
+            lock_token = _remove_run_context_registration_locked(str(lease["nonce"]))
+    if lock_token is not None:
+        lock_token.close()
+
+
+@contextmanager
+def _borrow_active_run_entry(
+    entry_root: Path,
+    lock_token: ArchiveLockToken | None,
+) -> Iterator[None]:
+    lease = _begin_active_run_entry_lease(entry_root, lock_token)
+    try:
+        yield
+    finally:
+        _end_active_run_entry_lease(lease)
+
+
 class ArchiveLockToken:
     """Opaque capability; the locked descriptor exists only in the registry."""
 
@@ -3355,6 +3709,9 @@ class RichArchiveStore:
     def acquire_lock(self) -> ArchiveLockToken:
         if self.lock_path is None:
             raise RichArchiveError("shared backup lock path is required for archive mutation")
+        active_run = _active_run_registration_for_entry(self.entry_root)
+        if active_run is not None and self.lock_path != active_run["lockPath"]:
+            raise RichArchiveError("active archive run forbids an alternate backup lock path")
         reject_symlink_path(self.lock_path)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         reject_symlink_path(self.lock_path)
@@ -3537,6 +3894,127 @@ class RichArchiveStore:
             "generationSha256": generation_sha256,
         }
 
+    def _current_pointer_snapshot(self) -> dict[str, Any]:
+        """Read and verify one stable CURRENT state for stage CAS binding."""
+        reject_symlink_path(self.entry_root)
+        reject_symlink_path(self.pointer_path)
+        if not self.pointer_path.exists():
+            current = self.resolve_current()
+            if current is not None or self.pointer_path.exists():
+                raise GenerationError("CURRENT changed while its base state was captured")
+            return {
+                "basePointerPresent": False,
+                "basePointerSha256": None,
+                "baseGenerationId": None,
+                "baseGenerationSha256": None,
+                "currentPath": None,
+            }
+        if not _regular_single_link(self.pointer_path):
+            raise GenerationError("CURRENT pointer is not a regular file")
+        before = self.pointer_path.read_bytes()
+        try:
+            pointer = json.loads(before.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GenerationError("CURRENT pointer is not valid JSON") from exc
+        if not isinstance(pointer, Mapping):
+            raise GenerationError("CURRENT pointer payload is invalid")
+        pointer_body = dict(pointer)
+        checksum = pointer_body.pop("pointerSha256", None)
+        if checksum != json_sha256(pointer_body) or pointer_body.get("schemaVersion") != POINTER_SCHEMA:
+            raise GenerationError("CURRENT pointer checksum or schema mismatch")
+        generation_id = _validated_generation_id(pointer_body.get("generationId"))
+        generation_sha256 = str(pointer_body.get("generationSha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", generation_sha256):
+            raise GenerationError("CURRENT pointer generation checksum is invalid")
+        current = self.resolve_current()
+        if current is None or current.name != generation_id:
+            raise GenerationError("CURRENT pointer changed while its base state was captured")
+        after = self.pointer_path.read_bytes()
+        if before != after:
+            raise GenerationError("CURRENT changed while its base state was captured")
+        return {
+            "basePointerPresent": True,
+            "basePointerSha256": hashlib.sha256(before).hexdigest(),
+            "baseGenerationId": generation_id,
+            "baseGenerationSha256": generation_sha256,
+            "currentPath": current,
+        }
+
+    def _stage_base_receipt(
+        self,
+        stage: Path,
+        generation_id: str,
+        snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        receipt: dict[str, Any] = {
+            "schemaVersion": STAGE_BASE_SCHEMA,
+            "entryRootSha256": json_sha256(str(self.entry_root)),
+            "generationId": generation_id,
+            "basePointerPresent": snapshot["basePointerPresent"],
+            "basePointerSha256": snapshot["basePointerSha256"],
+            "baseGenerationId": snapshot["baseGenerationId"],
+            "baseGenerationSha256": snapshot["baseGenerationSha256"],
+        }
+        receipt["receiptSha256"] = json_sha256(receipt)
+        return receipt
+
+    def _validated_stage_base_receipt(self, stage: Path) -> dict[str, Any]:
+        stage = _lexical_absolute(stage)
+        entry_root, generation_id = _generation_binding(stage)
+        if entry_root != self.entry_root:
+            raise GenerationError("stage base receipt targets another archive entry")
+        path = contained_path(stage, "receipts/stage-base-current.json")
+        if not _regular_single_link(path):
+            raise GenerationError("stage base CURRENT receipt is missing")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise GenerationError("stage base CURRENT receipt is invalid") from exc
+        if not isinstance(value, Mapping):
+            raise GenerationError("stage base CURRENT receipt payload is invalid")
+        receipt = dict(value)
+        checksum = receipt.pop("receiptSha256", None)
+        if checksum != json_sha256(receipt):
+            raise GenerationError("stage base CURRENT receipt checksum mismatch")
+        present = receipt.get("basePointerPresent")
+        pointer_sha = receipt.get("basePointerSha256")
+        base_generation_id = receipt.get("baseGenerationId")
+        base_generation_sha = receipt.get("baseGenerationSha256")
+        if (
+            receipt.get("schemaVersion") != STAGE_BASE_SCHEMA
+            or receipt.get("entryRootSha256") != json_sha256(str(entry_root))
+            or receipt.get("generationId") != generation_id
+            or not isinstance(present, bool)
+            or (
+                present
+                and (
+                    not re.fullmatch(r"[0-9a-f]{64}", str(pointer_sha or ""))
+                    or _validated_generation_id(base_generation_id) != base_generation_id
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(base_generation_sha or ""))
+                )
+            )
+            or (
+                not present
+                and any(value is not None for value in (
+                    pointer_sha, base_generation_id, base_generation_sha,
+                ))
+            )
+        ):
+            raise GenerationError("stage base CURRENT receipt binding is invalid")
+        return dict(value)
+
+    def _require_stage_base_current_unchanged(self, stage: Path) -> None:
+        receipt = self._validated_stage_base_receipt(stage)
+        current = self._current_pointer_snapshot()
+        for field_name in (
+            "basePointerPresent",
+            "basePointerSha256",
+            "baseGenerationId",
+            "baseGenerationSha256",
+        ):
+            if receipt.get(field_name) != current.get(field_name):
+                raise GenerationError("CURRENT changed since stage creation; stale stage rejected")
+
     def resolve_current(self) -> Path | None:
         reject_symlink_path(self.entry_root)
         reject_symlink_path(self.pointer_path)
@@ -3562,12 +4040,17 @@ class RichArchiveStore:
         copy_current: bool = True,
         lock_token: ArchiveLockToken | None = None,
     ) -> Path:
-        with self._borrow_lock(lock_token):
-            return self._create_stage_under_lease(
-                generation_id,
-                copy_current=copy_current,
-                lock_token=lock_token,
-            )
+        run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
+        try:
+            with self._borrow_lock(lock_token):
+                _require_active_run_entry_lock(self.entry_root, lock_token)
+                return self._create_stage_under_lease(
+                    generation_id,
+                    copy_current=copy_current,
+                    lock_token=lock_token,
+                )
+        finally:
+            _end_active_run_entry_lease(run_lease)
 
     def _create_stage_under_lease(
         self,
@@ -3591,8 +4074,10 @@ class RichArchiveStore:
         if os.path.lexists(stage):
             if stage.is_symlink() or not stage.is_dir():
                 raise GenerationError("invalid existing stage")
+            self._validated_stage_base_receipt(stage)
             return stage
-        current = self.resolve_current() if copy_current else None
+        snapshot = self._current_pointer_snapshot()
+        current = snapshot["currentPath"] if copy_current else None
         if current is not None:
             verify_generation(current)
             shutil.copytree(current, stage, copy_function=shutil.copy2, symlinks=True)
@@ -3601,6 +4086,10 @@ class RichArchiveStore:
             stage.mkdir(mode=0o700)
         for name in ("canonical", "raw", "attachments", "receipts", "legacy-retained"):
             (stage / name).mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_json(
+            contained_path(stage, "receipts/stage-base-current.json"),
+            self._stage_base_receipt(stage, generation_id, snapshot),
+        )
         return stage
 
     def merge_messages(
@@ -3625,12 +4114,27 @@ class RichArchiveStore:
             identity=identity,
             entry_root=self.entry_root,
         )
-        owned_lock = None
         if lock_token is None:
-            owned_lock = self.acquire_lock()
-            lock_token = owned_lock
-        lease = self._begin_lock_lease(lock_token)
+            lock_token = run_registration["lockToken"]
+        run_registration = _require_run_context(
+            run_context,
+            identity=identity,
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
+        lease: dict[str, Any] | None = None
+        budget_reservation: tuple[AssetRunBudget, dict[str, int]] | None = None
+        published = False
         try:
+            lease = self._begin_lock_lease(lock_token)
+            run_registration = _require_run_context(
+                run_context,
+                identity=identity,
+                entry_root=self.entry_root,
+                lock_token=lock_token,
+            )
+            _require_active_run_entry_lock(self.entry_root, lock_token)
             current = self.resolve_current()
             if current is None:
                 raise GenerationError("rich archive CURRENT generation is missing; full rebuild is required")
@@ -3674,10 +4178,12 @@ class RichArchiveStore:
                     for observation in record["observations"]
                     for asset in observation["assetInventory"]
                 ]
-                exact_capacity = budget.preflight_entry(
-                    assets, self.entry_root, assume_unknown_max=False,
+                exact_capacity = budget.reserve_entry(
+                    assets,
+                    self.entry_root,
+                    assume_unknown_max=False,
                 )
-                budget.commit_entry(exact_capacity)
+                budget_reservation = (budget, exact_capacity)
             stage = self.create_stage(
                 generation_id, copy_current=True, lock_token=lock_token,
             )
@@ -3715,13 +4221,25 @@ class RichArchiveStore:
             self.publish_stage(
                 stage, generation_id, manifest["generationSha256"], lock_token=lock_token,
             )
+            published = True
             return {"generationId": generation_id, "verified": True, **local}
         finally:
-            try:
+            if budget_reservation is not None and not published:
+                keep_reservation = True
+                try:
+                    current_after_failure = self.resolve_current()
+                except (OSError, ValueError, RichArchiveError):
+                    pass
+                else:
+                    keep_reservation = (
+                        current_after_failure is not None
+                        and current_after_failure.name == generation_id
+                    )
+                if not keep_reservation:
+                    budget_reservation[0].release_entry(budget_reservation[1])
+            if lease is not None:
                 self._end_lock_lease(lease)
-            finally:
-                if owned_lock is not None:
-                    owned_lock.close()
+            _end_active_run_entry_lease(run_lease)
 
     def reserve_full_stage_assets(
         self,
@@ -3744,7 +4262,24 @@ class RichArchiveStore:
             identity=identity,
             entry_root=self.entry_root,
         )
-        with self._borrow_lock(lock_token):
+        if lock_token is None:
+            lock_token = registration["lockToken"]
+        registration = _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            identity=identity,
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        with _borrow_active_run_entry(self.entry_root, lock_token), self._borrow_lock(lock_token):
+            registration = _require_run_context(
+                run_context,
+                kind="full_rebuild",
+                identity=identity,
+                entry_root=self.entry_root,
+                lock_token=lock_token,
+            )
+            _require_active_run_entry_lock(self.entry_root, lock_token)
             stage = _lexical_absolute(stage)
             entry_root, generation_id = _generation_binding(stage)
             if (
@@ -3754,41 +4289,56 @@ class RichArchiveStore:
                 or not stage.is_dir()
             ):
                 raise AssetDownloadError("asset reservation requires an owned staging generation")
-            if identity["channelId"] in registration["assetReservations"]:
-                raise AssetDownloadError("full-run entry already has an asset reservation")
-            assets, asset_evidence = _verified_generation_assets(stage)
-            budget = registration["budget"]
-            capacity = budget.preflight_entry(
-                assets,
-                stage,
-                assume_unknown_max=False,
-                assets_materialized=True,
-            )
-            reservation: dict[str, Any] = {
-                "schemaVersion": ASSET_RESERVATION_SCHEMA,
-                "reservationId": secrets.token_hex(32),
-                "runContextId": registration["runContextId"],
-                "archiveRootSha256": registration["archiveRootSha256"],
-                "inventoryDigest": registration["inventoryDigest"],
-                "entryIdentity": identity,
-                "entryRootSha256": json_sha256(str(entry_root)),
-                "generationId": generation_id,
-                "assetFileCount": capacity["files"],
-                "assetDeclaredBytes": capacity["declaredBytes"],
-                "assets": asset_evidence,
-                "assetsSha256": json_sha256(asset_evidence),
-            }
-            reservation["receiptSha256"] = json_sha256(reservation)
-            budget.commit_entry(capacity)
-            registration["assetReservations"][identity["channelId"]] = json.loads(
-                json.dumps(reservation, ensure_ascii=False)
-            )
-            self._require_active_lock_lease(lock_token)
-            atomic_json(
-                contained_path(stage, "receipts/full-run-asset-reservation.json"),
-                reservation,
-            )
-            return reservation
+            with registration["mutex"]:
+                if identity["channelId"] in registration["assetReservations"]:
+                    raise AssetDownloadError("full-run entry already has an asset reservation")
+                assets, asset_evidence = _verified_generation_assets(stage)
+                asset_file_count = len(assets)
+                asset_declared_bytes = sum(int(asset["declaredSize"]) for asset in assets)
+                reservation: dict[str, Any] = {
+                    "schemaVersion": ASSET_RESERVATION_SCHEMA,
+                    "reservationId": secrets.token_hex(32),
+                    "runContextId": registration["runContextId"],
+                    "archiveRootSha256": registration["archiveRootSha256"],
+                    "inventoryDigest": registration["inventoryDigest"],
+                    "entryIdentity": identity,
+                    "entryRootSha256": json_sha256(str(entry_root)),
+                    "generationId": generation_id,
+                    "assetFileCount": asset_file_count,
+                    "assetDeclaredBytes": asset_declared_bytes,
+                    "assets": asset_evidence,
+                    "assetsSha256": json_sha256(asset_evidence),
+                }
+                reservation["receiptSha256"] = json_sha256(reservation)
+                receipt_path = contained_path(
+                    stage,
+                    "receipts/full-run-asset-reservation.json",
+                )
+                if os.path.lexists(receipt_path):
+                    raise AssetDownloadError("full-run asset reservation receipt already exists")
+                self._require_active_lock_lease(lock_token)
+                atomic_json(receipt_path, reservation)
+                try:
+                    capacity = registration["budget"].reserve_entry(
+                        assets,
+                        stage,
+                        assume_unknown_max=False,
+                        assets_materialized=True,
+                    )
+                except BaseException:
+                    receipt_path.unlink(missing_ok=True)
+                    raise
+                if (
+                    capacity["files"] != asset_file_count
+                    or capacity["declaredBytes"] != asset_declared_bytes
+                ):
+                    registration["budget"].release_entry(capacity)
+                    receipt_path.unlink(missing_ok=True)
+                    raise AssetDownloadError("asset reservation totals changed during commit")
+                registration["assetReservations"][identity["channelId"]] = json.loads(
+                    json.dumps(reservation, ensure_ascii=False)
+                )
+                return reservation
 
     def install_full_pass_evidence(
         self,
@@ -3799,7 +4349,27 @@ class RichArchiveStore:
     ) -> dict[str, Any]:
         """Install collector evidence; only the live token can authorize PASS."""
         lease: dict[str, Any] | None = None
+        run_lease: dict[str, Any] | None = None
         try:
+            initial_registration = _require_live_evidence_token(
+                live_evidence_token,
+                root=stage,
+                allowed_states={"fresh"},
+            )
+            run_registration = _require_run_context(
+                initial_registration["runContext"](),
+                kind="full_rebuild",
+                entry_root=initial_registration["entryRoot"],
+            )
+            if lock_token is None:
+                lock_token = run_registration["lockToken"]
+            _require_run_context(
+                initial_registration["runContext"](),
+                kind="full_rebuild",
+                entry_root=initial_registration["entryRoot"],
+                lock_token=lock_token,
+            )
+            run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
             lease = self._begin_lock_lease(lock_token)
             stage = _lexical_absolute(stage)
             registration = _require_live_evidence_token(
@@ -3846,6 +4416,7 @@ class RichArchiveStore:
         finally:
             if lease is not None:
                 self._end_lock_lease(lease)
+            _end_active_run_entry_lease(run_lease)
 
     def publish_stage(
         self,
@@ -3862,7 +4433,21 @@ class RichArchiveStore:
         processed_channel: str | None = None
         asset_reservation_id: str | None = None
         lease: dict[str, Any] | None = None
+        run_lease: dict[str, Any] | None = None
         try:
+            if require_full_gate and lock_token is None:
+                initial_full_registration = _require_live_evidence_token(
+                    live_evidence_token,
+                    root=stage,
+                    allowed_states={"prepared"},
+                )
+                initial_run_registration = _require_run_context(
+                    initial_full_registration["runContext"](),
+                    kind="full_rebuild",
+                    entry_root=initial_full_registration["entryRoot"],
+                )
+                lock_token = initial_run_registration["lockToken"]
+            run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
             lease = self._begin_lock_lease(lock_token)
             generation_id = _validated_generation_id(generation_id)
             if not re.fullmatch(r"[0-9a-f]{64}", generation_sha256):
@@ -3895,6 +4480,7 @@ class RichArchiveStore:
                     kind="full_rebuild",
                     identity=identity,
                     entry_root=full_registration["entryRoot"],
+                    lock_token=lock_token,
                 )
                 processed_channel = identity["channelId"]
                 asset_reservation_id = str(
@@ -3902,8 +4488,9 @@ class RichArchiveStore:
                 )
                 if full_registration.get("preparedAssetReservationId") != asset_reservation_id:
                     raise GenerationError("live evidence token asset reservation binding changed")
-                if processed_channel in run_registration["processed"]:
-                    raise GenerationError("full rebuild entry was already published in this run")
+                with run_registration["mutex"]:
+                    if processed_channel in run_registration["processed"]:
+                        raise GenerationError("full rebuild entry was already published in this run")
             if not verified["ok"] or verified["generationSha256"] != generation_sha256:
                 raise GenerationError("publish stage failed generation verification")
             if final.exists() or final.is_symlink():
@@ -3917,6 +4504,8 @@ class RichArchiveStore:
                 if refreshed_registration is not full_registration:
                     raise GenerationError("runtime live evidence reservation changed before commit")
             self._require_active_lock_lease(lock_token)
+            _require_active_run_entry_lock(self.entry_root, lock_token)
+            self._require_stage_base_current_unchanged(stage)
             journal = {
                 "schemaVersion": JOURNAL_SCHEMA,
                 "phase": "prepared",
@@ -3943,20 +4532,25 @@ class RichArchiveStore:
                     and processed_channel is not None
                     and asset_reservation_id is not None
                 )
-                if asset_reservation_id in run_registration["usedAssetReservations"]:
-                    raise GenerationError("full-run asset reservation was already consumed")
-                run_registration["usedAssetReservations"].add(asset_reservation_id)
-                run_registration["processed"][processed_channel] = generation_sha256
+                with run_registration["mutex"]:
+                    if asset_reservation_id in run_registration["usedAssetReservations"]:
+                        raise GenerationError("full-run asset reservation was already consumed")
+                    run_registration["usedAssetReservations"].add(asset_reservation_id)
+                    run_registration["processed"][processed_channel] = generation_sha256
         finally:
             try:
                 if lease is not None:
                     self._end_lock_lease(lease)
             finally:
-                if require_full_gate:
-                    _consume_live_evidence_token(live_evidence_token)
+                try:
+                    _end_active_run_entry_lease(run_lease)
+                finally:
+                    if require_full_gate:
+                        _consume_live_evidence_token(live_evidence_token)
 
     def recover_journal(self, *, lock_token: ArchiveLockToken | None = None) -> dict[str, Any]:
-        with self._borrow_lock(lock_token):
+        with _borrow_active_run_entry(self.entry_root, lock_token), self._borrow_lock(lock_token):
+            _require_active_run_entry_lock(self.entry_root, lock_token)
             return self._recover_journal_under_lease(lock_token=lock_token)
 
     def _recover_journal_under_lease(
@@ -4013,6 +4607,7 @@ __all__ = [
     "FULL_RUN_RECEIPT_SCHEMA", "FullRebuildRunContext", "GENERATION_MANIFEST_SCHEMA",
     "GenerationError", "IncrementalRunContext", "LIVE_EVIDENCE_SCHEMA", "RECORD_SCHEMA",
     "LiveEvidenceToken", "RichArchiveError", "RichArchiveStore", "SOURCE_CENSUS_SCHEMA",
+    "STAGE_BASE_SCHEMA",
     "SourceBoundsError", "SourceCensusError", "apply_asset_results", "atomic_json",
     "atomic_jsonl", "begin_full_rebuild_run", "begin_incremental_run", "canonical_day",
     "collect_live_evidence", "contained_path", "file_sha256", "finalize_full_rebuild_run",
