@@ -26,7 +26,8 @@
   identity must equal the canonical directory identity used for content traversal.
 - A09 PASS: rejected alias classes produce explicit non-secret installer errors.
 - A10 PASS: missing, changed, retargeted, parent-swapped, root-replaced, and
-  target-replaced entries stop before mutation or force rollback.
+  target-replaced entries stop before mutation or force rollback; agent-message
+  normalization is applied before exact staged-contract verification.
 
 ## Closeout gate
 
@@ -35,13 +36,16 @@
   target replacement.
 - Verification: 243/243 tests PASS; post-run check PASS including package/source
   parity, cron-manifest validation, and both restore smokes. Evidence:
-  `logs/tool-runs/20260908_013151_daily-alias-final-full-pytest.log` and
-  `logs/tool-runs/20260908_013224_daily-alias-final-postcheck.log`.
+  `logs/tool-runs/20260908_015900_daily-message-final-full-pytest.log` and
+  `logs/tool-runs/20260908_020005_daily-message-final-postcheck.log`.
 - Static checks: Python compilation, diff whitespace, and changed-content secret-shape
   scan PASS. Evidence:
-  `logs/tool-runs/20260908_013329_daily-alias-final-static.log`.
+  `logs/tool-runs/20260908_020324_daily-message-final-static.log`.
 - Live read-only archive-tree verification: PASS. Evidence:
   `logs/tool-runs/20260908_013300_daily-alias-final-live-tree.log`.
+- Live disabled temporary agent-message readback matched the exact normalized
+  contract and was removed. Evidence:
+  `logs/tool-runs/20260908_015945_daily-message-live-readback.log`.
 - Independent release-quality review: three race regressions, live alias identity,
   complete tests, package parity, and self-check PASS.
 - Open P0/P1/P2/P3: 0/0/0/0.

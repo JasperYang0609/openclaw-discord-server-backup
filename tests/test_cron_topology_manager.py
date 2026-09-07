@@ -171,6 +171,7 @@ def test_manifest_contract_and_rendered_prompts(tmp_path):
         assert "{{" not in row["payload"]["message"]
         assert row["declarationKey"] in row["payload"]["message"]
         assert "check_daily_sync_gate.py" in row["payload"]["message"]
+        assert not row["payload"]["message"].endswith("\n")
     assert all(row["failureAlert"]["after"] == 1 and not row["failureAlert"]["includeSkipped"] for row in desired)
     assert [row["role"] for row in desired if row["delivery"]["mode"] == "announce"] == ["health-report"]
 

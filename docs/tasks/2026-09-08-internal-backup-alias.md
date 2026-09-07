@@ -10,6 +10,8 @@ rollback guarantees.
 
 - Raw-tree integrity hashing for internal directory aliases.
 - Positive and hostile-path regression tests.
+- Exact OpenClaw agent-message readback normalization discovered during the
+  rollback-safe live retry.
 - Full release and live cutover verification.
 
 ## Out of scope
@@ -24,6 +26,8 @@ rollback guarantees.
 - Existing live alias passes the pre-mutation tree hash.
 - Unsafe aliases fail before cron mutation.
 - Full repository self-check passes.
+- Staged agent prompts match OpenClaw's durable contract after its single terminal
+  newline normalization.
 - Independent review reports no open P0-P3.
 - Live retry returns READY, exact 11/11 readback passes, and legacy jobs remain
   disabled rather than deleted.

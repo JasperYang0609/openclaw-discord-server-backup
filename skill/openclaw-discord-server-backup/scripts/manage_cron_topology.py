@@ -240,7 +240,10 @@ def render_prompt(path: Path, replacements: dict[str, str]) -> str:
     unresolved = sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", text)))
     if unresolved:
         raise CronManagerError(f"prompt has unresolved placeholders: {unresolved}")
-    return text
+    # OpenClaw normalizes one terminal line break supplied through --message.
+    # Match that durable readback contract before the job is staged so exact
+    # verification does not reject an otherwise identical agent prompt.
+    return text[:-1] if text.endswith("\n") else text
 
 
 def render_jobs(manifest: dict[str, Any], context: RenderContext) -> list[dict[str, Any]]:
