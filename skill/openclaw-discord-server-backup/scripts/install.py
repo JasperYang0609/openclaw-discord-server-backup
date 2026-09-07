@@ -166,22 +166,214 @@ def workspace_path(workspace: Path, value: str, label: str) -> Path:
     return candidate
 
 
+def _open_directory_beneath(root_fd: int, parts: tuple[str, ...], *, label: str) -> int:
+    """Open an in-root directory without following any path component symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            if part in {"", ".", ".."} or "/" in part or "\x00" in part:
+                raise InstallError(f"{label} contains an unsafe path component")
+            try:
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+            except OSError as exc:
+                raise InstallError(f"{label} is not a stable real directory") from exc
+            os.close(current_fd)
+            current_fd = next_fd
+            info = os.fstat(current_fd)
+            if not stat.S_ISDIR(info.st_mode):
+                raise InstallError(f"{label} is not a real directory")
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _same_entry(before: os.stat_result, after: os.stat_result) -> bool:
+    """Compare enough metadata to reject replacement during one integrity read."""
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size")
+    if any(getattr(before, field) != getattr(after, field) for field in fields):
+        return False
+    return (
+        getattr(before, "st_ctime_ns", int(before.st_ctime * 1_000_000_000))
+        == getattr(after, "st_ctime_ns", int(after.st_ctime * 1_000_000_000))
+    )
+
+
+def _hash_regular_file_at(parent_fd: int, name: str, expected: os.stat_result) -> bytes:
+    """Read one regular file through the already-validated parent descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        file_fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise InstallError("raw root changed during integrity read") from exc
+    try:
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode) or not _same_entry(expected, opened):
+            raise InstallError("raw root changed during integrity read")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if not _same_entry(opened, os.fstat(file_fd)):
+            raise InstallError("raw root changed during integrity read")
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_entry(opened, current):
+            raise InstallError("raw root changed during integrity read")
+        return digest.digest()
+    finally:
+        os.close(file_fd)
+
+
+def _hash_tree_directory(
+    digest: Any,
+    *,
+    root: Path,
+    root_fd: int,
+    directory_fd: int,
+    prefix: Path,
+    alias_targets: dict[tuple[str, ...], os.stat_result],
+    visited_directories: dict[tuple[str, ...], os.stat_result],
+) -> None:
+    """Hash one directory tree using only descriptors rooted at ``root_fd``."""
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as exc:
+        raise InstallError("raw root changed during integrity read") from exc
+    for name in names:
+        if name in {"", ".", ".."} or "/" in name or "\x00" in name:
+            raise InstallError("raw root contains an unsafe entry name")
+        relative_path = prefix / name
+        relative = relative_path.as_posix().encode("utf-8")
+        try:
+            entry_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise InstallError("raw root changed during integrity read") from exc
+        if stat.S_ISLNK(entry_info.st_mode):
+            if entry_info.st_uid != os.getuid() or entry_info.st_nlink != 1:
+                raise InstallError("raw root contains an unsafe symlink")
+            try:
+                link_target = os.readlink(name, dir_fd=directory_fd)
+            except OSError as exc:
+                raise InstallError("raw root contains a broken symlink") from exc
+            lexical_target = Path(link_target)
+            if not lexical_target.is_absolute():
+                lexical_target = root / prefix / lexical_target
+            canonical_target = Path(os.path.abspath(lexical_target))
+            if canonical_target == root or root not in canonical_target.parents:
+                raise InstallError("raw root contains an external symlink")
+            target_relative_path = canonical_target.relative_to(root)
+            target_fd = _open_directory_beneath(
+                root_fd, target_relative_path.parts, label="raw alias target"
+            )
+            try:
+                target_info = os.fstat(target_fd)
+                if target_info.st_uid != os.getuid():
+                    raise InstallError("raw root contains an unsafe symlink")
+                target_key = target_relative_path.parts
+                previous_target = alias_targets.get(target_key)
+                visited_target = visited_directories.get(target_key)
+                if previous_target is not None and not _same_entry(previous_target, target_info):
+                    raise InstallError("raw alias target changed during integrity read")
+                if visited_target is not None and not _same_entry(visited_target, target_info):
+                    raise InstallError("raw alias target changed during integrity read")
+                alias_targets[target_key] = target_info
+                link_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not _same_entry(entry_info, link_after):
+                    raise InstallError("raw root changed during integrity read")
+                if os.readlink(name, dir_fd=directory_fd) != link_target:
+                    raise InstallError("raw root changed during integrity read")
+            finally:
+                os.close(target_fd)
+            target_relative = target_relative_path.as_posix().encode("utf-8")
+            digest.update(
+                b"L\0" + relative + b"\0" + os.fsencode(link_target) + b"\0"
+                + target_relative + b"\0"
+                + f"{entry_info.st_dev}:{entry_info.st_ino}:{target_info.st_dev}:{target_info.st_ino}".encode("ascii")
+                + b"\0"
+            )
+        elif stat.S_ISDIR(entry_info.st_mode):
+            child_fd = _open_directory_beneath(directory_fd, (name,), label="raw directory")
+            try:
+                opened = os.fstat(child_fd)
+                if not _same_entry(entry_info, opened):
+                    raise InstallError("raw root changed during integrity read")
+                directory_key = relative_path.parts
+                expected_target = alias_targets.get(directory_key)
+                if expected_target is not None and not _same_entry(expected_target, opened):
+                    raise InstallError("raw alias target changed during integrity read")
+                visited_directories[directory_key] = opened
+                digest.update(b"D\0" + relative + b"\0")
+                _hash_tree_directory(
+                    digest,
+                    root=root,
+                    root_fd=root_fd,
+                    directory_fd=child_fd,
+                    prefix=relative_path,
+                    alias_targets=alias_targets,
+                    visited_directories=visited_directories,
+                )
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not _same_entry(opened, current):
+                    raise InstallError("raw root changed during integrity read")
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(entry_info.st_mode):
+            digest.update(
+                b"F\0" + relative + b"\0"
+                + _hash_regular_file_at(directory_fd, name, entry_info)
+            )
+        else:
+            raise InstallError("raw root contains a non-regular entry")
+    try:
+        if sorted(os.listdir(directory_fd)) != names:
+            raise InstallError("raw root changed during integrity read")
+    except OSError as exc:
+        raise InstallError("raw root changed during integrity read") from exc
+
+
 def tree_hash(path: Path) -> str:
     digest = hashlib.sha256()
     if not path.exists():
         return digest.hexdigest()
     if path.is_symlink() or not path.is_dir():
         raise InstallError("raw root is unsafe")
-    for item in sorted(path.rglob("*"), key=lambda row: row.relative_to(path).as_posix()):
-        relative = item.relative_to(path).as_posix().encode("utf-8")
-        if item.is_symlink():
-            raise InstallError("raw root contains a symlink")
-        if item.is_dir():
-            digest.update(b"D\0" + relative + b"\0")
-        elif item.is_file():
-            digest.update(b"F\0" + relative + b"\0" + hashlib.sha256(item.read_bytes()).digest())
-        else:
-            raise InstallError("raw root contains a non-regular entry")
+    root = Path(os.path.abspath(path))
+    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        root_fd = os.open(root, root_flags)
+    except OSError as exc:
+        raise InstallError("raw root is unsafe") from exc
+    try:
+        root_info = os.fstat(root_fd)
+        alias_targets: dict[tuple[str, ...], os.stat_result] = {}
+        visited_directories: dict[tuple[str, ...], os.stat_result] = {}
+        _hash_tree_directory(
+            digest,
+            root=root,
+            root_fd=root_fd,
+            directory_fd=root_fd,
+            prefix=Path(),
+            alias_targets=alias_targets,
+            visited_directories=visited_directories,
+        )
+        if set(alias_targets) - set(visited_directories):
+            raise InstallError("raw alias target was not traversed")
+        for target_key, expected in alias_targets.items():
+            if not _same_entry(expected, visited_directories[target_key]):
+                raise InstallError("raw alias target changed during integrity read")
+        try:
+            current_root = os.stat(root, follow_symlinks=False)
+        except OSError as exc:
+            raise InstallError("raw root changed during integrity read") from exc
+        if not _same_entry(root_info, current_root):
+            raise InstallError("raw root changed during integrity read")
+    finally:
+        os.close(root_fd)
     return digest.hexdigest()
 
 

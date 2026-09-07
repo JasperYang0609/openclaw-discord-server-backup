@@ -92,6 +92,177 @@ def test_skill_tree_hash_detects_mode_only_drift(tmp_path):
     assert installer.skill_tree_hash(source) == installer.skill_tree_hash(target)
 
 
+def test_tree_hash_accepts_owned_internal_directory_alias(tmp_path):
+    raw = tmp_path / "raw"
+    canonical = raw / "customers/client"
+    canonical.mkdir(parents=True)
+    (canonical / "archive.md").write_text("one\n", encoding="utf-8")
+    alias = raw / "legacy-client"
+    alias.symlink_to(canonical, target_is_directory=True)
+
+    before = installer.tree_hash(raw)
+    (canonical / "archive.md").write_text("two\n", encoding="utf-8")
+
+    assert installer.tree_hash(raw) != before
+
+
+@pytest.mark.parametrize("target_kind", ["external", "broken", "chained", "file"])
+def test_tree_hash_rejects_unsafe_directory_aliases(tmp_path, target_kind):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    alias = raw / "alias"
+    if target_kind == "external":
+        target = tmp_path / "outside"
+        target.mkdir()
+    elif target_kind == "broken":
+        target = raw / "missing"
+    elif target_kind == "chained":
+        target = raw / "target-link"
+        real = raw / "real"
+        real.mkdir()
+        target.symlink_to(real, target_is_directory=True)
+    else:
+        target = raw / "file.txt"
+        target.write_text("data\n", encoding="utf-8")
+    alias.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(installer.InstallError):
+        installer.tree_hash(raw)
+
+
+def test_tree_hash_rejects_internal_alias_outside_current_owner(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    canonical = raw / "canonical"
+    canonical.mkdir(parents=True)
+    alias = raw / "legacy"
+    alias.symlink_to(canonical, target_is_directory=True)
+    actual_uid = os.getuid()
+    monkeypatch.setattr(installer.os, "getuid", lambda: actual_uid + 1)
+
+    with pytest.raises(installer.InstallError, match="unsafe symlink"):
+        installer.tree_hash(raw)
+
+
+def test_tree_hash_detects_internal_alias_retargeting(tmp_path):
+    raw = tmp_path / "raw"
+    canonical_a = raw / "canonical-a"
+    canonical_b = raw / "canonical-b"
+    canonical_a.mkdir(parents=True)
+    canonical_b.mkdir(parents=True)
+    alias = raw / "legacy"
+    alias.symlink_to(canonical_a, target_is_directory=True)
+    before = installer.tree_hash(raw)
+
+    alias.unlink()
+    alias.symlink_to(canonical_b, target_is_directory=True)
+
+    assert installer.tree_hash(raw) != before
+
+
+def test_tree_hash_rejects_alias_to_raw_root(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "alias").symlink_to(raw, target_is_directory=True)
+
+    with pytest.raises(installer.InstallError, match="external symlink"):
+        installer.tree_hash(raw)
+
+
+def test_tree_hash_rejects_target_parent_swap_to_external_symlink(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    target_parent = raw / "customers"
+    target = target_parent / "client"
+    target.mkdir(parents=True)
+    (target / "archive.md").write_text("inside\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    (outside / "client").mkdir(parents=True)
+    (outside / "client/archive.md").write_text("outside\n", encoding="utf-8")
+    (raw / "legacy-client").symlink_to(target, target_is_directory=True)
+    parked = raw / "customers-parked"
+    original_open = installer.os.open
+    swapped = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "customers" and kwargs.get("dir_fd") is not None and not swapped:
+            target_parent.rename(parked)
+            target_parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(installer.os, "open", racing_open)
+    try:
+        with pytest.raises(installer.InstallError, match="stable real directory"):
+            installer.tree_hash(raw)
+    finally:
+        if target_parent.is_symlink():
+            target_parent.unlink()
+        if parked.exists():
+            parked.rename(target_parent)
+
+
+def test_tree_hash_rejects_raw_root_replacement_after_descriptor_open(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "archive.md").write_text("must be hashed\n", encoding="utf-8")
+    parked = tmp_path / "raw-parked"
+    original_open = installer.os.open
+    swapped = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == raw and kwargs.get("dir_fd") is None and not swapped:
+            raw.rename(parked)
+            raw.mkdir()
+            swapped = True
+        return fd
+
+    monkeypatch.setattr(installer.os, "open", racing_open)
+    try:
+        with pytest.raises(installer.InstallError, match="changed during integrity read"):
+            installer.tree_hash(raw)
+    finally:
+        if raw.exists():
+            raw.rmdir()
+        if parked.exists():
+            parked.rename(raw)
+
+
+def test_tree_hash_rejects_alias_target_replacement_before_canonical_walk(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    target = raw / "z-target"
+    target.mkdir()
+    (target / "old.md").write_text("old\n", encoding="utf-8")
+    (raw / "a-alias").symlink_to(target, target_is_directory=True)
+    parked = raw / "z-target-parked"
+    original_open_beneath = installer._open_directory_beneath
+    swapped = False
+
+    def racing_open_beneath(root_fd, parts, *, label):
+        nonlocal swapped
+        fd = original_open_beneath(root_fd, parts, label=label)
+        if label == "raw alias target" and parts == ("z-target",) and not swapped:
+            target.rename(parked)
+            target.mkdir()
+            (target / "new.md").write_text("new\n", encoding="utf-8")
+            swapped = True
+        return fd
+
+    monkeypatch.setattr(installer, "_open_directory_beneath", racing_open_beneath)
+    try:
+        with pytest.raises(installer.InstallError, match="alias target changed"):
+            installer.tree_hash(raw)
+    finally:
+        if target.exists():
+            for child in target.iterdir():
+                child.unlink()
+            target.rmdir()
+        if parked.exists():
+            parked.rename(target)
+
+
 def test_stage_and_swap_converges_mode_only_drift(tmp_path, monkeypatch):
     source = tmp_path / "source"
     target = tmp_path / "target"
