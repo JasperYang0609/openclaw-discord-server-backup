@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -71,6 +72,51 @@ def stub_common(monkeypatch, args, events):
         lambda source, target: events.append("skill-swap") or installer.SkillSwap(target, None, False),
     )
     monkeypatch.setattr(installer, "finalize_skill", lambda _swap: None)
+
+
+def test_skill_tree_hash_detects_mode_only_drift(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    source_file = source / "helper.py"
+    target_file = target / "helper.py"
+    source_file.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    target_file.write_bytes(source_file.read_bytes())
+    source_file.chmod(0o755)
+    target_file.chmod(0o644)
+
+    assert installer.skill_tree_hash(source) != installer.skill_tree_hash(target)
+
+    target_file.chmod(0o755)
+    assert installer.skill_tree_hash(source) == installer.skill_tree_hash(target)
+
+
+def test_stage_and_swap_converges_mode_only_drift(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    (source / "scripts").mkdir(parents=True)
+    (target / "scripts").mkdir(parents=True)
+    source_file = source / "scripts/helper.py"
+    target_file = target / "scripts/helper.py"
+    source_file.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    target_file.write_bytes(source_file.read_bytes())
+    source_file.chmod(0o755)
+    # Group/other execute bits do not make an owner-owned file directly
+    # executable when the owner's execute bit is absent.
+    target_file.chmod(0o655)
+    monkeypatch.setattr(
+        installer.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    swap = installer.stage_and_swap_skill(source, target)
+
+    assert swap.changed is True
+    assert installer.normalized_file_mode(target_file) == 0o755
+    assert installer.skill_tree_hash(source) == installer.skill_tree_hash(target)
+    installer.finalize_skill(swap)
 
 
 def test_ordinary_upgrade_quiesces_before_first_file_mutation(tmp_path, monkeypatch):

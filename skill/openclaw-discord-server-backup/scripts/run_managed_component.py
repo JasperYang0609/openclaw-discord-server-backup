@@ -335,8 +335,22 @@ def verify_topology_and_render(args: argparse.Namespace) -> int:
     if config.get("accountId"):
         command.extend(["--account-id", str(config["accountId"])])
     cron_settings = config.get("cron") if isinstance(config.get("cron"), dict) else {}
-    if cron_settings.get("adoptionMap"):
-        command.extend(["--adoption-map", str(workspace_child(workspace, str(cron_settings["adoptionMap"]), "adoption map"))])
+    adoption_value = cron_settings.get("adoptionMap")
+    prepared_value = cron_settings.get("preparedAdoptionReceipt")
+    if prepared_value and not adoption_value:
+        raise RuntimeError("prepared adoption receipt requires its configured adoption map")
+    if adoption_value:
+        command.extend([
+            "--adoption-map",
+            str(workspace_child(workspace, str(adoption_value), "adoption map")),
+        ])
+        if prepared_value:
+            command.extend([
+                "--prepared-adoption-receipt",
+                str(workspace_child(
+                    workspace, str(prepared_value), "prepared adoption receipt",
+                )),
+            ])
     proc = subprocess.run(command, cwd=workspace, text=True, capture_output=True, check=False)
     if proc.returncode != 0:
         health.write_component(

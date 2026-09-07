@@ -132,6 +132,17 @@ def test_runtime_config_cannot_redirect_python_or_openclaw_executables(tmp_path)
 
 def test_health_report_runs_topology_verify_before_render(monkeypatch, tmp_path, capsys):
     args, workspace, customer = make_args(tmp_path, "health-report")
+    config_path = workspace / "memory/config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    adoption = workspace / "memory/adoption.json"
+    prepared = workspace / "memory/health/transactions/prepared"
+    adoption.write_text("{}\n", encoding="utf-8")
+    prepared.mkdir(parents=True)
+    config["cron"] = {
+        "adoptionMap": "memory/adoption.json",
+        "preparedAdoptionReceipt": "memory/health/transactions/prepared",
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
     receipt_dir = workspace / "memory/health"
     # All non-topology components exist so topology refresh controls the result.
     for component in [*runner.health.DAILY_COMPONENTS, *runner.health.WEEKLY_COMPONENTS, *runner.health.MONTHLY_COMPONENTS]:
@@ -168,7 +179,26 @@ def test_health_report_runs_topology_verify_before_render(monkeypatch, tmp_path,
     assert runner.verify_topology_and_render(args) == 0
     assert calls and "verify" in calls[0]
     assert calls[0][1].endswith("manage_cron_topology.py")
+    assert calls[0][calls[0].index("--adoption-map") + 1] == str(adoption)
+    assert calls[0][calls[0].index("--prepared-adoption-receipt") + 1] == str(prepared)
     assert "排程與告警：正常" in capsys.readouterr().out
+
+
+def test_health_report_rejects_prepared_receipt_without_adoption_map(tmp_path):
+    args, workspace, _customer = make_args(tmp_path, "health-report")
+    config_path = workspace / "memory/config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["cron"] = {
+        "preparedAdoptionReceipt": "memory/health/transactions/prepared",
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    try:
+        runner.verify_topology_and_render(args)
+    except RuntimeError as exc:
+        assert "requires its configured adoption map" in str(exc)
+    else:
+        raise AssertionError("prepared receipt without adoption map must fail closed")
 
 
 def test_health_topology_verify_preserves_legacy_configured_discord_root(monkeypatch, tmp_path, capsys):

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import importlib.util
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,15 @@ IS_REPOSITORY_LAYOUT = (
 )
 ROOT = REPO_ROOT_CANDIDATE if IS_REPOSITORY_LAYOUT else SKILL_DIR
 LAYOUT = "repository" if IS_REPOSITORY_LAYOUT else "installed"
+DIRECT_EXECUTABLES = (
+    "scripts/check_daily_sync_gate.py",
+    "scripts/backup_health_report.py",
+)
+
+
+def normalized_file_mode(path: Path) -> int:
+    """Return the release identity for one regular file's execute bits."""
+    return 0o755 if path.stat().st_mode & stat.S_IXUSR else 0o644
 
 
 def check(name: str, ok: bool, detail: str = "", results: list[tuple[str, bool, str]] | None = None) -> None:
@@ -65,6 +75,16 @@ def installed_python_smoke() -> tuple[bool, str]:
         if proc.returncode != 0:
             return False, f"{name} --help failed: {(proc.stderr or proc.stdout).strip()}"
     return True, f"compiled={len(scripts)} cli_help={len(cli_scripts)}"
+
+
+def direct_executables_ready(skill_dir: Path = SKILL_DIR) -> tuple[bool, str]:
+    for relative in DIRECT_EXECUTABLES:
+        path = skill_dir / relative
+        if path.is_symlink() or not path.is_file():
+            return False, f"required direct executable is missing or unsafe: {relative}"
+        if normalized_file_mode(path) != 0o755:
+            return False, f"required direct executable lacks execute bits: {relative}"
+    return True, f"verified={len(DIRECT_EXECUTABLES)}"
 
 
 def json_loads(path: Path) -> bool:
@@ -290,29 +310,44 @@ def weekly_evidence_smoke() -> tuple[bool, str]:
     return True, ""
 
 
-def package_matches_source() -> tuple[bool, str]:
-    package = ROOT / "dist" / "openclaw-discord-server-backup.skill"
+def package_matches_source(
+    package: Path | None = None,
+    skill_dir: Path = SKILL_DIR,
+) -> tuple[bool, str]:
+    package = package or ROOT / "dist" / "openclaw-discord-server-backup.skill"
     if not package.is_file():
         return False, "dist package is missing"
-    expected: dict[str, bytes] = {}
-    for path in sorted(SKILL_DIR.rglob("*")):
+    expected: dict[str, tuple[bytes, int]] = {}
+    for path in sorted(skill_dir.rglob("*")):
         if (
             not path.is_file()
-            or "__pycache__" in path.relative_to(SKILL_DIR).parts
+            or "__pycache__" in path.relative_to(skill_dir).parts
             or path.suffix == ".pyc"
             or path.name == ".DS_Store"
         ):
             continue
-        name = f"{SKILL_DIR.name}/{path.relative_to(SKILL_DIR).as_posix()}"
-        expected[name] = path.read_bytes()
+        name = f"{skill_dir.name}/{path.relative_to(skill_dir).as_posix()}"
+        expected[name] = (path.read_bytes(), normalized_file_mode(path))
     try:
         with ZipFile(package) as archive:
-            names = set(archive.namelist())
+            member_names = archive.namelist()
+            if len(member_names) != len(set(member_names)):
+                return False, "package contains duplicate members"
+            names = set(member_names)
             if names != set(expected):
                 return False, f"package file set mismatch: missing={sorted(set(expected)-names)}, extra={sorted(names-set(expected))}"
-            for name, content in expected.items():
-                if archive.read(name) != content:
+            for name, (content, mode) in expected.items():
+                info = archive.getinfo(name)
+                if info.create_system != 3:
+                    return False, f"package member is not Unix metadata: {name}"
+                archived_unix_mode = (info.external_attr >> 16) & 0xFFFF
+                if stat.S_IFMT(archived_unix_mode) != stat.S_IFREG:
+                    return False, f"package member is not a regular file: {name}"
+                if archive.read(info) != content:
                     return False, f"package content mismatch: {name}"
+                archived_mode = stat.S_IMODE(archived_unix_mode)
+                if archived_mode != mode:
+                    return False, f"package mode mismatch: {name} expected={mode:04o} actual={archived_mode:04o}"
     except (OSError, BadZipFile) as exc:
         return False, f"package unreadable: {exc}"
     return True, ""
@@ -348,6 +383,8 @@ def main() -> int:
     ]
     check("layout detected", LAYOUT in {"repository", "installed"}, LAYOUT, results)
     check("required skill files exist", all((SKILL_DIR / rel).exists() for rel in skill_required), results=results)
+    ok, detail = direct_executables_ready()
+    check("directly invoked helpers executable", ok, detail, results)
 
     if IS_REPOSITORY_LAYOUT:
         examples = ["examples/config.example.json", "examples/state.example.json", "examples/queue.example.json"]

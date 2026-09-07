@@ -67,6 +67,11 @@ class SkillSwap:
     changed: bool
 
 
+def normalized_file_mode(path: Path) -> int:
+    """Return the release identity for one regular file's execute bits."""
+    return 0o755 if path.stat().st_mode & stat.S_IXUSR else 0o644
+
+
 def canonical_json(data: Any) -> bytes:
     return (json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -197,7 +202,8 @@ def skill_tree_hash(path: Path) -> str:
         if item.is_dir():
             digest.update(b"D\0" + encoded + b"\0")
         elif item.is_file():
-            digest.update(b"F\0" + encoded + b"\0" + hashlib.sha256(item.read_bytes()).digest())
+            mode = f"{normalized_file_mode(item):04o}".encode("ascii")
+            digest.update(b"F\0" + encoded + b"\0" + mode + b"\0" + hashlib.sha256(item.read_bytes()).digest())
         else:
             raise InstallError("Skill tree contains a non-regular entry")
     return digest.hexdigest()
@@ -302,6 +308,9 @@ def stage_and_swap_skill(source: Path, target: Path) -> SkillSwap:
     if any(item.is_symlink() for item in staged.rglob("*")):
         shutil.rmtree(staged)
         raise InstallError("Skill package contains a symlink")
+    if skill_tree_hash(source) != skill_tree_hash(staged):
+        shutil.rmtree(staged)
+        raise InstallError("staged Skill differs from source")
     check = subprocess.run([sys.executable, str(staged / "scripts/post_run_check.py")], text=True, capture_output=True, check=False)
     if check.returncode != 0:
         shutil.rmtree(staged)

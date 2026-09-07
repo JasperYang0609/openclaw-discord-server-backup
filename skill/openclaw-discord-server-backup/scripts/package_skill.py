@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import tempfile
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+def normalized_file_mode(path: Path) -> int:
+    """Return the deterministic archive mode for one regular file."""
+    return 0o755 if path.stat().st_mode & stat.S_IXUSR else 0o644
 
 
 def include_file(path: Path, skill_dir: Path) -> bool:
@@ -38,8 +42,8 @@ def package(skill_dir: Path, output: Path) -> None:
                 relative = skill_dir.name / path.relative_to(skill_dir)
                 info = ZipInfo(relative.as_posix(), date_time=FIXED_ZIP_TIME)
                 info.compress_type = ZIP_DEFLATED
-                mode = 0o755 if os.access(path, os.X_OK) else 0o644
-                info.external_attr = (mode & 0xFFFF) << 16
+                mode = normalized_file_mode(path)
+                info.external_attr = (stat.S_IFREG | mode) << 16
                 info.create_system = 3
                 archive.writestr(info, path.read_bytes())
         temp_path.replace(output)
