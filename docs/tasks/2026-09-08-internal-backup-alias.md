@@ -29,5 +29,14 @@ rollback guarantees.
 - Staged agent prompts match OpenClaw's durable contract after its single terminal
   newline normalization.
 - Independent review reports no open P0-P3.
+- One-shot command and persistent-session canaries omit the cron-only
+  `--exact` flag required by OpenClaw 2026.7.1-2; recurring production jobs
+  retain their exact schedules.
+- Canary cleanup tolerates an inventory-to-delete disappearance race only when
+  an authoritative follow-up inventory proves the declaration is absent.
+- The persistent-session overlap canary supports OpenClaw's single-flight
+  behavior: one simultaneous manual trigger may be rejected, but it must pass
+  a bounded retry after the first flight and the final trace must prove two
+  complete, non-overlapping executions.
 - Live retry returns READY, exact 11/11 readback passes, and legacy jobs remain
   disabled rather than deleted.

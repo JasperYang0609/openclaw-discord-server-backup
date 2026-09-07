@@ -34,10 +34,9 @@
 - Business-logic negatives: external, broken, chained, file, root-level, ownership
   mismatch, retargeted alias, parent replacement, raw-root replacement, and alias
   target replacement.
-- Verification: 243/243 tests PASS; post-run check PASS including package/source
+- Verification: 248/248 tests PASS; post-run check PASS including package/source
   parity, cron-manifest validation, and both restore smokes. Evidence:
-  `logs/tool-runs/20260908_015900_daily-message-final-full-pytest.log` and
-  `logs/tool-runs/20260908_020005_daily-message-final-postcheck.log`.
+  `logs/tool-runs/20260908_022729_daily-canary-final-full-gates.log`.
 - Static checks: Python compilation, diff whitespace, and changed-content secret-shape
   scan PASS. Evidence:
   `logs/tool-runs/20260908_020324_daily-message-final-static.log`.
@@ -46,8 +45,19 @@
 - Live disabled temporary agent-message readback matched the exact normalized
   contract and was removed. Evidence:
   `logs/tool-runs/20260908_015945_daily-message-live-readback.log`.
+- Live command and persistent-session canaries PASS after the compatibility
+  fixes. Evidence: `logs/tool-runs/20260908_021957_daily-command-canary-fixed.log`
+  and `logs/tool-runs/20260908_022620_daily-session-singleflight-live.log`.
 - Independent release-quality review: three race regressions, live alias identity,
   complete tests, package parity, and self-check PASS.
 - Open P0/P1/P2/P3: 0/0/0/0.
+- Compatibility: one-shot `--at` canaries do not pass the cron-only `--exact`
+  flag; this keeps the pre-activation execution gates runnable without changing
+  the exact schedule contract of any managed recurring job.
+- Cleanup is fail closed: an `rm` race is accepted only when immediate global
+  readback proves no matching canary declaration remains.
+- A single-flight rejection is not treated as completion: the rejected canary
+  must succeed on one bounded post-flight retry, and the trace must still show
+  two complete serial executions with no overlap marker.
 - Release decision: RELEASE_READY for commit and the already-authorized controlled
   cutover; live readback and natural-schedule validation remain separate gates.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -97,6 +98,58 @@ class FakeClient:
 
     def persistent_session_canary(self, workspace, target, agent):
         self.events.append(("persistent", target, agent))
+
+
+def test_one_shot_canaries_do_not_use_cron_only_exact_flag():
+    # OpenClaw 2026.7.1-2 rejects --exact together with the one-shot --at
+    # schedule. The production recurring jobs still use --exact.
+    assert '"--exact"' not in inspect.getsource(manager.OpenClawCronClient.canary)
+    assert '"--exact"' not in inspect.getsource(manager.OpenClawCronClient.persistent_session_canary)
+
+
+def test_canary_cleanup_accepts_rm_race_only_after_absence_readback(monkeypatch):
+    client = manager.OpenClawCronClient("openclaw")
+    key = "canary-race"
+    inventories = iter([[{"id": "gone", "declarationKey": key}], []])
+    monkeypatch.setattr(client, "list_jobs", lambda: next(inventories))
+    monkeypatch.setattr(client, "remove", lambda _job_id: (_ for _ in ()).throw(manager.CronManagerError("gone")))
+    client.remove_declaration_key(key)
+
+
+def test_canary_cleanup_rejects_rm_failure_when_declaration_remains(monkeypatch):
+    client = manager.OpenClawCronClient("openclaw")
+    key = "canary-remains"
+    monkeypatch.setattr(client, "list_jobs", lambda: [{"id": "still-here", "declarationKey": key}])
+    monkeypatch.setattr(client, "remove", lambda _job_id: (_ for _ in ()).throw(manager.CronManagerError("busy")))
+    with pytest.raises(manager.CronManagerError, match="remained"):
+        client.remove_declaration_key(key)
+
+
+class CanaryProcess:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+    def communicate(self, timeout):
+        assert timeout == 180
+        return "", ""
+
+
+def test_persistent_canary_retries_one_single_flight_rejection(monkeypatch):
+    client = manager.OpenClawCronClient("openclaw")
+    calls = []
+    monkeypatch.setattr(client, "run", lambda args, **kwargs: calls.append((args, kwargs)))
+    client.complete_parallel_canary_runs(
+        ["first", "second"], [CanaryProcess(1), CanaryProcess(0)],
+    )
+    assert calls == [(["cron", "run", "first", "--wait", "--wait-timeout", "2m"], {"timeout_seconds": 180})]
+
+
+def test_persistent_canary_rejects_when_both_parallel_runs_fail():
+    client = manager.OpenClawCronClient("openclaw")
+    with pytest.raises(manager.CronManagerError, match="every concurrent run"):
+        client.complete_parallel_canary_runs(
+            ["first", "second"], [CanaryProcess(1), CanaryProcess(1)],
+        )
 
 
 class MutateThenFailClient(FakeClient):

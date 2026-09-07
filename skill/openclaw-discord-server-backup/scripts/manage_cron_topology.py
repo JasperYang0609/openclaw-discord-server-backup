@@ -1109,7 +1109,13 @@ class OpenClawCronClient:
     def remove_declaration_key(self, declaration_key: str) -> None:
         matches = [job for job in self.list_jobs() if str(job.get("declarationKey") or "") == declaration_key]
         for job in matches:
-            self.remove(str(job["id"]))
+            try:
+                self.remove(str(job["id"]))
+            except CronManagerError:
+                # A one-shot canary can disappear between inventory and rm.
+                # Treat that race as successful only when the authoritative
+                # post-delete inventory proves the declaration is absent.
+                pass
         remaining = [job for job in self.list_jobs() if str(job.get("declarationKey") or "") == declaration_key]
         if remaining:
             raise CronManagerError("temporary canary declaration remained after cleanup")
@@ -1119,7 +1125,7 @@ class OpenClawCronClient:
         args = [
             "cron", "add", "--name", "Discord backup isolated command canary",
             "--at", "+1h", "--declaration-key", key,
-            "--session", "isolated", "--exact", "--no-deliver",
+            "--session", "isolated", "--no-deliver",
             "--command-argv", json.dumps([sys.executable, "-c", "from pathlib import Path; print(Path.cwd()); print('TOOL_OK')"]),
             "--command-cwd", str(workspace), "--timeout-seconds", "60",
             "--no-output-timeout-seconds", "30", "--output-max-bytes", "8192", "--json",
@@ -1176,7 +1182,7 @@ class OpenClawCronClient:
                     args = [
                         "cron", "add", "--name", f"Discord daily session canary {label}",
                         "--at", "+1h", "--declaration-key", key,
-                        "--session", session_target, "--exact", "--no-deliver",
+                        "--session", session_target, "--no-deliver",
                         "--message", message, "--agent", agent, "--tools", "exec",
                         "--light-context", "--timeout-seconds", "120", "--json",
                     ]
@@ -1188,12 +1194,7 @@ class OpenClawCronClient:
                     )
                     for job_id in job_ids
                 ]
-                for process in processes:
-                    _, _stderr = process.communicate(timeout=180)
-                    if process.returncode != 0:
-                        raise CronManagerError(
-                            f"persistent-session overlap canary failed (exit={process.returncode})"
-                        )
+                self.complete_parallel_canary_runs(job_ids, processes)
                 trace = state_dir / "trace.jsonl"
                 if (state_dir / "overlap").exists() or not trace.is_file():
                     raise CronManagerError("persistent-session overlap canary detected concurrent execution")
@@ -1219,6 +1220,26 @@ class OpenClawCronClient:
             raise CronManagerError(f"persistent-session canary cleanup failed for {len(cleanup_errors)} job(s)")
         if primary_error:
             raise primary_error
+
+    def complete_parallel_canary_runs(
+        self, job_ids: list[str], processes: list[subprocess.Popen[str]],
+    ) -> None:
+        rejected: list[str] = []
+        for job_id, process in zip(job_ids, processes):
+            _, _stderr = process.communicate(timeout=180)
+            if process.returncode != 0:
+                rejected.append(job_id)
+        # OpenClaw 2026.7.1-2 enforces a single flight for one persistent
+        # session by rejecting one of two simultaneous manual triggers. Accept
+        # that only as an intermediate state: after the successful flight has
+        # ended, the rejected job must run successfully on a bounded retry.
+        if len(rejected) > 1:
+            raise CronManagerError("persistent-session overlap canary rejected every concurrent run")
+        if rejected:
+            self.run(
+                ["cron", "run", rejected[0], "--wait", "--wait-timeout", "2m"],
+                timeout_seconds=180,
+            )
 
 
 def cron_add_args(job: dict[str, Any], *, disabled: bool) -> list[str]:
