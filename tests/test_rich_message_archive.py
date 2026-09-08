@@ -549,6 +549,22 @@ def test_component_only_embed_poll_snapshot_reply_and_status_all_render():
     assert rich.parse_markdown_markers(rendered) == [(record["messageId"], record["visiblePayloadSha256"])]
 
 
+def test_live_embed_reference_and_media_descriptions_are_known_and_rendered():
+    record = normalize(message(content="", embeds=[{
+        "reference_id": "reference-1",
+        "thumbnail": {
+            "url": "https://example.com/thumbnail.png",
+            "description": "縮圖替代說明",
+        },
+    }]))
+
+    assert record["unknownVisibleFields"] == []
+    assert rich.validate_record(record, require_assets=False)["ok"]
+    rendered = rich.render_message(record)
+    assert "reference-1" in rendered
+    assert "縮圖替代說明" in rendered
+
+
 def test_markdown_escapes_html_links_images_and_message_cannot_forge_machine_marker():
     record = normalize(message(
         content="<img src=x onerror=alert(1)>\n![tracking](https://evil.test/pixel)\n"
@@ -1476,6 +1492,164 @@ def test_materialized_stage_resume_rebinds_only_signed_url_churn_without_redownl
         assert final.is_dir()
         assert fresh_token.closed
         assert rich.verify_sealed_full_rebuild_run(second_context)["gateStatus"] == "PASS"
+    finally:
+        second_context.close()
+
+
+def test_materialized_stage_resume_discards_only_valid_interrupted_evidence_prefix(
+    monkeypatch,
+    tmp_path,
+):
+    store = make_store(tmp_path)
+    limits = rich.AssetLimits(disk_reserve_bytes=0)
+    source = message(attachments=[{
+        "id": "900",
+        "filename": "resume.bin",
+        "size": 3,
+        "url": "https://cdn.discordapp.com/attachments/1/resume.bin",
+    }])
+    first_context = full_run_context(tmp_path, limits=limits)
+    try:
+        lock_token = context_lock_token(first_context)
+        token = live_evidence(store, "interrupted-evidence", first_context, [source])
+        stage = store.materialize_full_stage_from_live_evidence(
+            generation_id="interrupted-evidence",
+            live_evidence_token=token,
+            downloader=rich.AssetDownloader(
+                opener=FakeOpener([FakeResponse(body=b"abc")]),
+                resolver=global_resolver,
+                limits=limits,
+            ),
+            lock_token=lock_token,
+        )
+        store.reserve_full_stage_assets(
+            stage,
+            run_context=first_context,
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            lock_token=lock_token,
+        )
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                rich,
+                "_build_runtime_pass_receipt",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    rich.GenerationError("simulated interruption")
+                ),
+            )
+            with pytest.raises(rich.GenerationError, match="simulated interruption"):
+                store.install_full_pass_evidence(
+                    stage,
+                    live_evidence_token=token,
+                    lock_token=lock_token,
+                )
+    finally:
+        first_context.close()
+
+    assert (stage / "receipts/full-run-asset-reservation.json").is_file()
+    assert (stage / "receipts/live-inventory-evidence.json").is_file()
+    second_context = full_run_context(tmp_path, limits=limits)
+    try:
+        lock_token = context_lock_token(second_context)
+        fresh_token = live_evidence(
+            store, "interrupted-evidence", second_context, [source],
+        )
+        rebound = store.rebind_materialized_full_stage_from_live_evidence(
+            stage,
+            live_evidence_token=fresh_token,
+            lock_token=lock_token,
+        )
+        assert rebound["records"] == 1
+        assert {path.name for path in (stage / "receipts").iterdir()} == {
+            "stage-base-current.json",
+        }
+        store.reserve_full_stage_assets(
+            stage,
+            run_context=second_context,
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            lock_token=lock_token,
+        )
+        installed = store.install_full_pass_evidence(
+            stage,
+            live_evidence_token=fresh_token,
+            lock_token=lock_token,
+        )
+        final = store.seal_full_stage_for_root_run(
+            stage,
+            "interrupted-evidence",
+            installed["manifest"]["generationSha256"],
+            live_evidence_token=fresh_token,
+            lock_token=lock_token,
+            run_context=second_context,
+        )
+        assert final.is_dir()
+    finally:
+        second_context.close()
+
+
+def test_materialized_stage_resume_rejects_tampered_interrupted_reservation(
+    monkeypatch,
+    tmp_path,
+):
+    store = make_store(tmp_path)
+    limits = rich.AssetLimits(disk_reserve_bytes=0)
+    source = message(content="")
+    first_context = full_run_context(tmp_path, limits=limits)
+    try:
+        lock_token = context_lock_token(first_context)
+        token = live_evidence(store, "tampered-interrupted", first_context, [source])
+        stage = store.materialize_full_stage_from_live_evidence(
+            generation_id="tampered-interrupted",
+            live_evidence_token=token,
+            downloader=rich.AssetDownloader(
+                opener=FakeOpener([]),
+                resolver=global_resolver,
+                limits=limits,
+            ),
+            lock_token=lock_token,
+        )
+        store.reserve_full_stage_assets(
+            stage,
+            run_context=first_context,
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            lock_token=lock_token,
+        )
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                rich,
+                "_build_runtime_pass_receipt",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    rich.GenerationError("simulated interruption")
+                ),
+            )
+            with pytest.raises(rich.GenerationError, match="simulated interruption"):
+                store.install_full_pass_evidence(
+                    stage,
+                    live_evidence_token=token,
+                    lock_token=lock_token,
+                )
+    finally:
+        first_context.close()
+
+    reservation_path = stage / "receipts/full-run-asset-reservation.json"
+    reservation = json.loads(reservation_path.read_text())
+    reservation["reservationId"] = "f" * 64
+    rich.atomic_json(reservation_path, reservation)
+    second_context = full_run_context(tmp_path, limits=limits)
+    try:
+        token = live_evidence(
+            store, "tampered-interrupted", second_context, [source],
+        )
+        with pytest.raises(rich.AssetDownloadError, match="checksum mismatch"):
+            store.rebind_materialized_full_stage_from_live_evidence(
+                stage,
+                live_evidence_token=token,
+                lock_token=context_lock_token(second_context),
+            )
+        assert reservation_path.is_file()
+        assert (stage / "receipts/live-inventory-evidence.json").is_file()
     finally:
         second_context.close()
 

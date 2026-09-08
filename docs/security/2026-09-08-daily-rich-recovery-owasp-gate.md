@@ -98,3 +98,20 @@ remain covered below.
   cumulative active-probe cap regressions.
 - Release decision remains `BLOCKED` pending exact-commit install, live
   baseline completion, cursor catch-up, and natural-schedule acceptance.
+
+## Embed schema and interrupted-prefix candidate evidence
+
+- Newly observed `embed.reference_id` and media `description` leaves are
+  explicitly classified and remain present in deterministic structured
+  Markdown. Unrecognized nested embed leaves still fail closed.
+- Interrupted recovery accepts only base receipt plus a valid asset reservation
+  and optional checksummed live evidence. Audit receipts, manifests, unsafe or
+  unexplained files, dependency gaps, checksum drift, and attachment-byte
+  mismatch are rejected before cleanup.
+- Fresh Discord evidence rewrites canonical/raw records before local and prior
+  evidence verification; only then are obsolete incomplete receipts removed
+  and a new run-bound reservation permitted.
+- Full repository suite 450/450 PASS, including six focused schema/recovery
+  tests and a tampered reservation that leaves all evidence files untouched.
+  Release remains `BLOCKED` pending exact install, live 182/182 baseline,
+  catch-up, and natural run.

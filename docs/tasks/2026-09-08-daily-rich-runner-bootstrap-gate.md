@@ -100,3 +100,29 @@ Candidate evidence: 447/447 tests PASS, including a long non-probe wall-time
 gap regression and a cumulative active-probe elapsed-cap rejection. Live
 baseline continuation and final installed/natural-schedule acceptance remain
 pending.
+
+## Live embed schema and interrupted evidence prefix
+
+The sixth live entry then failed closed because Discord returned two preserved
+embed leaves that the independent census had not yet classified:
+`embed.reference_id` and media `description`. Both leaves were already retained
+and included in deterministic structured Markdown; the schema census now
+classifies them explicitly while continuing to reject any other unknown nested
+embed field.
+
+The same interruption occurred after attachment reservation and persisted live
+evidence but before an audit receipt or manifest. Resume now accepts only that
+exact incomplete prefix. It verifies regular single-link topology, the
+reservation checksum and every referenced attachment byte, the persisted
+evidence checksum and entry identity, and fresh Discord equivalence. It then
+rewrites canonical/raw records from the fresh collector, verifies the prior
+evidence against the rewritten generation, and removes only the obsolete
+reservation/live-evidence receipts before creating a new run-bound reservation.
+Any manifest, audit receipt, unexplained file, broken dependency, checksum
+change, semantic drift, or attachment mismatch still fails closed with zero
+cleanup.
+
+Candidate evidence: 450/450 repository tests PASS, including six focused
+resume/schema regressions, successful interrupted-prefix recovery, and
+tampered-reservation rejection. Exact-commit install and live continuation
+remain pending.

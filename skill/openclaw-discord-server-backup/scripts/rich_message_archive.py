@@ -285,6 +285,7 @@ KNOWN_COMPONENT_KEYS = frozenset({
 KNOWN_EMBED_KEYS = frozenset({
     "title", "type", "description", "url", "timestamp", "color", "footer", "image",
     "thumbnail", "video", "provider", "author", "fields", "flags", "content_scan_version",
+    "reference_id",
 })
 KNOWN_POLL_KEYS = frozenset({
     "question", "answers", "expiry", "allow_multiselect", "layout_type", "results",
@@ -301,9 +302,9 @@ KNOWN_SNAPSHOT_MESSAGE_KEYS = frozenset({
 })
 KNOWN_EMBED_NESTED_KEYS = {
     "footer": frozenset({"text", "icon_url", "proxy_icon_url"}),
-    "image": frozenset({"url", "proxy_url", "height", "width", "content_type", "placeholder", "placeholder_version", "flags"}),
-    "thumbnail": frozenset({"url", "proxy_url", "height", "width", "content_type", "placeholder", "placeholder_version", "flags"}),
-    "video": frozenset({"url", "proxy_url", "height", "width", "content_type", "placeholder", "placeholder_version", "flags"}),
+    "image": frozenset({"url", "proxy_url", "height", "width", "content_type", "placeholder", "placeholder_version", "flags", "description"}),
+    "thumbnail": frozenset({"url", "proxy_url", "height", "width", "content_type", "placeholder", "placeholder_version", "flags", "description"}),
+    "video": frozenset({"url", "proxy_url", "height", "width", "content_type", "placeholder", "placeholder_version", "flags", "description"}),
     "provider": frozenset({"name", "url"}),
     "author": frozenset({"name", "url", "icon_url", "proxy_icon_url"}),
     "fields": frozenset({"name", "value", "inline"}),
@@ -4968,7 +4969,9 @@ class RichArchiveStore:
 
         This is intentionally narrower than a normal resume.  It accepts only
         a stage that stopped after all canonical/raw/attachment bytes were
-        written but before any reservation, PASS receipt, or manifest existed.
+        written.  A cryptographically valid, incomplete reservation/PASS
+        evidence prefix may be discarded before the fresh rebind; unexplained
+        or inconsistent evidence remains fail closed.
         Fresh records may differ from staged records only by verified Discord
         CDN signature query churn; completed local attachment receipts are
         grafted onto the fresh source records after their bytes are rehashed.
@@ -5014,32 +5017,68 @@ class RichArchiveStore:
                 receipts_root = contained_path(stage, "receipts")
                 if receipts_root.is_symlink() or not receipts_root.is_dir():
                     raise GenerationError("materialized resume receipt directory is invalid")
+                receipt_entries = list(receipts_root.iterdir())
                 receipt_files = {
                     path.name
-                    for path in receipts_root.iterdir()
+                    for path in receipt_entries
                     if path.is_file() or path.is_symlink()
                 }
-                if receipt_files != {"stage-base-current.json"} or any(
-                    not _regular_single_link(path)
-                    for path in receipts_root.iterdir()
+                if any(not _regular_single_link(path) for path in receipt_entries):
+                    raise GenerationError("materialized resume stage has unsafe receipts")
+                allowed_receipts = {
+                    "stage-base-current.json",
+                    "full-run-asset-reservation.json",
+                    "live-inventory-evidence.json",
+                }
+                if (
+                    "stage-base-current.json" not in receipt_files
+                    or not receipt_files <= allowed_receipts
                 ):
                     raise GenerationError("materialized resume stage has advanced receipts")
-                if os.path.lexists(stage / "generation-manifest.json"):
+                manifest_path = stage / "generation-manifest.json"
+                manifest_present = os.path.lexists(manifest_path)
+                if manifest_present:
                     raise GenerationError("materialized resume stage is already manifested")
 
-                projection = _generation_projection(stage)
-                if any(
-                    int(projection[field]) != 0
-                    for field in (
-                        "duplicateCanonicalIds",
-                        "unknownVisibleFields",
-                        "attachmentErrors",
-                        "sectionCoverageErrors",
-                        "markdownErrors",
-                    )
-                ) or projection["binaryExpected"] != projection["binaryVerified"]:
-                    raise GenerationError("materialized resume stage failed local verification")
+                old_records, old_by_day, duplicate_ids = _load_generation_records(stage)
+                if duplicate_ids:
+                    raise GenerationError("materialized resume stage has duplicate records")
                 _verified_generation_assets(stage)
+
+                advanced_receipts = receipt_files - {"stage-base-current.json"}
+                if advanced_receipts:
+                    identity = _validated_entry_identity(
+                        registration["evidence"].get("entryIdentity")
+                    )
+                    if "full-run-asset-reservation.json" not in advanced_receipts:
+                        raise GenerationError(
+                            "materialized resume advanced evidence lacks asset reservation"
+                        )
+                    _validated_persisted_asset_reservation(stage, identity)
+                    if "live-inventory-evidence.json" in advanced_receipts:
+                        old_evidence = json.loads(
+                            (receipts_root / "live-inventory-evidence.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        if (
+                            not isinstance(old_evidence, Mapping)
+                            or old_evidence.get("schemaVersion") != LIVE_EVIDENCE_SCHEMA
+                            or old_evidence.get("entryIdentity") != identity
+                        ):
+                            raise GenerationError(
+                                "materialized resume persisted live evidence is invalid"
+                            )
+                        old_evidence_body = dict(old_evidence)
+                        old_evidence_sha256 = old_evidence_body.pop("evidenceSha256", None)
+                        if old_evidence_sha256 != json_sha256(old_evidence_body):
+                            raise GenerationError(
+                                "materialized resume persisted live evidence is invalid"
+                            )
+                    elif advanced_receipts - {"full-run-asset-reservation.json"}:
+                        raise GenerationError(
+                            "materialized resume advanced receipt dependency is invalid"
+                        )
 
                 fresh_value = registration.get("normalizedRecords")
                 if not isinstance(fresh_value, list) or any(
@@ -5047,7 +5086,6 @@ class RichArchiveStore:
                 ):
                     raise GenerationError("materialized resume fresh records are missing")
                 fresh_records = json.loads(json.dumps(fresh_value, ensure_ascii=False))
-                old_records = projection["records"]
                 if {str(row.get("messageId") or "") for row in fresh_records} != set(old_records):
                     raise GenerationError("materialized resume message set changed")
 
@@ -5067,16 +5105,9 @@ class RichArchiveStore:
                 for fresh_record in fresh_records:
                     message_id = str(fresh_record.get("messageId") or "")
                     old_record = old_records[message_id]
-                    old_outcome = validate_record(
-                        old_record,
-                        require_assets=True,
-                        generation_root=stage,
-                    )
                     fresh_outcome = validate_record(fresh_record, require_assets=False)
                     if (
-                        old_outcome["unknownVisibleFields"]
-                        or old_outcome["attachmentErrors"]
-                        or fresh_outcome["unknownVisibleFields"]
+                        fresh_outcome["unknownVisibleFields"]
                         or fresh_outcome["attachmentErrors"]
                         or old_record.get("createdTimestamp") != fresh_record.get("createdTimestamp")
                         or _resume_stable_live_binding(_active_live_binding(old_record))
@@ -5129,11 +5160,11 @@ class RichArchiveStore:
                         TZ_TAIPEI
                     ).date().isoformat()
                     by_day.setdefault(day, []).append(record)
-                if set(by_day) != set(projection["byDay"]):
+                if set(by_day) != set(old_by_day):
                     raise GenerationError("materialized resume day partition changed")
 
                 expected_files = {
-                    "receipts/stage-base-current.json",
+                    *{f"receipts/{name}" for name in receipt_files},
                     *{f"canonical/{day}.jsonl" for day in by_day},
                     *{f"raw/{day}.md" for day in by_day},
                 }
@@ -5176,6 +5207,25 @@ class RichArchiveStore:
                 ) or rebound_projection["binaryExpected"] != rebound_projection["binaryVerified"]:
                     raise GenerationError("materialized resume rebound stage failed verification")
                 _verified_generation_assets(stage)
+                if "live-inventory-evidence.json" in advanced_receipts:
+                    _validated, old_errors = _validated_live_evidence(
+                        stage,
+                        old_evidence,
+                        rebound_projection,
+                    )
+                    if old_errors:
+                        raise GenerationError(
+                            "materialized resume persisted live evidence is invalid"
+                        )
+                if advanced_receipts:
+                    self._require_active_lock_lease(lock_token)
+                    for name in (
+                        "live-inventory-evidence.json",
+                        "full-run-asset-reservation.json",
+                    ):
+                        if name in advanced_receipts:
+                            (receipts_root / name).unlink()
+                    _fsync_dir(receipts_root)
                 stable_bindings = [
                     _resume_stable_live_binding(_active_live_binding(row))
                     for row in sorted(rebound, key=lambda item: int(str(item["messageId"])))
