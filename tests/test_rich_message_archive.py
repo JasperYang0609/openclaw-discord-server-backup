@@ -1502,12 +1502,21 @@ def test_materialized_stage_resume_discards_only_valid_interrupted_evidence_pref
 ):
     store = make_store(tmp_path)
     limits = rich.AssetLimits(disk_reserve_bytes=0)
-    source = message(attachments=[{
-        "id": "900",
-        "filename": "resume.bin",
-        "size": 3,
-        "url": "https://cdn.discordapp.com/attachments/1/resume.bin",
-    }])
+    source = message(
+        attachments=[{
+            "id": "900",
+            "filename": "resume.bin",
+            "size": 3,
+            "url": "https://cdn.discordapp.com/attachments/1/resume.bin",
+        }],
+        embeds=[{
+            "reference_id": "reference-1",
+            "thumbnail": {
+                "url": "https://example.com/thumbnail.png",
+                "description": "縮圖替代說明",
+            },
+        }],
+    )
     first_context = full_run_context(tmp_path, limits=limits)
     try:
         lock_token = context_lock_token(first_context)
@@ -1548,6 +1557,24 @@ def test_materialized_stage_resume_discards_only_valid_interrupted_evidence_pref
 
     assert (stage / "receipts/full-run-asset-reservation.json").is_file()
     assert (stage / "receipts/live-inventory-evidence.json").is_file()
+    records, by_day, _duplicates = rich._load_generation_records(stage)
+    old_record = next(iter(records.values()))
+    reclassified = {
+        "/embeds/0/reference_id",
+        "/embeds/0/thumbnail/description",
+    }
+    for field in old_record["sourceCensus"]["fields"]:
+        if field["pointer"] in reclassified:
+            field["class"] = "unknown_visible"
+    old_record["sourceCensus"]["unknownVisibleFields"] = sorted(reclassified)
+    old_record["sourceCensus"]["censusSha256"] = rich.json_sha256(
+        old_record["sourceCensus"]["fields"]
+    )
+    old_record["unknownVisibleFields"] = sorted(reclassified)
+    day = next(iter(by_day))
+    rich.atomic_jsonl(stage / "canonical" / f"{day}.jsonl", [old_record])
+    with pytest.raises(rich.SourceCensusError, match="active source census mismatch"):
+        rich.validate_record(old_record, generation_root=stage)
     second_context = full_run_context(tmp_path, limits=limits)
     try:
         lock_token = context_lock_token(second_context)

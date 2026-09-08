@@ -115,3 +115,10 @@ remain covered below.
   tests and a tampered reservation that leaves all evidence files untouched.
   Release remains `BLOCKED` pending exact install, live 182/182 baseline,
   catch-up, and natural run.
+
+- Recovery may reclassify only derived source-census receipts in memory while
+  verifying pre-existing attachment bytes and the persisted reservation. Fresh
+  Discord records must then pass the complete current validator before any
+  incomplete receipt is removed. The focused regression reproduces the live
+  old-census/new-schema transition and PASSes without weakening unknown-field,
+  identity, reservation, or attachment-integrity gates.

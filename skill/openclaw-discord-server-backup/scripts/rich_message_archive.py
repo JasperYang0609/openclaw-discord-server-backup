@@ -3384,6 +3384,8 @@ def _generation_projection(root: Path) -> dict[str, Any]:
 
 def _verified_generation_assets(
     root: Path,
+    *,
+    allow_source_census_reclassification: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return unique verified in-scope assets and their immutable byte evidence."""
     records, _by_day, duplicate_ids = _load_generation_records(root)
@@ -3391,7 +3393,24 @@ def _verified_generation_assets(
         raise AssetDownloadError("asset reservation rejects duplicate canonical IDs")
     unique: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for record in records.values():
-        outcome = validate_record(record, generation_root=root)
+        try:
+            outcome = validate_record(record, generation_root=root)
+        except SourceCensusError:
+            if not allow_source_census_reclassification:
+                raise
+            validation_record = json.loads(json.dumps(record, ensure_ascii=False))
+            _revision, active_observation = _active_parts(validation_record)
+            validation_record["sourceCensus"] = source_field_census(
+                active_observation["apiSourcePayload"]
+            )
+            validation_record["unknownVisibleFields"] = sorted({
+                pointer
+                for observation in validation_record.get("observations") or []
+                for pointer in source_field_census(
+                    observation["apiSourcePayload"]
+                )["unknownVisibleFields"]
+            })
+            outcome = validate_record(validation_record, generation_root=root)
         if outcome["attachmentErrors"]:
             raise AssetDownloadError("asset reservation requires verified local attachment bytes")
         for observation in record.get("observations") or []:
@@ -3434,6 +3453,8 @@ def _verified_generation_assets(
 def _validated_persisted_asset_reservation(
     stage: Path,
     identity: Mapping[str, str],
+    *,
+    allow_source_census_reclassification: bool = False,
 ) -> dict[str, Any]:
     entry_root, generation_id = _generation_binding(stage)
     relative_part_count = len(PurePosixPath(identity["relativePath"]).parts)
@@ -3448,7 +3469,10 @@ def _validated_persisted_asset_reservation(
     receipt_sha256 = body.pop("receiptSha256", None)
     if receipt_sha256 != json_sha256(body):
         raise AssetDownloadError("full-run asset reservation receipt checksum mismatch")
-    assets, asset_evidence = _verified_generation_assets(stage)
+    assets, asset_evidence = _verified_generation_assets(
+        stage,
+        allow_source_census_reclassification=allow_source_census_reclassification,
+    )
     if (
         body.get("schemaVersion") != ASSET_RESERVATION_SCHEMA
         or not re.fullmatch(r"[0-9a-f]{64}", str(body.get("runContextId") or ""))
@@ -5043,7 +5067,10 @@ class RichArchiveStore:
                 old_records, old_by_day, duplicate_ids = _load_generation_records(stage)
                 if duplicate_ids:
                     raise GenerationError("materialized resume stage has duplicate records")
-                _verified_generation_assets(stage)
+                _verified_generation_assets(
+                    stage,
+                    allow_source_census_reclassification=True,
+                )
 
                 advanced_receipts = receipt_files - {"stage-base-current.json"}
                 if advanced_receipts:
@@ -5054,7 +5081,11 @@ class RichArchiveStore:
                         raise GenerationError(
                             "materialized resume advanced evidence lacks asset reservation"
                         )
-                    _validated_persisted_asset_reservation(stage, identity)
+                    _validated_persisted_asset_reservation(
+                        stage,
+                        identity,
+                        allow_source_census_reclassification=True,
+                    )
                     if "live-inventory-evidence.json" in advanced_receipts:
                         old_evidence = json.loads(
                             (receipts_root / "live-inventory-evidence.json").read_text(

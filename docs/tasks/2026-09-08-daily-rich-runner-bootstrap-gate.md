@@ -126,3 +126,13 @@ Candidate evidence: 450/450 repository tests PASS, including six focused
 resume/schema regressions, successful interrupted-prefix recovery, and
 tampered-reservation rejection. Exact-commit install and live continuation
 remain pending.
+
+Live retry exposed that a newly classified source census makes the old staged
+top-level census receipt intentionally stale before the fresh rewrite. The
+recovery verifier now permits an in-memory census reclassification solely for
+attachment-byte and reservation verification; it reruns the complete record
+validator after replacing canonical/raw content from fresh Discord evidence.
+All non-census record invariants, attachment sizes/hashes, reservation binding,
+message/asset identity, stable live binding, and unknown-field rejection remain
+enforced. The interrupted-prefix test now reproduces this exact old-to-new
+census transition and passes; live continuation is pending.
