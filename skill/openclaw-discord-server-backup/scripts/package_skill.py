@@ -9,9 +9,23 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+PRIVATE_RUNTIME_PATHS = frozenset({
+    "manifests/runtime-components.v1.json",
+    "scripts/rich_message_archive.py",
+    "scripts/rich_core_adapter_v3.py",
+    "scripts/run_daily_sync_v3.py",
+    "scripts/run_managed_component.py",
+})
+
+
 def normalized_file_mode(path: Path) -> int:
     """Return the deterministic archive mode for one regular file."""
     return 0o755 if path.stat().st_mode & stat.S_IXUSR else 0o644
+
+
+def packaged_file_mode(path: Path, skill_dir: Path) -> int:
+    relative = path.relative_to(skill_dir).as_posix()
+    return 0o600 if relative in PRIVATE_RUNTIME_PATHS else normalized_file_mode(path)
 
 
 def include_file(path: Path, skill_dir: Path) -> bool:
@@ -42,7 +56,7 @@ def package(skill_dir: Path, output: Path) -> None:
                 relative = skill_dir.name / path.relative_to(skill_dir)
                 info = ZipInfo(relative.as_posix(), date_time=FIXED_ZIP_TIME)
                 info.compress_type = ZIP_DEFLATED
-                mode = normalized_file_mode(path)
+                mode = packaged_file_mode(path, skill_dir)
                 info.external_attr = (stat.S_IFREG | mode) << 16
                 info.create_system = 3
                 archive.writestr(info, path.read_bytes())

@@ -19,6 +19,20 @@ DIRECT_EXECUTABLES = (
     "scripts/check_daily_sync_gate.py",
     "scripts/backup_health_report.py",
 )
+PRIVATE_RUNTIME_PATHS = frozenset({
+    "manifests/runtime-components.v1.json",
+    "scripts/rich_message_archive.py",
+    "scripts/rich_core_adapter_v3.py",
+    "scripts/run_daily_sync_v3.py",
+    "scripts/run_managed_component.py",
+})
+
+
+def expected_archive_mode(source: Path) -> int:
+    relative = source.relative_to(SKILL).as_posix()
+    if relative in PRIVATE_RUNTIME_PATHS:
+        return 0o600
+    return 0o755 if source.stat().st_mode & stat.S_IXUSR else 0o644
 
 
 def load_post_check():
@@ -124,13 +138,23 @@ class PackageSkillTests(unittest.TestCase):
                     archived = "openclaw-discord-server-backup/" + source.relative_to(SKILL).as_posix()
                     self.assertIn(archived, names)
                     self.assertEqual(archive.read(archived), source.read_bytes(), archived)
-                    expected_mode = 0o755 if source.stat().st_mode & stat.S_IXUSR else 0o644
+                    expected_mode = expected_archive_mode(source)
                     info = archive.getinfo(archived)
                     unix_mode = (info.external_attr >> 16) & 0xFFFF
                     self.assertEqual(info.create_system, 3, archived)
                     self.assertEqual(stat.S_IFMT(unix_mode), stat.S_IFREG, archived)
                     archived_mode = stat.S_IMODE(unix_mode)
                     self.assertEqual(archived_mode, expected_mode, archived)
+
+    def test_private_runtime_members_are_packaged_owner_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = self.build(Path(tmp) / "dist")
+            with ZipFile(package) as archive:
+                for relative in sorted(PRIVATE_RUNTIME_PATHS):
+                    name = f"openclaw-discord-server-backup/{relative}"
+                    info = archive.getinfo(name)
+                    mode = stat.S_IMODE((info.external_attr >> 16) & 0xFFFF)
+                    self.assertEqual(mode, 0o600, name)
 
     def test_packaged_post_run_check_passes_in_installed_layout(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -20,6 +20,7 @@ from typing import Any
 ACTIVE = {"queued", "catching_up", "retry"}
 TZ_TAIPEI = timezone(timedelta(hours=8))
 MAX_429_RETRIES = 8
+RICH_QUEUE_PREFIX = "rich_"
 
 
 def entry_is_excluded(entry: dict[str, Any]) -> bool:
@@ -29,6 +30,36 @@ def entry_is_excluded(entry: dict[str, Any]) -> bool:
         or entry.get("invalidChannel")
         or entry.get("syncStatus") == "excluded"
     )
+
+
+def is_rich_queue_reason(value: Any) -> bool:
+    """Reserve the entire rich_* namespace for the deterministic v2 writer."""
+    return isinstance(value, str) and value.startswith(RICH_QUEUE_PREFIX)
+
+
+def active_rich_queue_keys(
+    state: dict[str, Any], queue: dict[str, Any]
+) -> list[str]:
+    """Return rich work that this legacy Markdown writer must never consume."""
+    entries = state.get("entries") or {}
+    if not isinstance(entries, dict):
+        return []
+    blocked: set[str] = set()
+    for item in queue.get("items") or []:
+        if not isinstance(item, dict) or item.get("status", "queued") not in ACTIVE:
+            continue
+        key = item.get("entryKey")
+        if isinstance(key, str) and is_rich_queue_reason(item.get("reason")):
+            blocked.add(key)
+    for key, entry in entries.items():
+        if (
+            isinstance(key, str)
+            and isinstance(entry, dict)
+            and not entry_is_excluded(entry)
+            and is_rich_queue_reason(entry.get("backlogReason"))
+        ):
+            blocked.add(key)
+    return sorted(blocked)
 
 # When load_json recovers from a .bak file, the recovery source is recorded here
 # and attached to the final output JSON as `recoveredFrom`.
@@ -407,11 +438,20 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
 
     # 1) Active queue always wins. It represents work already discovered by daily
     # sync/audit/backlog and should not be starved by broad stale probes.
-    items = [i for i in queue.get("items", []) if i.get("status", "queued") in ACTIVE]
+    items = [
+        i for i in queue.get("items", [])
+        if i.get("status", "queued") in ACTIVE
+        and not is_rich_queue_reason(i.get("reason"))
+    ]
     items.sort(key=lambda i: (int(i.get("priority") or 50), i.get("createdAt") or "", i.get("relativePath") or ""))
     for item in items:
         key = item.get("entryKey")
-        if key in entries and key not in seen and not entry_is_excluded(entries[key]):
+        if (
+            key in entries
+            and key not in seen
+            and not entry_is_excluded(entries[key])
+            and not is_rich_queue_reason(entries[key].get("backlogReason"))
+        ):
             add(key, entries[key], item)
         if len(selected) >= limit:
             return selected
@@ -423,6 +463,8 @@ def select_candidates(state: dict[str, Any], queue: dict[str, Any], limit: int, 
         if key in seen:
             continue
         if entry_is_excluded(entry):
+            continue
+        if is_rich_queue_reason(entry.get("backlogReason")):
             continue
         if entry.get("syncStatus") in {"partial", "queued", "catching_up", "error"} or entry.get("backlogReason"):
             item = upsert_queue_item(queue, key, entry, "queued", reason=entry.get("backlogReason") or "state_partial", priority=40)
@@ -543,6 +585,16 @@ def main() -> int:
 
     state = load_json(state_path, {})
     queue = load_json(queue_path, {"version": 1, "items": []})
+    rich_blockers = active_rich_queue_keys(state, queue)
+    if rich_blockers:
+        print(json.dumps({
+            "ok": False,
+            "status": "blocked",
+            "reason": "rich_queue_requires_v2_worker",
+            "blockedEntries": len(rich_blockers),
+        }, ensure_ascii=False, sort_keys=True))
+        lock_handle.close()
+        return 2
     token = "" if args.dry_run else load_discord_token(Path(args.openclaw_config), args.token_env)
     run_label = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S %z")
 

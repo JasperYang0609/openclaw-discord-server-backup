@@ -22,13 +22,17 @@ ROLES = {
 }
 
 DAILY_FAILURE_CODES = {
-    "rich_archive_contract_invalid",
-    "rich_archive_current_invalid",
+    "rich_archive_readback_failed",
     "rich_archive_merge_failed",
     "rich_archive_not_initialized",
-    "rich_archive_readback_mismatch",
-    "rich_archive_unavailable",
-    "rich_archive_verification_failed",
+    "rich_asset_budget_exhausted",
+    "rich_baseline_missing",
+    "rich_core_authority_expired",
+    "rich_core_authority_invalid",
+    "rich_core_contract_pending",
+    "rich_core_contract_unsupported",
+    "rich_core_integrity_mismatch",
+    "rich_core_load_failed",
 }
 
 
@@ -154,13 +158,9 @@ def command_for(
             limits.get("dailyMessageLimitPerEntry"), default=60, maximum=60,
             label="daily message limit",
         )
-        freshness_days = bounded_config_int(
-            limits.get("dailyFreshnessDays"), default=2, maximum=7,
-            label="daily freshness window",
-        )
-        lookback_limit = bounded_config_int(
-            limits.get("dailyLookbackLimit"), default=10, maximum=30,
-            label="daily lookback limit",
+        mutable_limit = bounded_config_int(
+            limits.get("dailyMutableRefreshLimit"), default=10, maximum=30,
+            label="daily mutable refresh limit",
         )
         return [[
             python, str(HERE / "run_daily_sync_v3.py"),
@@ -169,16 +169,20 @@ def command_for(
             "--queue", str(queue),
             "--root", str(discord_root),
             "--inventory", str(inventory),
+            "--mapping-ledger", str(mapping),
+            "--guild-id", str(config["guildId"]),
             "--today", today,
             "--timezone", str(config.get("timezone") or "Asia/Taipei"),
             "--openclaw-config", str(openclaw_config),
+            "--workspace", str(workspace),
+            "--backup-config", str(config_path),
             "--max-entries", str(max_entries),
             "--max-write-entries", "4",
-            "--page-limit", "30",
+            "--page-size", "30",
+            "--max-pages-per-entry", "2",
             "--max-messages-per-entry", str(max_messages),
             "--max-read-messages", "180",
-            "--lookback-limit", str(lookback_limit),
-            "--freshness-days", str(freshness_days),
+            "--mutable-refresh-limit", str(mutable_limit),
         ]]
     if role == "caught-up-audit":
         return [[
@@ -401,7 +405,7 @@ def run_role(args: argparse.Namespace) -> int:
             "repairStatus": "失敗告警已啟用，等待重試",
         }]
     producer = (
-        "openclaw-discord-server-backup/daily-sync-v1"
+        "openclaw-discord-server-backup/daily-sync-v2"
         if args.role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}
         else "openclaw-discord-server-backup/run-managed-component.v1"
     )
