@@ -79,3 +79,24 @@ Candidate evidence: 445/445 tests PASS; positive no-redownload resume,
 semantic-asset-change rejection, and tampered-byte rejection PASS; deterministic
 package/source parity and repository post-run check PASS. Live baseline and
 natural-schedule acceptance remain pending.
+
+## Long-running baseline probe-budget repair
+
+The resumed live baseline exposed a separate fail-closed false positive after
+five entries: the 60-second unknown-size metadata budget was implemented as an
+absolute deadline beginning when the full run started. Message enumeration,
+attachment download, hashing, and generation sealing therefore consumed the
+deadline even though they issued no metadata probes.
+
+The budget now charges only elapsed time inside an actual credential-free CDN
+HEAD probe. The shared request-count cap, cumulative active-probe time cap,
+single-request timeout, exact Discord CDN host allowlist, global-address
+resolution, redirect restrictions, content-length validation, and all file,
+entry, run, and disk-capacity quotas remain unchanged. Non-probe work and idle
+time cannot exhaust the metadata budget, while cumulative active probe time
+still fails closed once its configured cap is exceeded.
+
+Candidate evidence: 447/447 tests PASS, including a long non-probe wall-time
+gap regression and a cumulative active-probe elapsed-cap rejection. Live
+baseline continuation and final installed/natural-schedule acceptance remain
+pending.

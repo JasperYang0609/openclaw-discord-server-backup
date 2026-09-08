@@ -1031,6 +1031,60 @@ def test_unknown_size_probe_budget_is_shared_across_batch_records(tmp_path):
     assert opener.requests == []
 
 
+def test_unknown_size_probe_elapsed_budget_ignores_non_probe_wall_time(monkeypatch):
+    first = normalize(message(content="", sticker_items=[{
+        "id": "1500000000000000001", "name": "one", "format_type": 1,
+    }]))
+    second = normalize(message(content="", sticker_items=[{
+        "id": "1500000000000000002", "name": "two", "format_type": 1,
+    }]))
+    clock = iter((100.0, 100.4, 10_000.0, 10_000.4))
+    monkeypatch.setattr(rich.time, "monotonic", lambda: next(clock))
+    limits = rich.AssetLimits(
+        max_unknown_size_probes=2,
+        metadata_probe_elapsed_seconds=1.0,
+    )
+    budget = rich.AssetProbeBudget.from_limits(limits)
+    downloader = rich.AssetDownloader(
+        opener=FakeOpener([FakeResponse(), FakeResponse()]),
+        resolver=global_resolver,
+        limits=limits,
+    )
+
+    rich.resolve_asset_sizes(first, downloader, probe_budget=budget)
+    rich.resolve_asset_sizes(second, downloader, probe_budget=budget)
+
+    assert budget.remaining_requests == 0
+    assert budget.remaining_elapsed_seconds == pytest.approx(0.2)
+
+
+def test_unknown_size_probe_elapsed_budget_caps_cumulative_active_time(monkeypatch):
+    first = normalize(message(content="", sticker_items=[{
+        "id": "1500000000000000001", "name": "one", "format_type": 1,
+    }]))
+    second = normalize(message(content="", sticker_items=[{
+        "id": "1500000000000000002", "name": "two", "format_type": 1,
+    }]))
+    clock = iter((1.0, 1.7, 100.0, 100.5))
+    monkeypatch.setattr(rich.time, "monotonic", lambda: next(clock))
+    limits = rich.AssetLimits(
+        max_unknown_size_probes=2,
+        metadata_probe_elapsed_seconds=1.0,
+    )
+    budget = rich.AssetProbeBudget.from_limits(limits)
+    downloader = rich.AssetDownloader(
+        opener=FakeOpener([FakeResponse(), FakeResponse()]),
+        resolver=global_resolver,
+        limits=limits,
+    )
+
+    rich.resolve_asset_sizes(first, downloader, probe_budget=budget)
+    with pytest.raises(rich.AssetDownloadError, match="elapsed-time cap"):
+        rich.resolve_asset_sizes(second, downloader, probe_budget=budget)
+
+    assert budget.remaining_elapsed_seconds == pytest.approx(-0.2)
+
+
 def test_downloader_closes_response_on_non_success_and_validation_error(tmp_path):
     non_success = FakeResponse(status=500)
     downloader = rich.AssetDownloader(opener=FakeOpener([non_success]), resolver=global_resolver)

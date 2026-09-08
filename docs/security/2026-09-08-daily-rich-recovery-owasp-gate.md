@@ -84,3 +84,17 @@ remain covered below.
   parity, repository post-run check, and diff hygiene PASS.
 - Release decision remains `BLOCKED` until the exact commit is installed and
   the live baseline, cursor catch-up, and natural schedule gates pass.
+
+## Active metadata-probe budget candidate evidence
+
+- The elapsed cap now measures only time spent inside actual CDN metadata
+  probes; unrelated full-run enumeration, download, hashing, sealing, and idle
+  time no longer consume it.
+- The shared request cap and cumulative active-probe time cap remain fail
+  closed. Per-request timeout, exact-host DNS/SSRF controls, redirect limits,
+  credential-free requests, content-length validation, byte/file quotas, and
+  disk reserve are unchanged.
+- Full repository suite: 447/447 PASS, including long non-probe wall-time and
+  cumulative active-probe cap regressions.
+- Release decision remains `BLOCKED` pending exact-commit install, live
+  baseline completion, cursor catch-up, and natural-schedule acceptance.

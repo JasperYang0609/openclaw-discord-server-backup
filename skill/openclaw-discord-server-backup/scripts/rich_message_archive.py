@@ -1549,24 +1549,40 @@ class AssetProbeBudget:
     """One shared unknown-size metadata budget for a batch or full run."""
 
     remaining_requests: int
-    deadline_monotonic: float
+    remaining_elapsed_seconds: float
+    _mutex: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def from_limits(cls, limits: AssetLimits) -> "AssetProbeBudget":
         return cls(
             remaining_requests=limits.max_unknown_size_probes,
-            deadline_monotonic=time.monotonic() + limits.metadata_probe_elapsed_seconds,
+            remaining_elapsed_seconds=limits.metadata_probe_elapsed_seconds,
         )
 
     def ensure_capacity(self, count: int) -> None:
-        if count > self.remaining_requests:
-            raise AssetDownloadError("unknown-size asset metadata probe quota exceeded")
-        if time.monotonic() > self.deadline_monotonic:
-            raise AssetDownloadError("asset metadata probe elapsed-time cap exceeded")
+        with self._mutex:
+            if count > self.remaining_requests:
+                raise AssetDownloadError("unknown-size asset metadata probe quota exceeded")
+            if count and self.remaining_elapsed_seconds <= 0:
+                raise AssetDownloadError("asset metadata probe elapsed-time cap exceeded")
 
     def consume(self) -> None:
-        self.ensure_capacity(1)
-        self.remaining_requests -= 1
+        with self._mutex:
+            self.ensure_capacity(1)
+            self.remaining_requests -= 1
+
+    def charge_elapsed(self, elapsed_seconds: float) -> None:
+        """Charge only time spent performing a metadata probe, not batch idle time."""
+        if elapsed_seconds < 0:
+            raise AssetDownloadError("asset metadata probe elapsed time is invalid")
+        with self._mutex:
+            self.remaining_elapsed_seconds -= elapsed_seconds
+            if self.remaining_elapsed_seconds < 0:
+                raise AssetDownloadError("asset metadata probe elapsed-time cap exceeded")
 
 
 @dataclass
@@ -1975,7 +1991,11 @@ def resolve_asset_sizes(
             row = dict(asset)
             if row.get("inScope") and row.get("declaredSize") is None:
                 budget.consume()
-                row["declaredSize"] = downloader.probe_size(row)
+                started = time.monotonic()
+                try:
+                    row["declaredSize"] = downloader.probe_size(row)
+                finally:
+                    budget.charge_elapsed(max(0.0, time.monotonic() - started))
                 row["sizeSource"] = "http_head"
             output.append(row)
         observation["assetInventory"] = output
