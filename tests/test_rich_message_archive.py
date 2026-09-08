@@ -1351,6 +1351,170 @@ def test_root_atomic_resume_requires_fresh_matching_live_evidence(tmp_path):
         third_context.close()
 
 
+def test_materialized_stage_resume_rebinds_only_signed_url_churn_without_redownload(tmp_path):
+    store = make_store(tmp_path)
+    limits = rich.AssetLimits(disk_reserve_bytes=0)
+    first_source = message(attachments=[{
+        "id": "900",
+        "filename": "resume.bin",
+        "size": 3,
+        "url": "https://cdn.discordapp.com/attachments/1/resume.bin?ex=1&is=2&hm=aaa",
+    }])
+    opener = FakeOpener([FakeResponse(body=b"abc")])
+    first_context = full_run_context(tmp_path, limits=limits)
+    try:
+        first_token = live_evidence(
+            store, "materialized-resume", first_context, [first_source],
+        )
+        stage = store.materialize_full_stage_from_live_evidence(
+            generation_id="materialized-resume",
+            live_evidence_token=first_token,
+            downloader=rich.AssetDownloader(
+                opener=opener,
+                resolver=global_resolver,
+                limits=limits,
+            ),
+            lock_token=context_lock_token(first_context),
+        )
+    finally:
+        first_context.close()
+
+    assert [path.name for path in (stage / "receipts").iterdir()] == [
+        "stage-base-current.json",
+    ]
+    second_source = json.loads(json.dumps(first_source))
+    second_source["attachments"][0]["url"] = (
+        "https://cdn.discordapp.com/attachments/1/resume.bin?ex=9&is=8&hm=bbb"
+    )
+    second_context = full_run_context(tmp_path, limits=limits)
+    try:
+        lock_token = context_lock_token(second_context)
+        fresh_token = live_evidence(
+            store, "materialized-resume", second_context, [second_source],
+        )
+        rebound = store.rebind_materialized_full_stage_from_live_evidence(
+            stage,
+            live_evidence_token=fresh_token,
+            lock_token=lock_token,
+        )
+        assert rebound["records"] == 1
+        assert len(opener.requests) == 1
+        store.reserve_full_stage_assets(
+            stage,
+            run_context=second_context,
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            lock_token=lock_token,
+        )
+        installed = store.install_full_pass_evidence(
+            stage,
+            live_evidence_token=fresh_token,
+            lock_token=lock_token,
+        )
+        final = store.seal_full_stage_for_root_run(
+            stage,
+            "materialized-resume",
+            installed["manifest"]["generationSha256"],
+            live_evidence_token=fresh_token,
+            lock_token=lock_token,
+            run_context=second_context,
+        )
+        assert final.is_dir()
+        assert fresh_token.closed
+        assert rich.verify_sealed_full_rebuild_run(second_context)["gateStatus"] == "PASS"
+    finally:
+        second_context.close()
+
+
+def test_materialized_stage_resume_rejects_semantic_asset_change(tmp_path):
+    store = make_store(tmp_path)
+    limits = rich.AssetLimits(disk_reserve_bytes=0)
+    source = message(attachments=[{
+        "id": "900",
+        "filename": "resume.bin",
+        "size": 3,
+        "url": "https://cdn.discordapp.com/attachments/1/resume.bin?ex=1&is=2&hm=aaa",
+    }])
+    first_context = full_run_context(tmp_path, limits=limits)
+    try:
+        token = live_evidence(store, "semantic-change", first_context, [source])
+        stage = store.materialize_full_stage_from_live_evidence(
+            generation_id="semantic-change",
+            live_evidence_token=token,
+            downloader=rich.AssetDownloader(
+                opener=FakeOpener([FakeResponse(body=b"abc")]),
+                resolver=global_resolver,
+                limits=limits,
+            ),
+            lock_token=context_lock_token(first_context),
+        )
+    finally:
+        first_context.close()
+
+    changed = json.loads(json.dumps(source))
+    changed["attachments"][0]["filename"] = "different.bin"
+    second_context = full_run_context(tmp_path, limits=limits)
+    try:
+        token = live_evidence(store, "semantic-change", second_context, [changed])
+        with pytest.raises(rich.GenerationError, match="fresh Discord evidence"):
+            store.rebind_materialized_full_stage_from_live_evidence(
+                stage,
+                live_evidence_token=token,
+                lock_token=context_lock_token(second_context),
+            )
+        assert token.closed
+        assert not (stage / "receipts/full-run-asset-reservation.json").exists()
+        assert not (stage / "receipts/rich-archive-latest.json").exists()
+    finally:
+        second_context.close()
+
+
+def test_materialized_stage_resume_rejects_tampered_asset_bytes(tmp_path):
+    store = make_store(tmp_path)
+    limits = rich.AssetLimits(disk_reserve_bytes=0)
+    source = message(attachments=[{
+        "id": "900",
+        "filename": "resume.bin",
+        "size": 3,
+        "url": "https://cdn.discordapp.com/attachments/1/resume.bin",
+    }])
+    first_context = full_run_context(tmp_path, limits=limits)
+    try:
+        token = live_evidence(store, "tampered-stage", first_context, [source])
+        stage = store.materialize_full_stage_from_live_evidence(
+            generation_id="tampered-stage",
+            live_evidence_token=token,
+            downloader=rich.AssetDownloader(
+                opener=FakeOpener([FakeResponse(body=b"abc")]),
+                resolver=global_resolver,
+                limits=limits,
+            ),
+            lock_token=context_lock_token(first_context),
+        )
+    finally:
+        first_context.close()
+
+    record = next(iter(rich._load_generation_records(stage)[0].values()))
+    asset = record["observations"][0]["assetInventory"][0]
+    rich.contained_path(stage, asset["localRelativePath"]).write_bytes(b"xyz")
+    second_context = full_run_context(tmp_path, limits=limits)
+    try:
+        token = live_evidence(store, "tampered-stage", second_context, [source])
+        with pytest.raises(
+            (rich.GenerationError, rich.AssetDownloadError),
+            match="local verification|verified local attachment bytes",
+        ):
+            store.rebind_materialized_full_stage_from_live_evidence(
+                stage,
+                live_evidence_token=token,
+                lock_token=context_lock_token(second_context),
+            )
+        assert token.closed
+        assert not (stage / "receipts/full-run-asset-reservation.json").exists()
+    finally:
+        second_context.close()
+
+
 def test_cross_generation_install_rejects_and_consumes_bound_token(tmp_path):
     store = make_store(tmp_path)
     with full_run_context(tmp_path) as run_context:

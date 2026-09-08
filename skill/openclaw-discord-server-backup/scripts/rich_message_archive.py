@@ -4937,6 +4937,241 @@ class RichArchiveStore:
             )
         return stage
 
+    def rebind_materialized_full_stage_from_live_evidence(
+        self,
+        stage: Path,
+        *,
+        live_evidence_token: LiveEvidenceToken | None,
+        lock_token: ArchiveLockToken | None = None,
+    ) -> dict[str, Any]:
+        """Rebind an unsealed, fully materialized stage to fresh Discord proof.
+
+        This is intentionally narrower than a normal resume.  It accepts only
+        a stage that stopped after all canonical/raw/attachment bytes were
+        written but before any reservation, PASS receipt, or manifest existed.
+        Fresh records may differ from staged records only by verified Discord
+        CDN signature query churn; completed local attachment receipts are
+        grafted onto the fresh source records after their bytes are rehashed.
+        """
+        initial = _require_live_evidence_token(
+            live_evidence_token,
+            allowed_states={"fresh"},
+        )
+        run_context = initial["runContext"]()
+        run_registration = _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+        )
+        if lock_token is None:
+            lock_token = run_registration["lockToken"]
+        _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
+        try:
+            with self._borrow_lock(lock_token):
+                stage = _lexical_absolute(stage)
+                registration = _require_live_evidence_token(
+                    live_evidence_token,
+                    root=stage,
+                    allowed_states={"fresh"},
+                )
+                entry_root, generation_id = _generation_binding(stage)
+                expected_stage = contained_path(self.staging, generation_id)
+                if (
+                    entry_root != self.entry_root
+                    or stage != expected_stage
+                    or stage.is_symlink()
+                    or not stage.is_dir()
+                ):
+                    raise GenerationError("materialized resume stage path is invalid")
+                self._require_stage_base_current_unchanged(stage)
+
+                receipts_root = contained_path(stage, "receipts")
+                if receipts_root.is_symlink() or not receipts_root.is_dir():
+                    raise GenerationError("materialized resume receipt directory is invalid")
+                receipt_files = {
+                    path.name
+                    for path in receipts_root.iterdir()
+                    if path.is_file() or path.is_symlink()
+                }
+                if receipt_files != {"stage-base-current.json"} or any(
+                    not _regular_single_link(path)
+                    for path in receipts_root.iterdir()
+                ):
+                    raise GenerationError("materialized resume stage has advanced receipts")
+                if os.path.lexists(stage / "generation-manifest.json"):
+                    raise GenerationError("materialized resume stage is already manifested")
+
+                projection = _generation_projection(stage)
+                if any(
+                    int(projection[field]) != 0
+                    for field in (
+                        "duplicateCanonicalIds",
+                        "unknownVisibleFields",
+                        "attachmentErrors",
+                        "sectionCoverageErrors",
+                        "markdownErrors",
+                    )
+                ) or projection["binaryExpected"] != projection["binaryVerified"]:
+                    raise GenerationError("materialized resume stage failed local verification")
+                _verified_generation_assets(stage)
+
+                fresh_value = registration.get("normalizedRecords")
+                if not isinstance(fresh_value, list) or any(
+                    not isinstance(row, Mapping) for row in fresh_value
+                ):
+                    raise GenerationError("materialized resume fresh records are missing")
+                fresh_records = json.loads(json.dumps(fresh_value, ensure_ascii=False))
+                old_records = projection["records"]
+                if {str(row.get("messageId") or "") for row in fresh_records} != set(old_records):
+                    raise GenerationError("materialized resume message set changed")
+
+                result_keys = (
+                    "declaredSize",
+                    "sizeSource",
+                    "sourceSizeMismatch",
+                    "status",
+                    "byteLength",
+                    "sha256",
+                    "error",
+                    "recoveryMethod",
+                    "recoveredFromAssetId",
+                    "recoveryOriginalError",
+                )
+                rebound: list[dict[str, Any]] = []
+                for fresh_record in fresh_records:
+                    message_id = str(fresh_record.get("messageId") or "")
+                    old_record = old_records[message_id]
+                    old_outcome = validate_record(
+                        old_record,
+                        require_assets=True,
+                        generation_root=stage,
+                    )
+                    fresh_outcome = validate_record(fresh_record, require_assets=False)
+                    if (
+                        old_outcome["unknownVisibleFields"]
+                        or old_outcome["attachmentErrors"]
+                        or fresh_outcome["unknownVisibleFields"]
+                        or fresh_outcome["attachmentErrors"]
+                        or old_record.get("createdTimestamp") != fresh_record.get("createdTimestamp")
+                        or _resume_stable_live_binding(_active_live_binding(old_record))
+                        != _resume_stable_live_binding(_active_live_binding(fresh_record))
+                    ):
+                        raise GenerationError("materialized resume differs from fresh Discord evidence")
+                    _old_revision, old_observation = _active_parts(old_record)
+                    old_assets = {
+                        str(asset.get("assetId") or ""): asset
+                        for asset in old_observation.get("assetInventory") or []
+                    }
+                    observations = [dict(row) for row in fresh_record.get("observations") or []]
+                    for observation in observations:
+                        assets: list[dict[str, Any]] = []
+                        for source_asset in observation.get("assetInventory") or []:
+                            asset_id = str(source_asset.get("assetId") or "")
+                            old_asset = old_assets.get(asset_id)
+                            if old_asset is None:
+                                raise GenerationError("materialized resume asset set changed")
+                            asset = dict(source_asset)
+                            for key in result_keys:
+                                if key in old_asset:
+                                    asset[key] = old_asset[key]
+                                else:
+                                    asset.pop(key, None)
+                            assets.append(asset)
+                        if {str(row.get("assetId") or "") for row in assets} != set(old_assets):
+                            raise GenerationError("materialized resume asset set changed")
+                        observation["assetInventory"] = assets
+                    fresh_record["observations"] = observations
+                    fresh_record["attachmentErrors"] = []
+                    outcome = validate_record(
+                        fresh_record,
+                        require_assets=True,
+                        generation_root=stage,
+                    )
+                    if outcome["unknownVisibleFields"] or outcome["attachmentErrors"]:
+                        raise GenerationError("materialized resume rebound record failed verification")
+                    rebound.append(fresh_record)
+
+                by_day: dict[str, list[dict[str, Any]]] = {}
+                for record in rebound:
+                    created = _iso_timestamp(
+                        record.get("createdTimestamp"),
+                        field="createdTimestamp",
+                        required=True,
+                    )
+                    assert created is not None
+                    day = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(
+                        TZ_TAIPEI
+                    ).date().isoformat()
+                    by_day.setdefault(day, []).append(record)
+                if set(by_day) != set(projection["byDay"]):
+                    raise GenerationError("materialized resume day partition changed")
+
+                expected_files = {
+                    "receipts/stage-base-current.json",
+                    *{f"canonical/{day}.jsonl" for day in by_day},
+                    *{f"raw/{day}.md" for day in by_day},
+                }
+                for old_record in old_records.values():
+                    for observation in old_record.get("observations") or []:
+                        for asset in observation.get("assetInventory") or []:
+                            if asset.get("inScope"):
+                                expected_files.add(str(asset.get("localRelativePath") or ""))
+                actual_files: set[str] = set()
+                for current, dirs, names in os.walk(stage, followlinks=False):
+                    current_path = Path(current)
+                    if any((current_path / name).is_symlink() for name in dirs):
+                        raise GenerationError("materialized resume stage contains a symlink")
+                    for name in names:
+                        path = current_path / name
+                        if not _regular_single_link(path):
+                            raise GenerationError("materialized resume stage contains an unsafe file")
+                        actual_files.add(path.relative_to(stage).as_posix())
+                if actual_files != expected_files:
+                    raise GenerationError("materialized resume stage contains unexplained files")
+
+                for day, rows in by_day.items():
+                    rows.sort(key=lambda row: int(str(row["messageId"])))
+                    self._require_active_lock_lease(lock_token)
+                    atomic_jsonl(stage / "canonical" / f"{day}.jsonl", rows)
+                    _atomic_bytes(
+                        stage / "raw" / f"{day}.md",
+                        render_day(rows).encode("utf-8"),
+                    )
+                rebound_projection = _generation_projection(stage)
+                if any(
+                    int(rebound_projection[field]) != 0
+                    for field in (
+                        "duplicateCanonicalIds",
+                        "unknownVisibleFields",
+                        "attachmentErrors",
+                        "sectionCoverageErrors",
+                        "markdownErrors",
+                    )
+                ) or rebound_projection["binaryExpected"] != rebound_projection["binaryVerified"]:
+                    raise GenerationError("materialized resume rebound stage failed verification")
+                _verified_generation_assets(stage)
+                stable_bindings = [
+                    _resume_stable_live_binding(_active_live_binding(row))
+                    for row in sorted(rebound, key=lambda item: int(str(item["messageId"])))
+                ]
+                return {
+                    "records": len(rebound),
+                    "assetFileCount": int(rebound_projection["binaryVerified"]),
+                    "resumeStableBindingSha256": json_sha256(stable_bindings),
+                    "freshEvidenceSha256": str(registration.get("evidenceSha256") or ""),
+                }
+        except BaseException:
+            _consume_live_evidence_token(live_evidence_token)
+            raise
+        finally:
+            _end_active_run_entry_lease(run_lease)
+
     def reserve_full_stage_assets(
         self,
         stage: Path,

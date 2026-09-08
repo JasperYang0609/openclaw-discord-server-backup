@@ -53,3 +53,29 @@ valid `CURRENT.json` for every eligible entry, then run one isolated installed
 runner smoke. Only after those gates pass may the live topology be transactionally
 upgraded and the next natural schedule window used for final acceptance.
 
+## Interrupted materialization recovery
+
+The first live full baseline stopped after the third entry had completely
+materialized roughly 1.2 GB of canonical, raw, and attachment bytes but before
+an asset reservation, PASS receipt, manifest, or generation seal existed.
+Safe recovery now permits that exact unsealed stage to be reused only when:
+
+- its only receipt is the checksummed stage-base CURRENT receipt;
+- every canonical/raw/attachment file is a regular single-link file and the
+  staged file set contains no unexplained files;
+- every attachment byte length and SHA-256 still matches its canonical receipt;
+- a fresh bounded Discord enumeration has the same message set, timestamps,
+  visible/source fingerprints, renderer accounting, and asset identities;
+- the only accepted source difference is a verified Discord CDN signature
+  query change whose stable URL identity is unchanged.
+
+The stage is rewritten to the fresh source records, revalidated locally, then
+continues through the existing reservation, PASS-evidence, manifest, and seal
+gates. Any filename, stable URL, size, content, message, day partition,
+unexpected receipt, manifest, symlink, hardlink, or hash change rejects reuse
+without creating a reservation or PASS receipt.
+
+Candidate evidence: 445/445 tests PASS; positive no-redownload resume,
+semantic-asset-change rejection, and tampered-byte rejection PASS; deterministic
+package/source parity and repository post-run check PASS. Live baseline and
+natural-schedule acceptance remain pending.

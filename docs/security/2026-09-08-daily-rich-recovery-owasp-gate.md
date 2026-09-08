@@ -58,7 +58,10 @@ remain covered below.
 - A10 Mishandling of Exceptional Conditions — `BLOCKED`: request/runtime/page/
   message/asset/disk limits, bounded 429 retries, terminal pagination, atomic
   writes, fail-closed exceptions, and resume-after-root logic are implemented.
-  Awaiting live fault-free completion and catch-up.
+  Interrupted materialized-stage recovery now requires fresh live equivalence,
+  exact stage topology, verified attachment bytes, and unchanged base CURRENT;
+  all other drift rejects before reservation or PASS evidence. Awaiting live
+  fault-free completion and catch-up.
 
 ## Attacker-perspective release checks
 
@@ -71,3 +74,13 @@ remain covered below.
 - A scanner-only result cannot release this change. Final release requires the
   full test suite, deterministic package parity, installed post-run check,
   live 182/182 proof, queue/cursor verification, and manual diff review.
+
+## Interrupted-stage candidate evidence
+
+- Full repository suite: 445/445 PASS.
+- Signed CDN query churn rebinds to fresh source evidence without a second
+  download; semantic filename drift and tampered local bytes fail closed.
+- Python compile, runtime-component hash binding, deterministic package/source
+  parity, repository post-run check, and diff hygiene PASS.
+- Release decision remains `BLOCKED` until the exact commit is installed and
+  the live baseline, cursor catch-up, and natural schedule gates pass.

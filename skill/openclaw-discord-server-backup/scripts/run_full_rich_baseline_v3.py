@@ -751,8 +751,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             )
             final = rich.contained_path(store.generations, generation_id)
             stage = rich.contained_path(store.staging, generation_id)
-            if stage.exists() or stage.is_symlink():
-                raise BaselineError("resume_staging_generation_requires_review")
+            if (final.exists() or final.is_symlink()) and (stage.exists() or stage.is_symlink()):
+                raise BaselineError("resume_generation_topology_ambiguous")
             phase = "collecting_live_evidence"
             try:
                 evidence_token = rich.collect_live_evidence(
@@ -788,18 +788,31 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         "freshEvidenceSha256": resumed["freshEvidenceSha256"],
                     }
                 else:
-                    phase = "materializing_generation"
-                    stage = store.materialize_full_stage_from_live_evidence(
-                        generation_id=generation_id,
-                        live_evidence_token=evidence_token,
-                        downloader=rich.AssetDownloader(
-                            limits=rich.AssetLimits(
-                                full_run_files=args.max_asset_files,
-                                full_run_bytes=args.max_asset_bytes,
-                                disk_reserve_bytes=args.minimum_free_space_bytes,
-                            )
-                        ),
-                    )
+                    if stage.exists() or stage.is_symlink():
+                        phase = "rebinding_materialized_generation"
+                        rebound = store.rebind_materialized_full_stage_from_live_evidence(
+                            stage,
+                            live_evidence_token=evidence_token,
+                        )
+                        resume_evidence = {
+                            "mode": "VERIFIED_MATERIALIZED_STAGE_REUSE",
+                            "stableBindingSha256": rebound["resumeStableBindingSha256"],
+                            "freshEvidenceSha256": rebound["freshEvidenceSha256"],
+                        }
+                    else:
+                        phase = "materializing_generation"
+                        stage = store.materialize_full_stage_from_live_evidence(
+                            generation_id=generation_id,
+                            live_evidence_token=evidence_token,
+                            downloader=rich.AssetDownloader(
+                                limits=rich.AssetLimits(
+                                    full_run_files=args.max_asset_files,
+                                    full_run_bytes=args.max_asset_bytes,
+                                    disk_reserve_bytes=args.minimum_free_space_bytes,
+                                )
+                            ),
+                        )
+                        resume_evidence = None
                     phase = "reserving_generation_assets"
                     store.reserve_full_stage_assets(
                         stage,
@@ -823,7 +836,6 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     local = rich.verify_generation(final)
                     message_count = int(local.get("records") or 0)
-                    resume_evidence = None
                 receipt_path = final / "receipts/rich-archive-latest.json"
                 selected_row = {
                     "channelId": channel_id,
