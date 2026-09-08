@@ -2358,6 +2358,66 @@ def _resume_stable_live_binding(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_RESUME_VOLATILE_THREAD_POINTERS = frozenset({
+    "/thread/last_message_id",
+    "/thread/member_count",
+    "/thread/message_count",
+    "/thread/total_message_sent",
+    "/thread/thread_metadata/archive_timestamp",
+})
+
+
+def _resume_stable_record_binding(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a resume binding that ignores only Discord-owned thread counters.
+
+    Forum starter messages embed a live thread object.  Discord updates its
+    last-message pointer, message/member counters, and archive activity
+    timestamp whenever the thread changes, even though the starter message
+    itself was not edited.  These fields can move while a large attachment
+    stage is being verified.  Preserve and validate the complete source record,
+    but exclude only those server-maintained values from the narrow resume
+    equivalence proof.  Thread identity, name, policy, flags, content, and all
+    attachment bindings remain part of the proof.
+    """
+    revision, observation = _active_parts(record)
+    content_value = revision.get("content")
+    mutable_value = observation.get("mutableState")
+    if not isinstance(content_value, Mapping) or not isinstance(mutable_value, Mapping):
+        raise GenerationError("resume record payload shape is invalid")
+    stable_content = json.loads(json.dumps(content_value, ensure_ascii=False))
+    thread = stable_content.get("thread")
+    if isinstance(thread, dict):
+        for pointer in _RESUME_VOLATILE_THREAD_POINTERS:
+            tokens = _path_tokens(pointer)
+            if len(tokens) == 2 and tokens[0] == "thread":
+                thread.pop(tokens[1], None)
+            elif len(tokens) == 3 and tokens[:2] == ("thread", "thread_metadata"):
+                metadata = thread.get("thread_metadata")
+                if isinstance(metadata, dict):
+                    metadata.pop(tokens[2], None)
+
+    accounting = sorted(
+        [
+            dict(row)
+            for row in (
+                list(revision.get("rendererAccounting") or [])
+                + list(observation.get("rendererAccounting") or [])
+            )
+            if str(row.get("pointer") or "") not in _RESUME_VOLATILE_THREAD_POINTERS
+        ],
+        key=lambda row: (str(row.get("pointer")), str(row.get("rendererSection"))),
+    )
+    binding = _resume_stable_live_binding(_active_live_binding(record))
+    binding["sourcePayloadSha256"] = json_sha256(stable_content)
+    binding["visiblePayloadSha256"] = json_sha256({
+        "content": stable_content,
+        "mutable": mutable_value,
+    })
+    binding["rendererAccountingSha256"] = json_sha256(accounting)
+    binding["visiblePointerCount"] = len(accounting)
+    return binding
+
+
 def _validate_immutable_evidence_reference(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise GenerationError("immutable pre-repair evidence reference is missing")
@@ -5141,8 +5201,8 @@ class RichArchiveStore:
                         fresh_outcome["unknownVisibleFields"]
                         or fresh_outcome["attachmentErrors"]
                         or old_record.get("createdTimestamp") != fresh_record.get("createdTimestamp")
-                        or _resume_stable_live_binding(_active_live_binding(old_record))
-                        != _resume_stable_live_binding(_active_live_binding(fresh_record))
+                        or _resume_stable_record_binding(old_record)
+                        != _resume_stable_record_binding(fresh_record)
                     ):
                         raise GenerationError("materialized resume differs from fresh Discord evidence")
                     _old_revision, old_observation = _active_parts(old_record)
@@ -5258,7 +5318,7 @@ class RichArchiveStore:
                             (receipts_root / name).unlink()
                     _fsync_dir(receipts_root)
                 stable_bindings = [
-                    _resume_stable_live_binding(_active_live_binding(row))
+                    _resume_stable_record_binding(row)
                     for row in sorted(rebound, key=lambda item: int(str(item["messageId"])))
                 ]
                 return {

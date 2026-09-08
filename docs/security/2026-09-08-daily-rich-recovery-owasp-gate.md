@@ -122,3 +122,20 @@ remain covered below.
   incomplete receipt is removed. The focused regression reproduces the live
   old-census/new-schema transition and PASSes without weakening unknown-field,
   identity, reservation, or attachment-integrity gates.
+
+## Forum thread activity-field candidate evidence
+
+- Live differential evidence found exactly one changed record out of 6,244:
+  the active forum starter. Message count, attachment set, timestamps, unknown
+  fields, and attachment errors otherwise matched; only Discord-maintained
+  thread activity values changed while this same thread received progress
+  messages.
+- Materialized resume ignores only five exact activity pointers. Thread name,
+  identity, policy, administrative state, content, attachment identity, stable
+  URL, byte length, and SHA-256 remain fail-closed equivalence inputs.
+- Focused regressions prove activity-only churn resumes, while thread rename
+  and auto-archive policy drift reject. Complete repository suite: 451/451
+  PASS; runtime component hash and deterministic package were regenerated.
+- A01, A04, A06, A08, and A10 remain `BLOCKED` until the exact candidate is
+  installed and the live baseline, 182/182 readback, catch-up, and natural
+  schedule gates complete.

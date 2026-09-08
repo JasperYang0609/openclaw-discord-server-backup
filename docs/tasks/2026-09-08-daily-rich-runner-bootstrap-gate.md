@@ -136,3 +136,25 @@ All non-census record invariants, attachment sizes/hashes, reservation binding,
 message/asset identity, stable live binding, and unknown-field rejection remain
 enforced. The interrupted-prefix test now reproduces this exact old-to-new
 census transition and passes; live continuation is pending.
+
+## Discord-owned thread activity during materialized resume
+
+The next live retry proved that the only remaining difference among 6,244
+records was the forum starter message for the active backup thread. Discord
+updates the embedded thread object's `last_message_id`, `message_count`, and
+`total_message_sent` whenever status messages arrive, without editing the
+starter message or changing its attachments. Those server-maintained values
+changed during the roughly five-minute fresh-evidence pass.
+
+The materialized-stage equivalence proof now excludes only the exact Discord-
+owned thread activity fields: last-message ID, message/member counters, total
+sent count, and archive activity timestamp. The complete source payload is
+still preserved and validated. Thread ID, name, parent/guild identity, flags,
+archived/locked state, auto-archive policy, rate limit, starter content,
+attachments, and every non-activity field remain in the stable proof and any
+change still rejects reuse.
+
+Candidate evidence: focused positive/negative regressions 2/2 PASS and the
+complete repository suite 451/451 PASS. The deterministic runtime manifest and
+Skill artifact were rebuilt after the source change. Exact-commit install and
+live continuation remain pending.

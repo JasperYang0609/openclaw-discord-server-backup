@@ -675,6 +675,47 @@ def test_resume_live_binding_ignores_only_verified_cdn_signature_churn():
     assert rich._resume_stable_live_binding(first) != rich._resume_stable_live_binding(changed)
 
 
+def test_resume_record_binding_ignores_only_discord_owned_thread_activity_fields():
+    first_source = message(thread={
+        "id": "1490000000000000100",
+        "name": "原討論串名稱",
+        "last_message_id": "1490000000000000101",
+        "message_count": 10,
+        "total_message_sent": 10,
+        "member_count": 2,
+        "thread_metadata": {
+            "archive_timestamp": "2026-09-05T04:00:00Z",
+            "archived": False,
+            "auto_archive_duration": 60,
+            "locked": False,
+        },
+    })
+    second_source = json.loads(json.dumps(first_source))
+    second_source["thread"].update({
+        "last_message_id": "1490000000000000199",
+        "message_count": 99,
+        "total_message_sent": 101,
+        "member_count": 3,
+    })
+    second_source["thread"]["thread_metadata"]["archive_timestamp"] = (
+        "2026-09-05T05:00:00Z"
+    )
+    first = normalize(first_source)
+    second = normalize(second_source)
+    assert rich._active_live_binding(first) != rich._active_live_binding(second)
+    assert rich._resume_stable_record_binding(first) == rich._resume_stable_record_binding(second)
+
+    renamed_source = json.loads(json.dumps(second_source))
+    renamed_source["thread"]["name"] = "已修改的討論串名稱"
+    renamed = normalize(renamed_source)
+    assert rich._resume_stable_record_binding(first) != rich._resume_stable_record_binding(renamed)
+
+    policy_source = json.loads(json.dumps(second_source))
+    policy_source["thread"]["thread_metadata"]["auto_archive_duration"] = 1440
+    policy = normalize(policy_source)
+    assert rich._resume_stable_record_binding(first) != rich._resume_stable_record_binding(policy)
+
+
 def test_attachment_description_changes_searchable_markdown_and_visible_fingerprint():
     first_source = message(attachments=[{
         "id": "900", "filename": "x.png", "description": "第一版說明", "size": 3,
@@ -1430,6 +1471,20 @@ def test_materialized_stage_resume_rebinds_only_signed_url_churn_without_redownl
         "size": 3,
         "url": "https://cdn.discordapp.com/attachments/1/resume.bin?ex=1&is=2&hm=aaa",
     }])
+    first_source["thread"] = {
+        "id": "1490000000000000100",
+        "name": "活動中的討論串",
+        "last_message_id": "1490000000000000101",
+        "message_count": 10,
+        "total_message_sent": 10,
+        "member_count": 2,
+        "thread_metadata": {
+            "archive_timestamp": "2026-09-05T04:00:00Z",
+            "archived": False,
+            "auto_archive_duration": 60,
+            "locked": False,
+        },
+    }
     opener = FakeOpener([FakeResponse(body=b"abc")])
     first_context = full_run_context(tmp_path, limits=limits)
     try:
@@ -1455,6 +1510,15 @@ def test_materialized_stage_resume_rebinds_only_signed_url_churn_without_redownl
     second_source = json.loads(json.dumps(first_source))
     second_source["attachments"][0]["url"] = (
         "https://cdn.discordapp.com/attachments/1/resume.bin?ex=9&is=8&hm=bbb"
+    )
+    second_source["thread"].update({
+        "last_message_id": "1490000000000000199",
+        "message_count": 99,
+        "total_message_sent": 101,
+        "member_count": 3,
+    })
+    second_source["thread"]["thread_metadata"]["archive_timestamp"] = (
+        "2026-09-05T05:00:00Z"
     )
     second_context = full_run_context(tmp_path, limits=limits)
     try:
