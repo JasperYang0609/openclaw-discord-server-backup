@@ -754,6 +754,118 @@ def test_downloader_has_no_bot_auth_cookie_or_proxy_headers_and_hashes_file(tmp_
     assert sent["accept-encoding"] == "identity"
 
 
+def attachment_with_proxy():
+    return message(attachments=[{
+        "id": "900",
+        "filename": "historical.bin",
+        "size": 3,
+        "content_type": "application/octet-stream",
+        "url": "https://cdn.discordapp.com/attachments/1/historical.bin",
+        "proxy_url": "https://media.discordapp.net/attachments/1/historical.bin",
+    }])
+
+
+def test_expired_direct_attachment_recovers_from_verified_equivalent_proxy(tmp_path):
+    proxy_response = FakeResponse(body=b"abc")
+    direct_response = FakeResponse(body=b"missing", status=404)
+    downloader = rich.AssetDownloader(
+        opener=FakeOpener([proxy_response, direct_response]),
+        resolver=global_resolver,
+        limits=rich.AssetLimits(disk_reserve_bytes=0),
+    )
+
+    recovered = rich.apply_asset_results(
+        normalize(attachment_with_proxy()), downloader, tmp_path,
+    )
+    assets = recovered["observations"][0]["assetInventory"]
+    proxy = next(row for row in assets if row["kind"] == "attachment_proxy")
+    direct = next(row for row in assets if row["kind"] == "attachment")
+
+    assert recovered["attachmentErrors"] == []
+    assert proxy["status"] == direct["status"] == "complete"
+    assert proxy["sha256"] == direct["sha256"] == hashlib.sha256(b"abc").hexdigest()
+    assert proxy["byteLength"] == direct["byteLength"] == 3
+    assert direct["recoveryMethod"] == "equivalent_discord_attachment_variant"
+    assert direct["recoveredFromAssetId"] == proxy["assetId"]
+    assert "HTTP status 404" in direct["recoveryOriginalError"]
+    proxy_path = rich.contained_path(tmp_path, proxy["localRelativePath"])
+    direct_path = rich.contained_path(tmp_path, direct["localRelativePath"])
+    assert proxy_path != direct_path
+    assert proxy_path.read_bytes() == direct_path.read_bytes() == b"abc"
+    assert rich.validate_record(
+        recovered, require_assets=True, generation_root=tmp_path,
+    )["ok"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("recoveryMethod", "unverified_copy"),
+    ("recoveredFromAssetId", "not-a-sibling"),
+    ("recoveryOriginalError", ""),
+])
+def test_equivalent_attachment_recovery_provenance_is_fail_closed(tmp_path, field, value):
+    recovered = rich.apply_asset_results(
+        normalize(attachment_with_proxy()),
+        rich.AssetDownloader(
+            opener=FakeOpener([FakeResponse(body=b"abc"), FakeResponse(status=404)]),
+            resolver=global_resolver,
+            limits=rich.AssetLimits(disk_reserve_bytes=0),
+        ),
+        tmp_path,
+    )
+    direct = next(
+        row for row in recovered["observations"][0]["assetInventory"]
+        if row["kind"] == "attachment"
+    )
+    direct[field] = value
+    with pytest.raises(rich.RichArchiveError, match="asset recovery"):
+        rich.validate_record(recovered, require_assets=True, generation_root=tmp_path)
+
+
+def test_non_equivalent_attachment_variants_are_not_recovered(tmp_path):
+    record = normalize(attachment_with_proxy())
+    proxy, direct = record["observations"][0]["assetInventory"]
+    source_path = rich.contained_path(tmp_path, proxy["localRelativePath"])
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"abc")
+    proxy.update({
+        "status": "complete",
+        "byteLength": 3,
+        "sha256": hashlib.sha256(b"abc").hexdigest(),
+    })
+    direct.update({"status": "error", "error": "HTTP status 404"})
+    direct["displayFilename"] = "different.bin"
+
+    output = rich._recover_equivalent_attachment_variants([proxy, direct], tmp_path)
+
+    assert next(row for row in output if row["kind"] == "attachment")["status"] == "error"
+
+
+def test_disagreeing_equivalent_completed_variants_fail_closed(tmp_path):
+    record = normalize(attachment_with_proxy())
+    proxy, direct = record["observations"][0]["assetInventory"]
+    first_path = rich.contained_path(tmp_path, proxy["localRelativePath"])
+    second_path = rich.contained_path(tmp_path, direct["localRelativePath"])
+    first_path.parent.mkdir(parents=True)
+    first_path.write_bytes(b"abc")
+    second_path.write_bytes(b"xyz")
+    proxy.update({
+        "status": "complete", "byteLength": 3,
+        "sha256": hashlib.sha256(b"abc").hexdigest(),
+    })
+    direct.update({
+        "status": "complete", "byteLength": 3,
+        "sha256": hashlib.sha256(b"xyz").hexdigest(),
+    })
+    failed = dict(direct)
+    failed.update({
+        "assetId": "failed-copy", "status": "error", "error": "HTTP status 404",
+        "localRelativePath": "attachments/1540000000000000001/failed-copy.bin",
+    })
+
+    with pytest.raises(rich.AssetDownloadError, match="variants disagree"):
+        rich._recover_equivalent_attachment_variants([proxy, direct, failed], tmp_path)
+
+
 def test_missing_sticker_size_is_resolved_by_safe_head_without_credentials():
     source = message(content="", sticker_items=[{
         "id": "1500000000000000001", "name": "貼圖", "format_type": 1,

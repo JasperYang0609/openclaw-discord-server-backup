@@ -664,6 +664,24 @@ def inventory_assets(
     return assets
 
 
+def _attachment_equivalence_key(asset: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """Bind direct and proxy URLs emitted by the same Discord attachment."""
+    kind = asset.get("kind")
+    pointer = str(asset.get("jsonPointer") or "")
+    if kind == "attachment" and pointer.endswith("/url"):
+        parent = pointer[:-4]
+    elif kind == "attachment_proxy" and pointer.endswith("/proxy_url"):
+        parent = pointer[:-10]
+    else:
+        return None
+    return (
+        parent,
+        asset.get("displayFilename"),
+        asset.get("sourceDeclaredSize"),
+        asset.get("contentType"),
+    )
+
+
 def normalize_message(
     message: Mapping[str, Any],
     *,
@@ -1060,6 +1078,42 @@ def validate_record(record: Mapping[str, Any], *, require_assets: bool = True, g
                     attachment_errors.add(f"asset_missing:{identity}")
                 elif path.stat().st_size != asset["byteLength"] or file_sha256(path) != asset["sha256"]:
                     attachment_errors.add(f"asset_hash_mismatch:{identity}")
+        actual_by_id = {str(asset.get("assetId") or ""): asset for asset in actual_assets}
+        for asset in actual_assets:
+            recovery_method = asset.get("recoveryMethod")
+            recovery_source_id = asset.get("recoveredFromAssetId")
+            recovery_original_error = asset.get("recoveryOriginalError")
+            if (
+                recovery_method is None
+                and recovery_source_id is None
+                and recovery_original_error is None
+            ):
+                continue
+            if (
+                recovery_method != "equivalent_discord_attachment_variant"
+                or not isinstance(recovery_source_id, str)
+                or not recovery_source_id
+                or not isinstance(recovery_original_error, str)
+                or not recovery_original_error
+                or len(recovery_original_error) > 1024
+            ):
+                raise RichArchiveError("asset recovery method is invalid")
+            source_asset = actual_by_id.get(recovery_source_id)
+            if (
+                source_asset is None
+                or source_asset is asset
+                or source_asset.get("recoveryMethod") is not None
+                or source_asset.get("recoveredFromAssetId") is not None
+                or source_asset.get("recoveryOriginalError") is not None
+                or _attachment_equivalence_key(source_asset) is None
+                or _attachment_equivalence_key(source_asset)
+                != _attachment_equivalence_key(asset)
+                or source_asset.get("kind") == asset.get("kind")
+                or source_asset.get("status") != "complete"
+                or source_asset.get("byteLength") != asset.get("byteLength")
+                or source_asset.get("sha256") != asset.get("sha256")
+            ):
+                raise RichArchiveError("asset recovery provenance is invalid")
         computed[observation_id] = (content, mutable, census)
 
     if linked_revisions != set(revisions):
@@ -1890,10 +1944,130 @@ def resolve_asset_sizes(
     return updated
 
 
+def _atomic_copy_equivalent_asset(
+    source: Path,
+    target: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    source = _lexical_absolute(source)
+    target = _lexical_absolute(target)
+    reject_symlink_path(source)
+    reject_symlink_path(target)
+    if os.path.lexists(target):
+        raise AssetDownloadError("equivalent asset target already exists")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(target.parent, 0o700)
+    reject_symlink_path(target.parent)
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = -1
+    temporary = ""
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        source_info = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_nlink != 1
+            or source_info.st_size != expected_size
+        ):
+            raise AssetDownloadError("equivalent asset source is unsafe")
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".equivalent", dir=target.parent,
+        )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                count += len(chunk)
+                if count > expected_size:
+                    raise AssetDownloadError("equivalent asset source exceeded declared size")
+                output.write(chunk)
+                digest.update(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if count != expected_size or digest.hexdigest() != expected_sha256:
+            raise AssetDownloadError("equivalent asset source digest mismatch")
+        os.replace(temporary, target)
+        temporary = ""
+        os.chmod(target, 0o600)
+        _fsync_dir(target.parent)
+    finally:
+        os.close(source_fd)
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def _recover_equivalent_attachment_variants(
+    assets: Sequence[Mapping[str, Any]],
+    generation_root: Path,
+) -> list[dict[str, Any]]:
+    output = [dict(asset) for asset in assets]
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for asset in output:
+        key = _attachment_equivalence_key(asset)
+        if key is not None and asset.get("inScope"):
+            groups.setdefault(key, []).append(asset)
+    for rows in groups.values():
+        complete = [row for row in rows if row.get("status") == "complete"]
+        failed = [row for row in rows if row.get("status") == "error"]
+        if not complete or not failed:
+            continue
+        complete.sort(key=lambda row: str(row.get("assetId") or ""))
+        source = complete[0]
+        if any(
+            row.get("byteLength") != source.get("byteLength")
+            or row.get("sha256") != source.get("sha256")
+            for row in complete[1:]
+        ):
+            raise AssetDownloadError("equivalent attachment variants disagree")
+        expected_size = source.get("byteLength")
+        expected_sha256 = str(source.get("sha256") or "")
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 0
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        ):
+            raise AssetDownloadError("equivalent attachment source receipt is invalid")
+        source_path = contained_path(
+            generation_root, str(source.get("localRelativePath") or ""),
+        )
+        for row in failed:
+            target_path = contained_path(
+                generation_root, str(row.get("localRelativePath") or ""),
+            )
+            original_error = str(row.get("error") or "asset_download_failed")
+            _atomic_copy_equivalent_asset(
+                source_path,
+                target_path,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+            )
+            row.update({
+                "status": "complete",
+                "byteLength": expected_size,
+                "sha256": expected_sha256,
+                "error": None,
+                "recoveryMethod": "equivalent_discord_attachment_variant",
+                "recoveredFromAssetId": str(source["assetId"]),
+                "recoveryOriginalError": original_error,
+            })
+    return output
+
+
 def apply_asset_results(record: Mapping[str, Any], downloader: AssetDownloader, generation_root: Path) -> dict[str, Any]:
     updated = dict(record)
     observations = [dict(row) for row in updated.get("observations") or []]
-    errors: list[str] = []
     for observation in observations:
         output: list[dict[str, Any]] = []
         for asset in observation.get("assetInventory") or []:
@@ -1903,10 +2077,17 @@ def apply_asset_results(record: Mapping[str, Any], downloader: AssetDownloader, 
                 failed = dict(asset)
                 failed.update({"status": "error", "error": str(exc)})
                 output.append(failed)
-                errors.append(f"{asset.get('assetId')}:{exc}")
-        observation["assetInventory"] = output
+        observation["assetInventory"] = _recover_equivalent_attachment_variants(
+            output, generation_root,
+        )
     updated["observations"] = observations
-    updated["attachmentErrors"] = sorted(set(errors))
+    remaining_errors = [
+        f"{asset.get('assetId')}:{asset.get('error') or 'asset_download_failed'}"
+        for observation in observations
+        for asset in observation.get("assetInventory") or []
+        if asset.get("inScope") and asset.get("status") == "error"
+    ]
+    updated["attachmentErrors"] = sorted(set(remaining_errors))
     return updated
 
 
