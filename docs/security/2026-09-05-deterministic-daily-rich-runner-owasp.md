@@ -91,3 +91,27 @@ Evidence:
   immutable-evidence checks PASS.
 - `git diff --check`, all-script `py_compile`, secret-signature scan, manifest
   validation, and required/forbidden package file contract all PASS.
+
+## 2026-09-08 natural-run repair addendum
+
+- A01 PASS — the new bootstrap preflight resolves only the already selected,
+  contained entry roots while the shared lock is held.
+- A02 PASS — canonical source and package now include the fixed-argv daily runner;
+  live topology remains unchanged until the prerequisite full rebuild passes.
+- A03 PASS — the package was regenerated from reviewed source and package/source
+  parity passed.
+- A04 PASS — `CURRENT.json` must verify before any Discord message read or merge.
+- A05 PASS — the added gate introduces no shell or content-derived execution.
+- A06 PASS — an absent baseline fails as `rich_archive_not_initialized`; it can no
+  longer enter the incremental merge or be mistaken for a recoverable read error.
+- A07 PASS — token resolution occurs only after the baseline gate passes.
+- A08 PASS — live read-only proof showed byte-identical state and queue before and
+  after the blocked preflight.
+- A09 PASS — public output and health evidence use bounded categories; the private
+  component log retains only the exception class, never raw exception text.
+- A10 PASS — missing and invalid current generations are distinct fail-closed
+  conditions covered by tests.
+
+Repair evidence: 293 tests PASS; repository post-run, package parity, Python
+compile, diff check, and secret-signature scan PASS. Production deployment and
+natural-run acceptance remain blocked on a verified full rich rebuild baseline.

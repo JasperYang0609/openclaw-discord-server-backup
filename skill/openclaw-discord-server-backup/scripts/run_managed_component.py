@@ -21,6 +21,16 @@ ROLES = {
     "weekly-inventory", "weekly-raw", "workspace-snapshot", "health-report",
 }
 
+DAILY_FAILURE_CODES = {
+    "rich_archive_contract_invalid",
+    "rich_archive_current_invalid",
+    "rich_archive_merge_failed",
+    "rich_archive_not_initialized",
+    "rich_archive_readback_mismatch",
+    "rich_archive_unavailable",
+    "rich_archive_verification_failed",
+}
+
 
 def load_sibling(name: str):
     path = HERE / name
@@ -315,6 +325,7 @@ def run_role(args: argparse.Namespace) -> int:
     returncode = 0
     safe_skip = False
     inventory_skip = False
+    failure_payload: dict[str, Any] | None = None
     for command in commands:
         proc = subprocess.run(command, cwd=workspace, text=True, capture_output=True, check=False)
         combined.append("$ " + " ".join(Path(value).name if index in {0, 1} else "[arg]" for index, value in enumerate(command)))
@@ -333,6 +344,7 @@ def run_role(args: argparse.Namespace) -> int:
                 returncode = proc.returncode
                 break
         if proc.returncode != 0:
+            failure_payload = parsed
             returncode = proc.returncode
             break
     output = "\n".join(combined)
@@ -359,6 +371,26 @@ def run_role(args: argparse.Namespace) -> int:
     elif returncode == 0:
         status, summary, pending = success_summary(args.role, metrics)
         anomalies: list[dict[str, Any]] = []
+    elif (
+        args.role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}
+        and failure_payload is not None
+        and failure_payload.get("reason") in DAILY_FAILURE_CODES
+    ):
+        failure_code = str(failure_payload["reason"])
+        if failure_code == "rich_archive_not_initialized":
+            summary = "Rich Archive 基線尚未建立，日常同步已在讀寫前停止"
+            pending = ["先完成並驗證 full rich rebuild，再啟用 deterministic daily sync"]
+        else:
+            summary = "Rich Archive 驗證失敗，游標已保留"
+            pending = ["查看本機受控日誌中的錯誤類型並修復後重試"]
+        status = "error"
+        anomalies = [{
+            "code": failure_code,
+            "summary": summary,
+            "impact": "本輪新訊息備份延後",
+            "dataLoss": "no",
+            "repairStatus": "未推進游標，等待 Rich Archive 修復",
+        }]
     else:
         status = "error"
         summary = "備份元件執行失敗，已停止後續寫入"

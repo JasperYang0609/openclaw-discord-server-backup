@@ -107,7 +107,7 @@ def fake_rich_module(*, fail_merge: bool = False):
         def __init__(self, entry_root: Path, *, lock_path: Path | None = None):
             self.entry_root = entry_root
             self.lock_path = lock_path
-            self.current: Path | None = None
+            self.current: Path | None = self.entry_root / "generations" / "base"
             self.merged = []
             instances.append(self)
 
@@ -125,6 +125,59 @@ def fake_rich_module(*, fail_merge: bool = False):
             return self.current
 
     return types.SimpleNamespace(RichArchiveStore=Store, AssetDownloader=Downloader, instances=instances)
+
+
+def test_missing_rich_baseline_fails_before_merge(tmp_path):
+    class Store:
+        def __init__(self, _entry_root: Path, *, lock_path: Path | None = None):
+            self.lock_path = lock_path
+
+        def resolve_current(self):
+            return None
+
+        def merge_messages(self, *_args, **_kwargs):
+            raise AssertionError("merge must not run without a verified baseline")
+
+    with pytest.raises(daily.DailySyncError, match="rich_archive_not_initialized"):
+        daily.merge_verified(
+            Store,
+            entry_root=tmp_path / "Entry",
+            lock_path=tmp_path / ".channel_backup.lock",
+            downloader=object(),
+            messages=[api_message("1540000000000000002")],
+            channel_id="1490000000000000001",
+            observed_at="2026-09-08T00:00:00+00:00",
+            generation_id="daily-test",
+        )
+
+
+def test_missing_rich_baseline_fails_before_discord_read_or_state_change(monkeypatch, tmp_path):
+    args, state_path, queue_path, _entry_root = setup_run(tmp_path)
+    original_state = state_path.read_bytes()
+    original_queue = queue_path.read_bytes()
+    rich = fake_rich_module()
+    monkeypatch.setattr(daily, "load_rich_archive_module", lambda: rich)
+    rich.instances.clear()
+
+    class UninitializedStore(rich.RichArchiveStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.current = None
+
+    rich.RichArchiveStore = UninitializedStore
+    read_called = False
+
+    def fetch(*_args, **_kwargs):
+        nonlocal read_called
+        read_called = True
+        return []
+
+    with pytest.raises(daily.DailySyncError, match="rich_archive_not_initialized"):
+        daily.execute(args, fetch=fetch)
+
+    assert read_called is False
+    assert state_path.read_bytes() == original_state
+    assert queue_path.read_bytes() == original_queue
 
 
 def test_lookback_refreshes_existing_message_without_advancing_cursor(monkeypatch, tmp_path):
@@ -150,7 +203,7 @@ def test_lookback_refreshes_existing_message_without_advancing_cursor(monkeypatc
     assert entry["lastWrittenMessageId"] == "1540000000000000001"
     assert entry["richArchiveIncrementalStatus"] == "verified"
     assert "richArchiveStatus" not in entry
-    assert rich.instances[0].merged[0]["content"] == "edited"
+    assert rich.instances[-1].merged[0]["content"] == "edited"
 
 
 def test_new_cursor_moves_only_after_verified_publish(monkeypatch, tmp_path):

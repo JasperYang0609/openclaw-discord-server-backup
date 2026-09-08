@@ -413,6 +413,19 @@ def resolved_generation_id(value: Any) -> str | None:
     return None
 
 
+def require_current_generation(store: Any) -> str:
+    resolve = getattr(store, "resolve_current", None)
+    if not callable(resolve):
+        raise DailySyncError("rich_archive_contract_invalid")
+    try:
+        current = resolved_generation_id(resolve())
+    except Exception as exc:
+        raise DailySyncError("rich_archive_current_invalid") from exc
+    if current is None:
+        raise DailySyncError("rich_archive_not_initialized")
+    return current
+
+
 def merge_verified(
     store_class: type, *, entry_root: Path, lock_path: Path, downloader: Any,
     messages: list[dict[str, Any]], channel_id: str, observed_at: str,
@@ -421,9 +434,9 @@ def merge_verified(
     try:
         store = store_class(entry_root, lock_path=lock_path)
         merge = getattr(store, "merge_messages", None)
-        resolve = getattr(store, "resolve_current", None)
-        if not callable(merge) or not callable(resolve):
+        if not callable(merge):
             raise DailySyncError("rich_archive_contract_invalid")
+        require_current_generation(store)
         result = merge(
             messages,
             channel_id=channel_id,
@@ -437,7 +450,7 @@ def merge_verified(
         committed = result.get("generationId")
         if not isinstance(committed, str) or not committed or not verification_passed(result):
             raise DailySyncError("rich_archive_verification_failed")
-        current = resolved_generation_id(resolve())
+        current = require_current_generation(store)
         if current != committed:
             raise DailySyncError("rich_archive_readback_mismatch")
         return committed, result
@@ -545,6 +558,13 @@ def execute(args: argparse.Namespace, *, fetch: Callable[..., list[dict[str, Any
         downloader_class = getattr(rich_module, "AssetDownloader", None)
         if not isinstance(downloader_class, type):
             raise DailySyncError("rich_archive_contract_invalid")
+        # Rich daily sync is incremental by contract. Prove every selected
+        # entry has a valid baseline before the first Discord read; otherwise
+        # the full rebuild must establish CURRENT and the slot fails closed
+        # without touching state, queue, or cursor ownership.
+        for _key, entry in candidates:
+            entry_root = safe_entry_root(root, str(entry["relativePath"]))
+            require_current_generation(store_class(entry_root, lock_path=lock_path))
         downloader = downloader_class()
         token = load_discord_token(openclaw_config, args.token_env)
         rate_limit_budget: dict[str, float] = {"waited": 0.0}
@@ -689,8 +709,17 @@ def main() -> int:
     try:
         result, exit_code = execute(parse_args())
     except DailySyncError as exc:
+        if exc.__cause__ is not None:
+            print(json.dumps({
+                "diagnostic": exc.category,
+                "causeType": type(exc.__cause__).__name__,
+            }, ensure_ascii=False, sort_keys=True), file=sys.stderr)
         result, exit_code = {"ok": False, "status": "error", "reason": exc.category}, 2
-    except Exception:
+    except Exception as exc:
+        print(json.dumps({
+            "diagnostic": "unexpected_error",
+            "causeType": type(exc).__name__,
+        }, ensure_ascii=False, sort_keys=True), file=sys.stderr)
         result, exit_code = {"ok": False, "status": "error", "reason": "unexpected_error"}, 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return exit_code

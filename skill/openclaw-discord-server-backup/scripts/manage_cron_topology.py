@@ -1226,27 +1226,6 @@ class OpenClawCronClient:
             if [event.get("event") for event in events] != ["start", "skipped", "end"]:
                 raise CronManagerError("daily lock canary trace did not prove serialized ordering")
 
-    def complete_parallel_canary_runs(
-        self, job_ids: list[str], processes: list[subprocess.Popen[str]],
-    ) -> None:
-        rejected: list[str] = []
-        for job_id, process in zip(job_ids, processes):
-            _, _stderr = process.communicate(timeout=180)
-            if process.returncode != 0:
-                rejected.append(job_id)
-        # OpenClaw 2026.7.1-2 enforces a single flight for one persistent
-        # session by rejecting one of two simultaneous manual triggers. Accept
-        # that only as an intermediate state: after the successful flight has
-        # ended, the rejected job must run successfully on a bounded retry.
-        if len(rejected) > 1:
-            raise CronManagerError("persistent-session overlap canary rejected every concurrent run")
-        if rejected:
-            self.run(
-                ["cron", "run", rejected[0], "--wait", "--wait-timeout", "2m"],
-                timeout_seconds=180,
-            )
-
-
 def cron_add_args(job: dict[str, Any], *, disabled: bool) -> list[str]:
     schedule = job["schedule"]
     payload = job["payload"]

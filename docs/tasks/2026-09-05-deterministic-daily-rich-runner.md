@@ -71,6 +71,10 @@ Out of scope:
    verification result. `resolve_current()` must select that same generation.
    Missing methods, mismatched generations, incomplete verification, channel
    mismatch, attachment failure, or any exception is fatal for the slot.
+   Before merge, `resolve_current()` must return a verified existing baseline.
+   A missing baseline fails as `rich_archive_not_initialized` before the merge
+   call and before cursor/state mutation; it is never collapsed into a generic
+   merge failure.
 7. Only after the archive generation is verified may the runner advance
    `lastWrittenMessageId` and its compatibility alias `lastMessageId` to the
    highest message ID actually committed. State and queue use atomic replace.
@@ -120,6 +124,8 @@ the existing private bounded log.
 - no shipped prompt or manifest permits direct/fallback raw Markdown writes;
 - missing rich module and unverified/mismatched generation fail before cursor
   movement;
+- missing or invalid `CURRENT.json` is reported as a distinct bounded category,
+  with only the exception class retained in the private managed-component log;
 - lock contention and incomplete inventory produce warning receipts without
   Discord reads;
 - deterministic selection excludes active queue, stale, null-cursor, partial,

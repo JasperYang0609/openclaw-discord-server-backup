@@ -102,6 +102,23 @@ def test_lock_words_in_unstructured_failure_do_not_mask_error(monkeypatch, tmp_p
     assert receipt["status"] == "error"
 
 
+def test_daily_missing_rich_baseline_writes_specific_no_loss_anomaly(monkeypatch, tmp_path):
+    args, workspace, _ = make_args(tmp_path, "daily-sync-1")
+    monkeypatch.setattr(runner, "command_for", lambda *a, **kw: [[
+        sys.executable, "-c",
+        "import json,sys; print(json.dumps({'ok':False,'status':'error','reason':'rich_archive_not_initialized'})); sys.exit(2)",
+    ]])
+
+    assert runner.run_role(args) == 2
+    receipt = json.loads(
+        (workspace / "memory/health/components/daily-sync-1.json").read_text(encoding="utf-8")
+    )
+    assert receipt["status"] == "error"
+    assert receipt["anomalies"][0]["code"] == "rich_archive_not_initialized"
+    assert receipt["anomalies"][0]["dataLoss"] == "no"
+    assert "full rich rebuild" in receipt["pending"][0]
+
+
 def test_backlog_metrics_create_pending_receipt(monkeypatch, tmp_path):
     args, workspace, _ = make_args(tmp_path, "backlog")
     monkeypatch.setattr(runner, "command_for", lambda *a, **kw: [[
