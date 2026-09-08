@@ -2305,6 +2305,38 @@ def _active_live_binding(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resume_stable_live_binding(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove only Discord CDN signature churn from a validated live binding."""
+    expected_keys = {
+        "messageId", "channelId", "apiSourcePayloadSha256", "sourcePayloadSha256",
+        "visiblePayloadSha256", "sourceCensusSha256", "rendererAccountingSha256",
+        "visiblePointerCount", "assets", "assetInventorySha256",
+    }
+    if set(value) != expected_keys or not isinstance(value.get("assets"), list):
+        raise GenerationError("resume live binding shape is invalid")
+    stable_assets: list[dict[str, Any]] = []
+    for raw in value["assets"]:
+        if not isinstance(raw, Mapping):
+            raise GenerationError("resume asset binding shape is invalid")
+        asset = dict(raw)
+        remote = asset.get("remoteUrl")
+        stable = asset.get("stableRemoteUrl")
+        if _discord_url_without_signature(remote) != stable:
+            raise GenerationError("resume asset URL is not bound to its stable identity")
+        asset["remoteUrl"] = stable
+        stable_assets.append(asset)
+    return {
+        "messageId": value["messageId"],
+        "channelId": value["channelId"],
+        "sourcePayloadSha256": value["sourcePayloadSha256"],
+        "visiblePayloadSha256": value["visiblePayloadSha256"],
+        "rendererAccountingSha256": value["rendererAccountingSha256"],
+        "visiblePointerCount": value["visiblePointerCount"],
+        "assets": stable_assets,
+        "stableAssetInventorySha256": json_sha256(stable_assets),
+    }
+
+
 def _validate_immutable_evidence_reference(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise GenerationError("immutable pre-repair evidence reference is missing")
@@ -5253,13 +5285,32 @@ class RichArchiveStore:
             persisted_inventory = persisted_evidence.get("inventory")
             fresh_inventory = fresh_evidence.get("inventory")
             persisted_transaction = persisted_evidence.get("transactionBinding")
+            fresh_records = token_registration.get("normalizedRecords")
+            if not isinstance(fresh_records, list):
+                raise GenerationError("resume fresh normalized records are missing")
+            for record in fresh_records:
+                if not isinstance(record, Mapping):
+                    raise GenerationError("resume fresh normalized record is invalid")
+                validate_record(record, require_assets=False)
+                if record.get("unknownVisibleFields") or record.get("attachmentErrors"):
+                    raise GenerationError("resume fresh record has unresolved visible fields")
+            persisted_messages = persisted_evidence.get("messages")
+            fresh_messages = fresh_evidence.get("messages")
+            if not isinstance(persisted_messages, list) or not isinstance(fresh_messages, list):
+                raise GenerationError("resume live message evidence is invalid")
+            persisted_stable = [
+                _resume_stable_live_binding(row) for row in persisted_messages
+            ]
+            fresh_stable = [
+                _resume_stable_live_binding(row) for row in fresh_messages
+            ]
             if (
                 not isinstance(persisted_inventory, Mapping)
                 or not isinstance(fresh_inventory, Mapping)
                 or not isinstance(persisted_transaction, Mapping)
                 or persisted_evidence.get("entryIdentity") != fresh_evidence.get("entryIdentity")
                 or persisted_evidence.get("verifiedCutoff") != fresh_evidence.get("verifiedCutoff")
-                or persisted_evidence.get("messages") != fresh_evidence.get("messages")
+                or persisted_stable != fresh_stable
                 or persisted_inventory.get("digest") != run_registration["inventoryDigest"]
                 or fresh_inventory.get("digest") != run_registration["inventoryDigest"]
                 or persisted_transaction.get("generationId") != generation_id
@@ -5299,6 +5350,8 @@ class RichArchiveStore:
                 "records": int(local.get("records") or 0),
                 "assetFileCount": int(reservation["assetFileCount"]),
                 "assetDeclaredBytes": int(reservation["assetDeclaredBytes"]),
+                "resumeStableBindingSha256": json_sha256(fresh_stable),
+                "freshEvidenceSha256": str(fresh_evidence.get("evidenceSha256") or ""),
             }
         finally:
             try:

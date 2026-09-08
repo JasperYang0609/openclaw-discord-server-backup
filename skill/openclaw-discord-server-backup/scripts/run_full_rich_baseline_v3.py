@@ -782,6 +782,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         run_context=run_context,
                     )
                     message_count = int(resumed.get("records") or 0)
+                    resume_evidence = {
+                        "mode": "FRESH_LIVE_EQUIVALENCE",
+                        "stableBindingSha256": resumed["resumeStableBindingSha256"],
+                        "freshEvidenceSha256": resumed["freshEvidenceSha256"],
+                    }
                 else:
                     phase = "materializing_generation"
                     stage = store.materialize_full_stage_from_live_evidence(
@@ -818,8 +823,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     local = rich.verify_generation(final)
                     message_count = int(local.get("records") or 0)
+                    resume_evidence = None
                 receipt_path = final / "receipts/rich-archive-latest.json"
-                selected.append({
+                selected_row = {
                     "channelId": channel_id,
                     "relativePath": str(entry["relativePath"]),
                     "type": str(entry["type"]),
@@ -827,7 +833,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     "generationSha256": generation_sha256,
                     "receiptSha256": file_sha256(receipt_path),
                     "messageCount": message_count,
-                })
+                }
+                if resume_evidence is not None:
+                    selected_row["resumeEvidence"] = resume_evidence
+                selected.append(selected_row)
                 write_progress(
                     run_root,
                     run_id=run_id,

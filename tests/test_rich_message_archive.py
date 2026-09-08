@@ -640,6 +640,25 @@ def test_signed_cdn_query_does_not_create_content_revision_but_is_observed():
     assert len(merged["observations"]) == 2
 
 
+def test_resume_live_binding_ignores_only_verified_cdn_signature_churn():
+    first_source = message(attachments=[{
+        "id": "900", "filename": "x.png", "size": 3,
+        "url": "https://cdn.discordapp.com/attachments/1/x.png?ex=1&is=2&hm=aaa",
+    }])
+    second_source = json.loads(json.dumps(first_source))
+    second_source["attachments"][0]["url"] = (
+        "https://cdn.discordapp.com/attachments/1/x.png?ex=9&is=8&hm=bbb"
+    )
+    first = rich._active_live_binding(normalize(first_source))
+    second = rich._active_live_binding(normalize(second_source))
+    assert first != second
+    assert rich._resume_stable_live_binding(first) == rich._resume_stable_live_binding(second)
+
+    changed = json.loads(json.dumps(second))
+    changed["assets"][0]["displayFilename"] = "different.png"
+    assert rich._resume_stable_live_binding(first) != rich._resume_stable_live_binding(changed)
+
+
 def test_attachment_description_changes_searchable_markdown_and_visible_fingerprint():
     first_source = message(attachments=[{
         "id": "900", "filename": "x.png", "description": "第一版說明", "size": 3,
