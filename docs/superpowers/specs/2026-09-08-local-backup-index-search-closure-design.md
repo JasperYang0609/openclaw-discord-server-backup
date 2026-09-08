@@ -16,7 +16,8 @@ start until this local closure passes.
 - The index source map includes Discord raw Markdown.
 - Of 182 Discord entries, 168 are healthy, 11 have new messages after their
   durable cursor, and three previously failed reads now succeed.
-- Three legacy raw archives contain duplicate message IDs. This is duplicate
+- Thirteen legacy raw archives contain duplicate message IDs (594 repeated
+  occurrences in the 2026-09-08 local audit). This is duplicate
   evidence, not proof of message loss, but it must not create duplicate search
   results.
 - The current rich-archive daily runner blocks because a complete rich baseline
@@ -39,7 +40,7 @@ Separate the core pipeline from optional rich archival.
 5. Search for a unique phrase from a newly backed-up message and require the
    correct Discord raw source path in the result.
 6. Verify that legacy duplicate IDs do not create duplicate indexed chunks or
-   duplicate top results. Repair only the three affected archives if the index
+   duplicate top results. Repair only the thirteen affected archives if the index
    deduplication contract is insufficient; never rewrite unrelated history.
 
 ## Daily data flow

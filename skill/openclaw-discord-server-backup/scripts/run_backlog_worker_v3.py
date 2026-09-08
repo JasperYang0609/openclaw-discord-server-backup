@@ -21,6 +21,11 @@ ACTIVE = {"queued", "catching_up", "retry"}
 TZ_TAIPEI = timezone(timedelta(hours=8))
 MAX_429_RETRIES = 8
 RICH_QUEUE_PREFIX = "rich_"
+RAW_HEADER_ID_PATTERNS = (
+    re.compile(r"^#{1,6}\s+.*(?:—|\||｜)\s*id:(\d{15,20})\s*$"),
+    re.compile(r"^#{1,6} .*?(?:\||｜)\s*(\d{15,20})\s*$"),
+    re.compile(r"^#{1,6} .*?\((\d{15,20})\)\s*$"),
+)
 
 
 def entry_is_excluded(entry: dict[str, Any]) -> bool:
@@ -270,13 +275,40 @@ def ensure_dirs(root: Path, rel: str) -> Path:
     return base
 
 
-def append_batch(root: Path, entry: dict[str, Any], msgs: list[dict[str, Any]], run_label: str) -> None:
+def existing_raw_message_ids(raw_dir: Path) -> set[str]:
+    ids: set[str] = set()
+    if not raw_dir.is_dir():
+        return ids
+    for path in sorted(raw_dir.glob("*.md")):
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                stripped = line.strip()
+                for pattern in RAW_HEADER_ID_PATTERNS:
+                    match = pattern.search(stripped)
+                    if match:
+                        ids.add(match.group(1))
+                        break
+    return ids
+
+
+def append_batch(root: Path, entry: dict[str, Any], msgs: list[dict[str, Any]], run_label: str) -> int:
     rel = entry.get("relativePath")
     if not rel:
         raise RuntimeError("entry missing relativePath")
     base = ensure_dirs(root, rel)
-    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    existing_ids = existing_raw_message_ids(base / "raw")
+    unique: list[dict[str, Any]] = []
+    seen = set(existing_ids)
     for msg in sorted(msgs, key=lambda m: int(m["id"])):
+        message_id = str(msg["id"])
+        if message_id in seen:
+            continue
+        seen.add(message_id)
+        unique.append(msg)
+    if not unique:
+        return 0
+    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for msg in unique:
         by_day[msg_day_tw(msg)].append(msg)
     for day, day_msgs in by_day.items():
         raw = base / "raw" / f"{day}.md"
@@ -303,6 +335,7 @@ def append_batch(root: Path, entry: dict[str, Any], msgs: list[dict[str, Any]], 
             f.write("\n### 重要連結 / 檔案\n")
             for x in s["links"]:
                 f.write(f"- {x}\n")
+    return len(unique)
 
 
 def normalize_queue_items(queue: dict[str, Any], state: dict[str, Any]) -> None:
@@ -586,15 +619,6 @@ def main() -> int:
     state = load_json(state_path, {})
     queue = load_json(queue_path, {"version": 1, "items": []})
     rich_blockers = active_rich_queue_keys(state, queue)
-    if rich_blockers:
-        print(json.dumps({
-            "ok": False,
-            "status": "blocked",
-            "reason": "rich_queue_requires_v2_worker",
-            "blockedEntries": len(rich_blockers),
-        }, ensure_ascii=False, sort_keys=True))
-        lock_handle.close()
-        return 2
     token = "" if args.dry_run else load_discord_token(Path(args.openclaw_config), args.token_env)
     run_label = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S %z")
 
@@ -649,9 +673,9 @@ def main() -> int:
                     status = "caught_up"
                     break
                 msgs = sorted(msgs, key=lambda m: int(m["id"]))
-                append_batch(root, entry, msgs, run_label)
+                appended = append_batch(root, entry, msgs, run_label)
                 cursor = msgs[-1]["id"]
-                added += len(msgs)
+                added += appended
                 entry["lastWrittenMessageId"] = cursor
                 entry["lastMessageId"] = cursor
                 entry["lastSuccessfulWriteAt"] = now_utc()
@@ -699,6 +723,8 @@ def main() -> int:
     for item in queue.get("items", []):
         if item.get("status") not in ACTIVE:
             continue
+        if is_rich_queue_reason(item.get("reason")):
+            continue
         if int(item.get("attempts") or 0) > 5:
             audit_warnings.append({"entry": item.get("entryKey"), "kind": "attempts", "attempts": int(item.get("attempts") or 0), "status": item.get("status")})
     for key, entry in (state.get("entries") or {}).items():
@@ -707,8 +733,20 @@ def main() -> int:
         if int(entry.get("consecutiveErrors") or 0) > 3:
             audit_warnings.append({"entry": key, "kind": "consecutiveErrors", "consecutiveErrors": int(entry.get("consecutiveErrors") or 0), "syncStatus": entry.get("syncStatus")})
 
-    active_left = sum(1 for i in queue.get("items", []) if i.get("status") in ACTIVE)
-    result = {"ok": True, "today": args.today, "processed": len(report), "totalBatches": total_batches, "activeQueueLeft": active_left, "auditWarnings": audit_warnings, "entries": report}
+    active_left = sum(
+        1 for i in queue.get("items", [])
+        if i.get("status") in ACTIVE and not is_rich_queue_reason(i.get("reason"))
+    )
+    result = {
+        "ok": True,
+        "today": args.today,
+        "processed": len(report),
+        "totalBatches": total_batches,
+        "activeQueueLeft": active_left,
+        "optionalRichPending": len(rich_blockers),
+        "auditWarnings": audit_warnings,
+        "entries": report,
+    }
     if RECOVERED_SOURCES:
         result["recoveredFrom"] = RECOVERED_SOURCES
     print(json.dumps(result, ensure_ascii=False, indent=2))

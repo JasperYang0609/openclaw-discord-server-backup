@@ -104,7 +104,7 @@ def test_lock_words_in_unstructured_failure_do_not_mask_error(monkeypatch, tmp_p
     assert receipt["status"] == "error"
 
 
-def test_daily_missing_rich_baseline_writes_specific_no_loss_anomaly(monkeypatch, tmp_path):
+def test_daily_core_role_never_misclassifies_rich_runner_error_as_success(monkeypatch, tmp_path):
     args, workspace, _ = make_args(tmp_path, "daily-sync-1")
     monkeypatch.setattr(runner, "command_for", lambda *a, **kw: [[
         sys.executable, "-c",
@@ -116,9 +116,9 @@ def test_daily_missing_rich_baseline_writes_specific_no_loss_anomaly(monkeypatch
         (workspace / "memory/health/components/daily-sync-1.json").read_text(encoding="utf-8")
     )
     assert receipt["status"] == "error"
-    assert receipt["anomalies"][0]["code"] == "rich_archive_not_initialized"
-    assert receipt["anomalies"][0]["dataLoss"] == "no"
-    assert "full rich rebuild" in receipt["pending"][0]
+    assert receipt["anomalies"][0]["code"] == "component_failed"
+    assert receipt["anomalies"][0]["dataLoss"] == "unknown"
+    assert receipt["producer"] == "openclaw-discord-server-backup/daily-sync-core-v3"
 
 
 def test_backlog_metrics_create_pending_receipt(monkeypatch, tmp_path):
@@ -161,15 +161,13 @@ def test_daily_role_builds_bounded_deterministic_command(tmp_path):
 
     assert len(commands) == 1
     command = commands[0]
-    assert command[1].endswith("run_daily_sync_v3.py")
-    assert command[command.index("--role") + 1] == "daily-sync-2"
-    assert command[command.index("--mapping-ledger") + 1].endswith("inventory-mapping.json")
-    assert command[command.index("--guild-id") + 1] == config["guildId"]
-    assert command[command.index("--workspace") + 1] == str(workspace)
-    assert command[command.index("--backup-config") + 1] == str(config_path)
+    assert command[1].endswith("run_backlog_worker_v3.py")
     assert command[command.index("--max-entries") + 1] == "6"
-    assert command[command.index("--max-write-entries") + 1] == "4"
-    assert command[command.index("--max-read-messages") + 1] == "180"
+    assert command[command.index("--max-batches") + 1] == "12"
+    assert command[command.index("--max-batches-per-entry") + 1] == "2"
+    assert command[command.index("--limit") + 1] == "60"
+    assert "--inventory" not in command
+    assert "--mapping-ledger" not in command
 
 
 def test_daily_role_rejects_runtime_bounds_above_reviewed_caps(tmp_path):
@@ -196,7 +194,7 @@ def test_daily_role_writes_v2_health_receipt(monkeypatch, tmp_path):
     receipt = json.loads(
         (workspace / "memory/health/components/daily-sync-3.json").read_text(encoding="utf-8")
     )
-    assert receipt["producer"] == "openclaw-discord-server-backup/daily-sync-v2"
+    assert receipt["producer"] == "openclaw-discord-server-backup/daily-sync-core-v3"
     assert receipt["status"] == "ok"
 
 
@@ -219,7 +217,7 @@ def test_health_report_runs_topology_verify_before_render(monkeypatch, tmp_path,
         if component == "cron-topology":
             continue
         producer = (
-            "openclaw-discord-server-backup/daily-sync-v2" if component.startswith("daily-sync-")
+            "openclaw-discord-server-backup/daily-sync-core-v3" if component.startswith("daily-sync-")
             else "openclaw-discord-server-backup/run-managed-component.v1"
         )
         runner.health.write_component(
@@ -283,7 +281,7 @@ def test_health_topology_verify_preserves_legacy_configured_discord_root(monkeyp
         if component == "cron-topology":
             continue
         producer = (
-            "openclaw-discord-server-backup/daily-sync-v2" if component.startswith("daily-sync-")
+            "openclaw-discord-server-backup/daily-sync-core-v3" if component.startswith("daily-sync-")
             else "openclaw-discord-server-backup/run-managed-component.v1"
         )
         runner.health.write_component(

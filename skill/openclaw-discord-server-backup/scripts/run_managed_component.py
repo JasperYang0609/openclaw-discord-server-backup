@@ -21,21 +21,6 @@ ROLES = {
     "weekly-inventory", "weekly-raw", "workspace-snapshot", "health-report",
 }
 
-DAILY_FAILURE_CODES = {
-    "rich_archive_readback_failed",
-    "rich_archive_merge_failed",
-    "rich_archive_not_initialized",
-    "rich_asset_budget_exhausted",
-    "rich_baseline_missing",
-    "rich_core_authority_expired",
-    "rich_core_authority_invalid",
-    "rich_core_contract_pending",
-    "rich_core_contract_unsupported",
-    "rich_core_integrity_mismatch",
-    "rich_core_load_failed",
-}
-
-
 def load_sibling(name: str):
     path = HERE / name
     spec = importlib.util.spec_from_file_location(f"managed_{path.stem}", path)
@@ -158,31 +143,17 @@ def command_for(
             limits.get("dailyMessageLimitPerEntry"), default=60, maximum=60,
             label="daily message limit",
         )
-        mutable_limit = bounded_config_int(
-            limits.get("dailyMutableRefreshLimit"), default=10, maximum=30,
-            label="daily mutable refresh limit",
-        )
         return [[
-            python, str(HERE / "run_daily_sync_v3.py"),
-            "--role", role,
+            python, str(HERE / "run_backlog_worker_v3.py"),
             "--state", str(state),
             "--queue", str(queue),
             "--root", str(discord_root),
-            "--inventory", str(inventory),
-            "--mapping-ledger", str(mapping),
-            "--guild-id", str(config["guildId"]),
             "--today", today,
-            "--timezone", str(config.get("timezone") or "Asia/Taipei"),
             "--openclaw-config", str(openclaw_config),
-            "--workspace", str(workspace),
-            "--backup-config", str(config_path),
             "--max-entries", str(max_entries),
-            "--max-write-entries", "4",
-            "--page-size", "30",
-            "--max-pages-per-entry", "2",
-            "--max-messages-per-entry", str(max_messages),
-            "--max-read-messages", "180",
-            "--mutable-refresh-limit", str(mutable_limit),
+            "--max-batches", str(max_entries * 2),
+            "--max-batches-per-entry", "2",
+            "--limit", str(max_messages),
         ]]
     if role == "caught-up-audit":
         return [[
@@ -240,6 +211,7 @@ def parse_metrics(text: str) -> dict[str, Any]:
                 "finalLiveOnly", "finalLiveErrors", "checked", "writtenEntries",
                 "writtenMessages", "refreshedMessages", "mergedMessages",
                 "queued", "totalRead",
+                "optionalRichPending",
             ):
                 if key in data and isinstance(data[key], (int, float, bool)):
                     metrics[key] = data[key]
@@ -294,7 +266,7 @@ def success_summary(role: str, metrics: dict[str, Any]) -> tuple[str, str, list[
     if role == "discovery":
         return "ok", "頻道與討論串完整清單已更新", []
     if role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}:
-        pending = ["本輪達到安全上限，已交由 backlog 從驗證游標續做"] if int(metrics.get("queued", 0)) else []
+        pending = ["本輪達到安全上限，下一批會從驗證游標續做"] if int(metrics.get("activeQueueLeft", 0)) else []
         return ("pending" if pending else "ok"), (pending[0] if pending else "本輪日常同步已完成"), pending
     if role == "caught-up-audit":
         pending = ["尚有頻道待追趕"] if int(metrics.get("activeQueue", 0)) else []
@@ -375,26 +347,6 @@ def run_role(args: argparse.Namespace) -> int:
     elif returncode == 0:
         status, summary, pending = success_summary(args.role, metrics)
         anomalies: list[dict[str, Any]] = []
-    elif (
-        args.role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}
-        and failure_payload is not None
-        and failure_payload.get("reason") in DAILY_FAILURE_CODES
-    ):
-        failure_code = str(failure_payload["reason"])
-        if failure_code == "rich_archive_not_initialized":
-            summary = "Rich Archive 基線尚未建立，日常同步已在讀寫前停止"
-            pending = ["先完成並驗證 full rich rebuild，再啟用 deterministic daily sync"]
-        else:
-            summary = "Rich Archive 驗證失敗，游標已保留"
-            pending = ["查看本機受控日誌中的錯誤類型並修復後重試"]
-        status = "error"
-        anomalies = [{
-            "code": failure_code,
-            "summary": summary,
-            "impact": "本輪新訊息備份延後",
-            "dataLoss": "no",
-            "repairStatus": "未推進游標，等待 Rich Archive 修復",
-        }]
     else:
         status = "error"
         summary = "備份元件執行失敗，已停止後續寫入"
@@ -405,7 +357,7 @@ def run_role(args: argparse.Namespace) -> int:
             "repairStatus": "失敗告警已啟用，等待重試",
         }]
     producer = (
-        "openclaw-discord-server-backup/daily-sync-v2"
+        "openclaw-discord-server-backup/daily-sync-core-v3"
         if args.role in {"daily-sync-1", "daily-sync-2", "daily-sync-3"}
         else "openclaw-discord-server-backup/run-managed-component.v1"
     )

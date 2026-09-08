@@ -22,7 +22,7 @@ NOW = datetime.fromisoformat("2026-09-04T07:05:00+08:00")
 
 def write_ok(receipt_dir: Path, component: str, *, checked_at: datetime = NOW):
     producer = (
-        "openclaw-discord-server-backup/daily-sync-v2" if component.startswith("daily-sync-")
+        "openclaw-discord-server-backup/daily-sync-core-v3" if component.startswith("daily-sync-")
         else "openclaw-discord-server-backup/cron-manager.v1" if component == "cron-topology"
         else "openclaw-discord-server-backup/run-managed-component.v1"
     )
@@ -84,7 +84,7 @@ def test_all_three_lock_skips_without_later_audit_are_never_green(tmp_path):
         health.write_component(
             tmp_path, f"daily-sync-{index}", "warning", "本輪已安全略過",
             f"openclaw-discord-server-backup:123456789012345678:daily-sync-{index}:v1",
-            producer="openclaw-discord-server-backup/daily-sync-v2",
+            producer="openclaw-discord-server-backup/daily-sync-core-v3",
             anomalies=[{
                 "code": "backup_lock_busy", "summary": "本輪已安全略過",
                 "impact": "新訊息備份延後", "dataLoss": "no", "repairStatus": "等待續做",
@@ -96,6 +96,37 @@ def test_all_three_lock_skips_without_later_audit_are_never_green(tmp_path):
     assert "⚠️ 需注意" in report
     assert "三次日常同步都因另一個備份流程占用" in report
     assert "目前沒有資料遺失" in report
+
+
+def test_later_zero_queue_audit_supersedes_only_bounded_pending_receipts(tmp_path):
+    complete_local_receipts(tmp_path)
+    for component in ("daily-sync-1", "daily-sync-2", "backlog"):
+        producer = (
+            "openclaw-discord-server-backup/daily-sync-core-v3"
+            if component.startswith("daily-sync-")
+            else "openclaw-discord-server-backup/run-managed-component.v1"
+        )
+        health.write_component(
+            tmp_path, component, "pending", "下一批會續做",
+            f"openclaw-discord-server-backup:123456789012345678:{component}:v1",
+            producer=producer,
+            checks=[{"key": "bounded", "status": "ok", "summary": "safe"}],
+            metrics={"activeQueueLeft": 2}, pending=["下一批會續做"],
+            checked_at=(NOW - timedelta(minutes=20)).isoformat(),
+        )
+    health.write_component(
+        tmp_path, "caught-up-audit", "ok", "追平稽核通過",
+        "openclaw-discord-server-backup:123456789012345678:caught-up-audit:v1",
+        producer="openclaw-discord-server-backup/run-managed-component.v1",
+        checks=[{"key": "after_cursor", "status": "ok", "summary": "zero"}],
+        metrics={"activeQueue": 0}, checked_at=NOW.isoformat(),
+    )
+
+    report = health.render_report(tmp_path, now=NOW)
+
+    assert "✅ 正常" in report
+    assert "頻道／討論串：全部追平" in report
+    assert "下一批會續做" not in report
 
 
 def test_qwen_failure_uses_string_enum_and_never_prints_python_boolean(tmp_path):

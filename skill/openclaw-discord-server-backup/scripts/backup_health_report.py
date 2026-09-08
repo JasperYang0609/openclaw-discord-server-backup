@@ -38,7 +38,7 @@ LOCAL_PRODUCERS = {
         "core-backup", "discovery", "caught-up-audit", "backlog",
         "weekly-inventory", "weekly-raw", "workspace-snapshot",
     )},
-    **{f"daily-sync-{index}": {"openclaw-discord-server-backup/daily-sync-v2"} for index in (1, 2, 3)},
+    **{f"daily-sync-{index}": {"openclaw-discord-server-backup/daily-sync-core-v3"} for index in (1, 2, 3)},
     "cron-topology": {
         "openclaw-discord-server-backup/cron-manager.v1",
         "openclaw-discord-server-backup/health-topology-verify.v1",
@@ -351,6 +351,37 @@ def all_daily_sync_locked(receipts: dict[str, dict[str, Any]]) -> bool:
     return True
 
 
+def supersede_drained_queue_pending(
+    receipts: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Clear only bounded-work pending receipts proven obsolete by a later audit."""
+    audit = receipts.get("caught-up-audit")
+    if (
+        not audit
+        or audit.get("status") != "ok"
+        or audit.get("metrics", {}).get("activeQueue") != 0
+    ):
+        return receipts
+    bounded = ("daily-sync-1", "daily-sync-2", "daily-sync-3", "backlog")
+    pending_rows = [
+        receipts[name]
+        for name in bounded
+        if name in receipts and receipts[name].get("status") == "pending"
+    ]
+    if not pending_rows:
+        return receipts
+    if parse_checked_at(audit["checkedAt"]) <= max(
+        parse_checked_at(row["checkedAt"]) for row in pending_rows
+    ):
+        return receipts
+    effective = dict(receipts)
+    for name in bounded:
+        row = receipts.get(name)
+        if row and row.get("status") == "pending":
+            effective[name] = {**row, "status": "ok", "pending": []}
+    return effective
+
+
 def render_report(
     receipt_dir: Path,
     *,
@@ -379,8 +410,10 @@ def render_report(
     if qwen_receipt is not None:
         qwen = load_qwen_receipt(qwen_receipt, now)
 
-    core_text, core_anomalies, core_pending = group_summary([receipts["core-backup"]], "完整")
-    channel_rows = [receipts[name] for name in ("discovery", "daily-sync-1", "daily-sync-2", "daily-sync-3", "caught-up-audit", "backlog")]
+    effective_receipts = supersede_drained_queue_pending(receipts)
+
+    core_text, core_anomalies, core_pending = group_summary([effective_receipts["core-backup"]], "完整")
+    channel_rows = [effective_receipts[name] for name in ("discovery", "daily-sync-1", "daily-sync-2", "daily-sync-3", "caught-up-audit", "backlog")]
     channel_text, channel_anomalies, channel_pending = group_summary(channel_rows, "全部追平")
     if all_daily_sync_locked(receipts):
         channel_text = "三次日常同步都因另一個備份流程占用而安全略過，尚待後續補跑確認"
@@ -402,7 +435,7 @@ def render_report(
     else:
         index_text, index_anomalies, index_pending = group_summary([qwen], "已同步")
 
-    all_rows = [*receipts.values(), *weekly.values(), *monthly.values(), *([qwen] if qwen else [])]
+    all_rows = [*effective_receipts.values(), *weekly.values(), *monthly.values(), *([qwen] if qwen else [])]
     overall = worst_status(all_rows)
     anomalies = [*core_anomalies, *channel_anomalies, *index_anomalies, *snapshot_anomalies, *topology_anomalies]
     pending = list(dict.fromkeys([*core_pending, *channel_pending, *index_pending, *snapshot_pending, *topology_pending]))

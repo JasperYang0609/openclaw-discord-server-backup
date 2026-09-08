@@ -25,7 +25,7 @@
     },
     "run_managed_component.py": {
       "relativePath": "scripts/run_managed_component.py",
-      "sha256": "9464510217aefd27b0c1085e2d792f3c51cce7e4859fb5ca2c08902065533b65",
+      "sha256": "0e13f8a696123f546bd8e07fc94b3047e589188e9efa528abe0c03929f26c69e",
       "mode": "0600",
       "owner": "effective-user",
       "links": 1

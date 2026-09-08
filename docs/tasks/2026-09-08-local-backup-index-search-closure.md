@@ -16,7 +16,8 @@ Client packaging and optional full rich-archive migration are explicitly out of 
 - Catch up only entries with verified messages after their durable cursor.
 - Preserve append-only raw archives and advance cursors only after write/readback.
 - Preserve rich queue/state evidence while core work progresses.
-- Prevent legacy duplicate message IDs from creating duplicate indexed results.
+- Prevent the thirteen audited legacy archives with repeated message IDs from
+  creating duplicate indexed results, without rewriting unrelated history.
 - Keep Qwen model and index identity unchanged.
 
 ## Non-goals
@@ -50,4 +51,3 @@ Client packaging and optional full rich-archive migration are explicitly out of 
 
 Manual closure may be reported separately from natural-schedule validation. The
 local system is not 100% complete until the next natural schedule window passes.
-

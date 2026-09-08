@@ -109,6 +109,30 @@ def test_reactivating_caught_up_item_resets_attempts():
     assert item["attempts"] == 0
 
 
+def test_append_batch_is_idempotent_for_existing_and_repeated_message_ids(tmp_path):
+    entry = {"relativePath": "topic"}
+    first = {
+        "id": "1539914416244391999",
+        "timestamp": "2026-09-08T01:02:03+00:00",
+        "content": "first durable message",
+        "author": {"username": "tester"},
+    }
+    second = {
+        "id": "1539914416244392000",
+        "timestamp": "2026-09-08T01:03:03+00:00",
+        "content": "second durable message",
+        "author": {"username": "tester"},
+    }
+
+    assert worker.append_batch(tmp_path, entry, [first, first], "run-1") == 1
+    assert worker.append_batch(tmp_path, entry, [first, second, second], "run-2") == 1
+    assert worker.append_batch(tmp_path, entry, [first, second], "run-3") == 0
+
+    raw = (tmp_path / "topic/raw/2026-09-08.md").read_text(encoding="utf-8")
+    assert raw.count("id:1539914416244391999") == 1
+    assert raw.count("id:1539914416244392000") == 1
+
+
 def test_normalize_marks_orphan_item_retired():
     state = {"entries": {"topic": _entry("100")}}
     queue = {
@@ -176,7 +200,7 @@ def test_worker_skips_when_lock_is_held(tmp_path):
         lock.close()
 
 
-def test_legacy_worker_fails_closed_before_mutation_for_unknown_rich_reason(tmp_path):
+def test_core_worker_ignores_optional_rich_queue_without_mutation(tmp_path):
     state_path = tmp_path / "state.json"
     queue_path = tmp_path / "queue.json"
     root = tmp_path / "archive"
@@ -200,14 +224,12 @@ def test_legacy_worker_fails_closed_before_mutation_for_unknown_rich_reason(tmp_
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 2
+    assert result.returncode == 0
     payload = json.loads(result.stdout)
-    assert payload == {
-        "ok": False,
-        "status": "blocked",
-        "reason": "rich_queue_requires_v2_worker",
-        "blockedEntries": 1,
-    }
+    assert payload["ok"] is True
+    assert payload["processed"] == 0
+    assert payload["activeQueueLeft"] == 0
+    assert payload["optionalRichPending"] == 1
     assert (state_path.read_bytes(), queue_path.read_bytes()) == before
 
 
