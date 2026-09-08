@@ -47,6 +47,7 @@ HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 MAX_ERROR_BYTES = 64 * 1024
 MAX_429_RETRIES = 10
+MAX_TRANSIENT_RETRIES = 4
 
 
 class BaselineError(RuntimeError):
@@ -194,6 +195,15 @@ class DiscordTransport:
                 return json.loads(encoded.decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 body = exc.read(MAX_ERROR_BYTES + 1)
+                if exc.code in {500, 502, 503, 504}:
+                    retry_count += 1
+                    self.retries += 1
+                    if retry_count > MAX_TRANSIENT_RETRIES:
+                        raise BaselineError("discord_transient_retry_exhausted") from exc
+                    delay = min(0.5 * (2 ** (retry_count - 1)), 5.0)
+                    self.waited_seconds += delay
+                    time.sleep(delay)
+                    continue
                 if exc.code != 429:
                     raise BaselineError("discord_fetch_failed") from exc
                 retry_count += 1
@@ -209,6 +219,14 @@ class DiscordTransport:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     delay = 1.0
                 delay = min(max(delay, 0.0) + 0.25, 30.0)
+                self.waited_seconds += delay
+                time.sleep(delay)
+            except urllib.error.URLError as exc:
+                retry_count += 1
+                self.retries += 1
+                if retry_count > MAX_TRANSIENT_RETRIES:
+                    raise BaselineError("discord_transient_retry_exhausted") from exc
+                delay = min(0.5 * (2 ** (retry_count - 1)), 5.0)
                 self.waited_seconds += delay
                 time.sleep(delay)
             except (OSError, ValueError, TypeError) as exc:
@@ -396,6 +414,136 @@ def immutable_reference(
     return reference, evidence
 
 
+def resume_reference(
+    archive_root: Path,
+    state_path: Path,
+    queue_path: Path,
+    run_root: Path,
+    entries: Sequence[Mapping[str, Any]],
+    run_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Verify the immutable pre-run tree and allow only this run's generations."""
+    evidence_path = run_root / "immutable-pre-repair-evidence.json"
+    try:
+        run_info = run_root.lstat()
+        evidence_info = evidence_path.lstat()
+    except OSError as exc:
+        raise BaselineError("resume_immutable_evidence_invalid") from exc
+    if (
+        run_root.is_symlink()
+        or not stat.S_ISDIR(run_info.st_mode)
+        or stat.S_IMODE(run_info.st_mode) & 0o077
+        or evidence_path.is_symlink()
+        or not stat.S_ISREG(evidence_info.st_mode)
+        or evidence_info.st_nlink != 1
+    ):
+        raise BaselineError("resume_immutable_evidence_invalid")
+    evidence = load_object(evidence_path)
+    verification = {
+        "archiveTreeManifestSha256": evidence.get("archiveTreeManifestSha256"),
+        "stateSha256": evidence.get("stateSha256"),
+        "queueSha256": evidence.get("queueSha256"),
+        "entryCount": evidence.get("entryCount"),
+        "verifiedAt": evidence.get("verifiedAt"),
+    }
+    files = evidence.get("files")
+    if (
+        evidence.get("schemaVersion") != "openclaw-discord-immutable-evidence.v1"
+        or evidence.get("verificationSha256") != json_sha256(verification)
+        or not isinstance(files, list)
+        or evidence.get("entryCount") != len(files)
+        or evidence.get("archiveTreeManifestSha256") != json_sha256(files)
+        or evidence.get("stateSha256") != file_sha256(state_path)
+        or evidence.get("queueSha256") != file_sha256(queue_path)
+    ):
+        raise BaselineError("resume_immutable_evidence_invalid")
+    expected_paths: set[str] = set()
+    for row in files:
+        if not isinstance(row, Mapping):
+            raise BaselineError("resume_immutable_evidence_invalid")
+        relative = str(row.get("path") or "")
+        pure = PurePosixPath(relative)
+        if (
+            not relative
+            or pure.is_absolute()
+            or "\\" in relative
+            or any(part in {"", ".", ".."} for part in pure.parts)
+        ):
+            raise BaselineError("resume_immutable_evidence_invalid")
+        path = rich.contained_path(archive_root, relative)
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise BaselineError("resume_immutable_evidence_drift") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or path.is_symlink()
+            or info.st_size != row.get("size")
+            or file_sha256(path) != row.get("sha256")
+        ):
+            raise BaselineError("resume_immutable_evidence_drift")
+        expected_paths.add(relative)
+    allowed_prefixes = {
+        f"{entry['relativePath']}/generations/full-{run_id}-{sequence:04d}/"
+        for sequence, entry in enumerate(entries, 1)
+    } | {
+        f"{entry['relativePath']}/.staging/full-{run_id}-{sequence:04d}/"
+        for sequence, entry in enumerate(entries, 1)
+    }
+    for path in archive_root.rglob("*"):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise BaselineError("resume_archive_symlink")
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        relative = str(path.relative_to(archive_root))
+        if relative == ".channel_backup.lock" or relative.startswith("runs/"):
+            continue
+        if info.st_nlink != 1:
+            raise BaselineError("resume_archive_hardlink")
+        if relative not in expected_paths and not any(
+            relative.startswith(prefix) for prefix in allowed_prefixes
+        ):
+            raise BaselineError("resume_archive_contains_unexplained_drift")
+    reference = {
+        "snapshotId": f"pre-rich-{run_id}",
+        "status": "PASS",
+        "verifiedAt": evidence["verifiedAt"],
+        "archiveTreeManifestSha256": evidence["archiveTreeManifestSha256"],
+        "stateSha256": evidence["stateSha256"],
+        "queueSha256": evidence["queueSha256"],
+        "verificationSha256": evidence["verificationSha256"],
+    }
+    return reference, evidence
+
+
+def write_progress(
+    run_root: Path,
+    *,
+    run_id: str,
+    status: str,
+    sequence: int,
+    entry: Mapping[str, Any],
+    completed: int,
+    reason: str | None = None,
+) -> None:
+    body: dict[str, Any] = {
+        "schemaVersion": "openclaw-discord-rich-baseline-progress.v1",
+        "runId": run_id,
+        "status": status,
+        "sequence": sequence,
+        "channelId": str(entry["channelId"]),
+        "relativePath": str(entry["relativePath"]),
+        "completedEntryCount": completed,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    if reason is not None:
+        body["reason"] = reason
+    body["progressSha256"] = json_sha256(body)
+    rich.atomic_json(run_root / "run-progress.json", body)
+
+
 def pointer_body(run_id: str, manifest_sha256: str) -> dict[str, Any]:
     body = {
         "schemaVersion": RUN_POINTER_SCHEMA,
@@ -572,15 +720,27 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         run_root = rich.contained_path(archive_root, f"runs/{run_id}")
         run_root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(run_root.parent, 0o700)
-        run_root.mkdir(parents=False, exist_ok=False, mode=0o700)
-        os.chmod(run_root, 0o700)
-        reference, evidence = immutable_reference(
-            archive_root,
-            state_path,
-            queue_path,
-            run_id,
-        )
-        rich.atomic_json(run_root / "immutable-pre-repair-evidence.json", evidence)
+        if run_root.exists():
+            if run_root.is_symlink() or not run_root.is_dir():
+                raise BaselineError("resume_run_root_invalid")
+            reference, evidence = resume_reference(
+                archive_root,
+                state_path,
+                queue_path,
+                run_root,
+                entries,
+                run_id,
+            )
+        else:
+            run_root.mkdir(parents=False, exist_ok=False, mode=0o700)
+            os.chmod(run_root, 0o700)
+            reference, evidence = immutable_reference(
+                archive_root,
+                state_path,
+                queue_path,
+                run_id,
+            )
+            rich.atomic_json(run_root / "immutable-pre-repair-evidence.json", evidence)
         selected: list[dict[str, Any]] = []
         for sequence, entry in enumerate(entries, 1):
             channel_id = str(entry["channelId"])
@@ -589,61 +749,107 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 safe_entry_root(archive_root, str(entry["relativePath"])),
                 lock_path=rich.canonical_archive_lock_path(archive_root),
             )
-            evidence_token = rich.collect_live_evidence(
-                fetch_page=transport.page,
-                verify_immutable_evidence=lambda ref=reference: ref,
-                run_context=run_context,
-                entry_root=store.entry_root,
-                generation_id=generation_id,
-                channel_id=channel_id,
-                relative_path=str(entry["relativePath"]),
-                page_limit=args.page_size,
-                max_pages=args.max_pages_per_entry,
-                max_messages=args.max_messages_per_entry,
-                evidence_ttl_seconds=remaining_evidence_ttl(
-                    run_deadline_monotonic,
-                ),
-            )
-            stage = store.materialize_full_stage_from_live_evidence(
-                generation_id=generation_id,
-                live_evidence_token=evidence_token,
-                downloader=rich.AssetDownloader(
-                    limits=rich.AssetLimits(
-                        full_run_files=args.max_asset_files,
-                        full_run_bytes=args.max_asset_bytes,
-                        disk_reserve_bytes=args.minimum_free_space_bytes,
+            final = rich.contained_path(store.generations, generation_id)
+            stage = rich.contained_path(store.staging, generation_id)
+            if stage.exists() or stage.is_symlink():
+                raise BaselineError("resume_staging_generation_requires_review")
+            phase = "collecting_live_evidence"
+            try:
+                evidence_token = rich.collect_live_evidence(
+                    fetch_page=transport.page,
+                    verify_immutable_evidence=lambda ref=reference: ref,
+                    run_context=run_context,
+                    entry_root=store.entry_root,
+                    generation_id=generation_id,
+                    channel_id=channel_id,
+                    relative_path=str(entry["relativePath"]),
+                    page_limit=args.page_size,
+                    max_pages=args.max_pages_per_entry,
+                    max_messages=args.max_messages_per_entry,
+                    evidence_ttl_seconds=remaining_evidence_ttl(
+                        run_deadline_monotonic,
+                    ),
+                )
+                if final.exists() or final.is_symlink():
+                    phase = "verifying_resume_generation"
+                    local = rich.verify_generation(final)
+                    generation_sha256 = str(local["generationSha256"])
+                    resumed = store.register_existing_sealed_generation_for_root_run(
+                        final,
+                        generation_id,
+                        generation_sha256,
+                        live_evidence_token=evidence_token,
+                        run_context=run_context,
                     )
-                ),
-            )
-            store.reserve_full_stage_assets(
-                stage,
-                run_context=run_context,
-                channel_id=channel_id,
-                relative_path=str(entry["relativePath"]),
-            )
-            installed = store.install_full_pass_evidence(
-                stage,
-                live_evidence_token=evidence_token,
-            )
-            generation_sha256 = str(installed["manifest"]["generationSha256"])
-            final = store.seal_full_stage_for_root_run(
-                stage,
-                generation_id,
-                generation_sha256,
-                live_evidence_token=evidence_token,
-                run_context=run_context,
-            )
-            local = rich.verify_generation(final)
-            receipt_path = final / "receipts/rich-archive-latest.json"
-            selected.append({
-                "channelId": channel_id,
-                "relativePath": str(entry["relativePath"]),
-                "type": str(entry["type"]),
-                "generationId": generation_id,
-                "generationSha256": generation_sha256,
-                "receiptSha256": file_sha256(receipt_path),
-                "messageCount": int(local.get("messageCount") or 0),
-            })
+                    message_count = int(resumed.get("records") or 0)
+                else:
+                    phase = "materializing_generation"
+                    stage = store.materialize_full_stage_from_live_evidence(
+                        generation_id=generation_id,
+                        live_evidence_token=evidence_token,
+                        downloader=rich.AssetDownloader(
+                            limits=rich.AssetLimits(
+                                full_run_files=args.max_asset_files,
+                                full_run_bytes=args.max_asset_bytes,
+                                disk_reserve_bytes=args.minimum_free_space_bytes,
+                            )
+                        ),
+                    )
+                    phase = "reserving_generation_assets"
+                    store.reserve_full_stage_assets(
+                        stage,
+                        run_context=run_context,
+                        channel_id=channel_id,
+                        relative_path=str(entry["relativePath"]),
+                    )
+                    phase = "installing_full_pass_evidence"
+                    installed = store.install_full_pass_evidence(
+                        stage,
+                        live_evidence_token=evidence_token,
+                    )
+                    generation_sha256 = str(installed["manifest"]["generationSha256"])
+                    phase = "sealing_generation"
+                    final = store.seal_full_stage_for_root_run(
+                        stage,
+                        generation_id,
+                        generation_sha256,
+                        live_evidence_token=evidence_token,
+                        run_context=run_context,
+                    )
+                    local = rich.verify_generation(final)
+                    message_count = int(local.get("records") or 0)
+                receipt_path = final / "receipts/rich-archive-latest.json"
+                selected.append({
+                    "channelId": channel_id,
+                    "relativePath": str(entry["relativePath"]),
+                    "type": str(entry["type"]),
+                    "generationId": generation_id,
+                    "generationSha256": generation_sha256,
+                    "receiptSha256": file_sha256(receipt_path),
+                    "messageCount": message_count,
+                })
+                write_progress(
+                    run_root,
+                    run_id=run_id,
+                    status="RUNNING",
+                    sequence=sequence,
+                    entry=entry,
+                    completed=len(selected),
+                )
+            except Exception as exc:
+                reason = str(exc)
+                if not re.fullmatch(r"[a-z0-9_]+", reason):
+                    reason = f"{phase}_failed"
+                write_progress(
+                    run_root,
+                    run_id=run_id,
+                    status="BLOCKED",
+                    sequence=sequence,
+                    entry=entry,
+                    completed=len(selected),
+                    reason=reason,
+                )
+                raise BaselineError(reason) from exc
 
         sealed = rich.verify_sealed_full_rebuild_run(run_context)
         if sealed.get("gateStatus") != "PASS":

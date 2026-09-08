@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+import time
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -110,3 +113,116 @@ def test_runtime_argument_cannot_outlive_maximum_evidence_ttl(tmp_path):
     ])
     with pytest.raises(baseline.BaselineError, match="runtime_arguments_invalid"):
         baseline.execute(args)
+
+
+class _Response:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self, _limit):
+        return self.payload
+
+
+def test_discord_transport_retries_transient_http_failure(monkeypatch):
+    calls = {"count": 0}
+
+    def urlopen(_request, timeout):
+        assert timeout == 30
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise urllib.error.HTTPError(
+                "https://discord.example.invalid",
+                502,
+                "bad gateway",
+                {},
+                io.BytesIO(b""),
+            )
+        return _Response(b"{}")
+
+    monkeypatch.setattr(baseline.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(baseline.time, "sleep", lambda _seconds: None)
+    transport = baseline.DiscordTransport(
+        "test-token",
+        max_requests=3,
+        deadline_monotonic=time.monotonic() + 60,
+    )
+    assert transport.get("/test") == {}
+    assert transport.requests == 2
+    assert transport.retries == 1
+
+
+def test_resume_reference_allows_only_exact_run_owned_generation(tmp_path):
+    archive = tmp_path / "archive"
+    archive.mkdir(mode=0o700)
+    legacy = archive / "one" / "legacy.txt"
+    legacy.parent.mkdir()
+    legacy.write_text("legacy", encoding="utf-8")
+    state = tmp_path / "state.json"
+    queue = tmp_path / "queue.json"
+    state.write_text("{}", encoding="utf-8")
+    queue.write_text("{}", encoding="utf-8")
+    reference, evidence = baseline.immutable_reference(
+        archive, state, queue, "run-1",
+    )
+    run_root = archive / "runs" / "run-1"
+    run_root.mkdir(parents=True, mode=0o700)
+    baseline.rich.atomic_json(run_root / "immutable-pre-repair-evidence.json", evidence)
+    resumed = archive / "one/generations/full-run-1-0001/data.bin"
+    resumed.parent.mkdir(parents=True)
+    resumed.write_bytes(b"resumed")
+    loaded, _loaded_evidence = baseline.resume_reference(
+        archive,
+        state,
+        queue,
+        run_root,
+        [{"relativePath": "one"}],
+        "run-1",
+    )
+    assert loaded == reference
+
+    (archive / "unexplained.txt").write_text("drift", encoding="utf-8")
+    with pytest.raises(
+        baseline.BaselineError,
+        match="resume_archive_contains_unexplained_drift",
+    ):
+        baseline.resume_reference(
+            archive,
+            state,
+            queue,
+            run_root,
+            [{"relativePath": "one"}],
+            "run-1",
+        )
+
+
+def test_resume_reference_rejects_pre_run_file_drift(tmp_path):
+    archive = tmp_path / "archive"
+    archive.mkdir(mode=0o700)
+    legacy = archive / "legacy.txt"
+    legacy.write_text("legacy", encoding="utf-8")
+    state = tmp_path / "state.json"
+    queue = tmp_path / "queue.json"
+    state.write_text("{}", encoding="utf-8")
+    queue.write_text("{}", encoding="utf-8")
+    _reference, evidence = baseline.immutable_reference(
+        archive, state, queue, "run-1",
+    )
+    run_root = archive / "runs" / "run-1"
+    run_root.mkdir(parents=True, mode=0o700)
+    baseline.rich.atomic_json(run_root / "immutable-pre-repair-evidence.json", evidence)
+    legacy.write_text("tampered", encoding="utf-8")
+    with pytest.raises(baseline.BaselineError, match="resume_immutable_evidence_drift"):
+        baseline.resume_reference(
+            archive,
+            state,
+            queue,
+            run_root,
+            [{"relativePath": "one"}],
+            "run-1",
+        )

@@ -1254,6 +1254,84 @@ def test_root_atomic_full_stage_seals_before_compatibility_current(tmp_path):
         run_context.close()
 
 
+def test_root_atomic_resume_requires_fresh_matching_live_evidence(tmp_path):
+    store = make_store(tmp_path)
+    first_context = full_run_context(tmp_path)
+    try:
+        first_lock = context_lock_token(first_context)
+        first_token = live_evidence(store, "root-resume", first_context)
+        stage = store.materialize_full_stage_from_live_evidence(
+            generation_id="root-resume",
+            live_evidence_token=first_token,
+            downloader=rich.AssetDownloader(),
+            lock_token=first_lock,
+        )
+        store.reserve_full_stage_assets(
+            stage,
+            run_context=first_context,
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            lock_token=first_lock,
+        )
+        installed = store.install_full_pass_evidence(
+            stage,
+            live_evidence_token=first_token,
+            lock_token=first_lock,
+        )
+        generation_sha256 = installed["manifest"]["generationSha256"]
+        final = store.seal_full_stage_for_root_run(
+            stage,
+            "root-resume",
+            generation_sha256,
+            live_evidence_token=first_token,
+            lock_token=first_lock,
+            run_context=first_context,
+        )
+    finally:
+        first_context.close()
+
+    second_context = full_run_context(tmp_path)
+    try:
+        second_lock = context_lock_token(second_context)
+        fresh_token = live_evidence(store, "root-resume", second_context)
+        resumed = store.register_existing_sealed_generation_for_root_run(
+            final,
+            "root-resume",
+            generation_sha256,
+            live_evidence_token=fresh_token,
+            lock_token=second_lock,
+            run_context=second_context,
+        )
+        assert fresh_token.closed
+        assert resumed["records"] == 1
+        assert rich.verify_sealed_full_rebuild_run(second_context)["gateStatus"] == "PASS"
+    finally:
+        second_context.close()
+
+    third_context = full_run_context(tmp_path)
+    try:
+        third_lock = context_lock_token(third_context)
+        changed_token = live_evidence(
+            store,
+            "root-resume",
+            third_context,
+            [message(content="changed")],
+        )
+        with pytest.raises(rich.GenerationError, match="fresh Discord evidence"):
+            store.register_existing_sealed_generation_for_root_run(
+                final,
+                "root-resume",
+                generation_sha256,
+                live_evidence_token=changed_token,
+                lock_token=third_lock,
+                run_context=third_context,
+            )
+        assert changed_token.closed
+        assert rich.verify_sealed_full_rebuild_run(third_context)["gateStatus"] == "FAIL"
+    finally:
+        third_context.close()
+
+
 def test_cross_generation_install_rejects_and_consumes_bound_token(tmp_path):
     store = make_store(tmp_path)
     with full_run_context(tmp_path) as run_context:

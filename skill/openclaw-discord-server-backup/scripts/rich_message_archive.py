@@ -5179,6 +5179,141 @@ class RichArchiveStore:
                 finally:
                     _consume_live_evidence_token(live_evidence_token)
 
+    def register_existing_sealed_generation_for_root_run(
+        self,
+        final: Path,
+        generation_id: str,
+        generation_sha256: str,
+        *,
+        live_evidence_token: LiveEvidenceToken | None,
+        lock_token: ArchiveLockToken | None = None,
+        run_context: FullRebuildRunContext,
+    ) -> dict[str, Any]:
+        """Re-register an immutable generation after fresh Discord readback.
+
+        Persisted audit receipts never authorize resume on their own.  The
+        caller must freshly enumerate the same entry under a live evidence
+        token.  Only an exact active-binding/cutoff match may reuse the already
+        verified local bytes and charge them to the new run-wide budget.
+        """
+        token_registration = _require_live_evidence_token(
+            live_evidence_token,
+            root=final,
+            allowed_states={"fresh"},
+        )
+        if token_registration["runContext"]() is not run_context:
+            raise RichArchiveError("resume run context does not match live evidence")
+        identity = _validated_entry_identity(
+            token_registration["evidence"].get("entryIdentity")
+        )
+        run_registration = _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            identity=identity,
+            entry_root=self.entry_root,
+        )
+        if lock_token is None:
+            lock_token = run_registration["lockToken"]
+        _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            identity=identity,
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
+        lease: dict[str, Any] | None = None
+        capacity: dict[str, int] | None = None
+        try:
+            lease = self._begin_lock_lease(lock_token)
+            generation_id = _validated_generation_id(generation_id)
+            expected_final = contained_path(self.generations, generation_id)
+            final = _lexical_absolute(final)
+            if final != expected_final or final.is_symlink() or not final.is_dir():
+                raise GenerationError("resume generation path is invalid")
+            if not re.fullmatch(r"[0-9a-f]{64}", generation_sha256):
+                raise GenerationError("invalid generation checksum")
+            local = verify_generation(final)
+            if (
+                not local.get("ok")
+                or local.get("generationSha256") != generation_sha256
+                or local.get("gateStatus") != "AUDIT_ONLY"
+                or not local.get("fullGatePresent")
+                or local.get("fullGateErrors")
+            ):
+                raise GenerationError("resume generation audit verification failed")
+            evidence_path = contained_path(
+                final,
+                "receipts/live-inventory-evidence.json",
+            )
+            if not _regular_single_link(evidence_path):
+                raise GenerationError("resume generation live evidence is missing")
+            persisted_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            fresh_evidence = token_registration["evidence"]
+            persisted_inventory = persisted_evidence.get("inventory")
+            fresh_inventory = fresh_evidence.get("inventory")
+            persisted_transaction = persisted_evidence.get("transactionBinding")
+            if (
+                not isinstance(persisted_inventory, Mapping)
+                or not isinstance(fresh_inventory, Mapping)
+                or not isinstance(persisted_transaction, Mapping)
+                or persisted_evidence.get("entryIdentity") != fresh_evidence.get("entryIdentity")
+                or persisted_evidence.get("verifiedCutoff") != fresh_evidence.get("verifiedCutoff")
+                or persisted_evidence.get("messages") != fresh_evidence.get("messages")
+                or persisted_inventory.get("digest") != run_registration["inventoryDigest"]
+                or fresh_inventory.get("digest") != run_registration["inventoryDigest"]
+                or persisted_transaction.get("generationId") != generation_id
+            ):
+                raise GenerationError("resume generation differs from fresh Discord evidence")
+            reservation = _validated_persisted_asset_reservation(final, identity)
+            assets, _asset_evidence = _verified_generation_assets(final)
+            capacity = run_registration["budget"].reserve_entry(
+                assets,
+                final,
+                assume_unknown_max=False,
+                assets_materialized=True,
+            )
+            if (
+                capacity["files"] != reservation.get("assetFileCount")
+                or capacity["declaredBytes"] != reservation.get("assetDeclaredBytes")
+            ):
+                raise AssetDownloadError("resume generation asset totals changed")
+            reservation_id = str(reservation.get("reservationId") or "")
+            with run_registration["mutex"]:
+                channel_id = identity["channelId"]
+                if (
+                    channel_id in run_registration["processed"]
+                    or channel_id in run_registration["assetReservations"]
+                    or reservation_id in run_registration["usedAssetReservations"]
+                ):
+                    raise GenerationError("resume generation was already registered")
+                run_registration["assetReservations"][channel_id] = json.loads(
+                    json.dumps(reservation, ensure_ascii=False)
+                )
+                run_registration["usedAssetReservations"].add(reservation_id)
+                run_registration["processed"][channel_id] = generation_sha256
+                run_registration["sealedRoots"][channel_id] = str(final)
+            capacity = None
+            return {
+                "generationSha256": generation_sha256,
+                "records": int(local.get("records") or 0),
+                "assetFileCount": int(reservation["assetFileCount"]),
+                "assetDeclaredBytes": int(reservation["assetDeclaredBytes"]),
+            }
+        finally:
+            try:
+                if capacity is not None:
+                    run_registration["budget"].release_entry(capacity)
+            finally:
+                try:
+                    if lease is not None:
+                        self._end_lock_lease(lease)
+                finally:
+                    try:
+                        _end_active_run_entry_lease(run_lease)
+                    finally:
+                        _consume_live_evidence_token(live_evidence_token)
+
     def publish_existing_generation_pointer(
         self,
         generation_id: str,
