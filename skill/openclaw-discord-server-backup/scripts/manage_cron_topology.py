@@ -1570,6 +1570,7 @@ def apply_plan(
         best_effort_result(transaction, {
             "status": "rolled_back" if not rollback_errors else "rollback_incomplete",
             "error": type(exc).__name__,
+            "errorReason": str(exc) if isinstance(exc, CronManagerError) else "unexpected_internal_error",
             "rollbackErrors": rollback_errors,
         })
         if rollback_errors:
