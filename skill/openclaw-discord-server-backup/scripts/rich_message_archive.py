@@ -2335,6 +2335,7 @@ def _mint_run_context(
                 "assetReservations": {},
                 "usedAssetReservations": set(),
                 "processed": {},
+                "sealedRoots": {},
             }
             _ACTIVE_ARCHIVE_ROOT_RUNS[archive_key] = context._nonce
             for key in entry_keys:
@@ -2574,6 +2575,69 @@ def finalize_full_rebuild_run(context: FullRebuildRunContext | None) -> dict[str
         finally:
             if isinstance(context, FullRebuildRunContext):
                 context.close()
+
+
+def verify_sealed_full_rebuild_run(
+    context: FullRebuildRunContext | None,
+) -> dict[str, Any]:
+    """Verify every full-run generation is sealed before root selection.
+
+    Unlike ``finalize_full_rebuild_run``, this gate intentionally leaves the
+    run context and canonical lock live so the caller can atomically publish
+    the archive-root selector followed by compatibility pointers.
+    """
+    run_lease = _begin_run_context_lease(context, kind="full_rebuild")
+    try:
+        registration = _require_run_context(context, kind="full_rebuild")
+        expected = sorted(
+            (row["channelId"] for row in registration["expectedEntries"]),
+            key=int,
+        )
+        processed = sorted(registration["processed"], key=int)
+        sealed_roots = registration.get("sealedRoots") or {}
+        errors: list[str] = []
+        if processed != expected:
+            errors.append("not_all_inventory_entries_sealed")
+        if sorted(sealed_roots, key=int) != expected:
+            errors.append("not_all_sealed_roots_registered")
+        verified_roots: dict[str, dict[str, str]] = {}
+        for channel_id in expected:
+            raw_root = sealed_roots.get(channel_id)
+            try:
+                root = _lexical_absolute(Path(str(raw_root)))
+                local = verify_generation(root)
+                expected_hash = registration["processed"].get(channel_id)
+                if (
+                    not local.get("ok")
+                    or local.get("generationSha256") != expected_hash
+                    or root.parent.name != "generations"
+                ):
+                    raise GenerationError("sealed generation verification mismatch")
+                verified_roots[channel_id] = {
+                    "generationId": root.name,
+                    "generationSha256": str(expected_hash),
+                }
+            except (OSError, ValueError, RichArchiveError):
+                errors.append(f"sealed_generation_readback_failed:{channel_id}")
+        budget = registration["budget"]
+        receipt: dict[str, Any] = {
+            "schemaVersion": "openclaw-discord-rich-sealed-run.v1",
+            "gateStatus": "PASS" if not errors else "FAIL",
+            "runContextId": registration["runContextId"],
+            "archiveRootSha256": registration["archiveRootSha256"],
+            "inventoryDigest": registration["inventoryDigest"],
+            "expectedEntriesDigest": registration["expectedEntriesDigest"],
+            "expectedEntryCount": len(expected),
+            "sealedEntryCount": len(verified_roots),
+            "sealedGenerationByChannel": verified_roots,
+            "assetFileCount": budget.file_count,
+            "assetDeclaredBytes": budget.declared_bytes,
+            "errors": sorted(set(errors)),
+        }
+        receipt["receiptSha256"] = json_sha256(receipt)
+        return receipt
+    finally:
+        _end_run_context_lease(run_lease)
 
 
 _LIVE_EVIDENCE_GUARD = object()
@@ -2866,6 +2930,11 @@ def collect_live_evidence(
         "pid": os.getpid(),
         "state": "fresh",
         "evidence": body,
+        # The normalized records remain process-local authority.  Persisted
+        # evidence intentionally stores only active bindings; full rebuild
+        # materialization consumes these exact records so the bytes written to
+        # staging cannot drift from the live proof that authorized them.
+        "normalizedRecords": json.loads(json.dumps(normalized, ensure_ascii=False)),
         "evidenceSha256": body["evidenceSha256"],
         "entryRoot": entry_root,
         "generationId": generation_id,
@@ -4427,6 +4496,122 @@ class RichArchiveStore:
                 self._end_lock_lease(lease)
             _end_active_run_entry_lease(run_lease)
 
+    def materialize_full_stage_from_live_evidence(
+        self,
+        *,
+        generation_id: str,
+        live_evidence_token: LiveEvidenceToken | None,
+        downloader: AssetDownloader,
+        lock_token: ArchiveLockToken | None = None,
+    ) -> Path:
+        """Write the exact process-local live snapshot into a private stage.
+
+        The collector, normalizer, stage writer, and asset budget all remain in
+        one rich-core authority boundary.  No CURRENT pointer is changed here.
+        """
+        registration = _require_live_evidence_token(
+            live_evidence_token,
+            allowed_states={"fresh"},
+        )
+        run_context = registration["runContext"]()
+        run_registration = _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+        )
+        if lock_token is None:
+            lock_token = run_registration["lockToken"]
+        _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        generation_id = _validated_generation_id(generation_id)
+        records_value = registration.get("normalizedRecords")
+        if not isinstance(records_value, list) or any(
+            not isinstance(row, Mapping) for row in records_value
+        ):
+            raise GenerationError("runtime live evidence records are unavailable")
+        records = json.loads(json.dumps(records_value, ensure_ascii=False))
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            created = _iso_timestamp(
+                record.get("createdTimestamp"),
+                field="createdTimestamp",
+                required=True,
+            )
+            assert created is not None
+            day = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(
+                TZ_TAIPEI
+            ).date().isoformat()
+            by_day.setdefault(day, []).append(record)
+
+        budget = run_registration["budget"]
+        if budget.limits != downloader.limits:
+            raise AssetDownloadError(
+                "shared asset run budget limits do not match downloader limits"
+            )
+        assets = [
+            asset
+            for rows in by_day.values()
+            for record in rows
+            for observation in record["observations"]
+            for asset in observation["assetInventory"]
+        ]
+        budget.preflight_entry(
+            assets,
+            self.entry_root,
+            assume_unknown_max=True,
+        )
+        unknown_count = sum(
+            1
+            for asset in assets
+            if asset.get("inScope") and asset.get("declaredSize") is None
+        )
+        budget.probe_budget.ensure_capacity(unknown_count)
+        by_day = {
+            day: [
+                resolve_asset_sizes(
+                    record,
+                    downloader,
+                    probe_budget=budget.probe_budget,
+                )
+                for record in rows
+            ]
+            for day, rows in by_day.items()
+        }
+        assets = [
+            asset
+            for rows in by_day.values()
+            for record in rows
+            for observation in record["observations"]
+            for asset in observation["assetInventory"]
+        ]
+        budget.preflight_entry(
+            assets,
+            self.entry_root,
+            assume_unknown_max=False,
+        )
+        stage = self.create_stage(
+            generation_id,
+            copy_current=False,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
+        by_day = {
+            day: [apply_asset_results(record, downloader, stage) for record in rows]
+            for day, rows in by_day.items()
+        }
+        for day, rows in by_day.items():
+            rows.sort(key=lambda row: int(str(row["messageId"])))
+            atomic_jsonl(stage / "canonical" / f"{day}.jsonl", rows)
+            _atomic_bytes(
+                stage / "raw" / f"{day}.md",
+                render_day(rows).encode("utf-8"),
+            )
+        return stage
+
     def reserve_full_stage_assets(
         self,
         stage: Path,
@@ -4603,6 +4788,140 @@ class RichArchiveStore:
             if lease is not None:
                 self._end_lock_lease(lease)
             _end_active_run_entry_lease(run_lease)
+
+    def seal_full_stage_for_root_run(
+        self,
+        stage: Path,
+        generation_id: str,
+        generation_sha256: str,
+        *,
+        live_evidence_token: LiveEvidenceToken | None,
+        lock_token: ArchiveLockToken | None = None,
+        run_context: FullRebuildRunContext,
+    ) -> Path:
+        """Seal a verified full generation without changing per-entry CURRENT.
+
+        A full rebuild first seals every entry, then atomically selects one
+        archive-root manifest.  Compatibility CURRENT pointers are published
+        only after that root selection is read back.
+        """
+        initial = _require_live_evidence_token(
+            live_evidence_token,
+            root=stage,
+            allowed_states={"prepared"},
+        )
+        if initial["runContext"]() is not run_context:
+            raise RichArchiveError("full seal run context does not match live evidence")
+        run_registration = _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+        )
+        if lock_token is None:
+            lock_token = run_registration["lockToken"]
+        _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        run_lease = _begin_active_run_entry_lease(self.entry_root, lock_token)
+        lease: dict[str, Any] | None = None
+        try:
+            lease = self._begin_lock_lease(lock_token)
+            stage = _lexical_absolute(stage)
+            generation_id = _validated_generation_id(generation_id)
+            if not re.fullmatch(r"[0-9a-f]{64}", generation_sha256):
+                raise GenerationError("invalid generation checksum")
+            final = contained_path(self.generations, generation_id)
+            expected_stage = contained_path(self.staging, generation_id)
+            if stage != expected_stage or stage.is_symlink() or not stage.is_dir():
+                raise GenerationError("seal stage path is invalid")
+            token_registration = _require_live_evidence_token(
+                live_evidence_token,
+                root=stage,
+                allowed_states={"prepared"},
+            )
+            if token_registration.get("preparedGenerationSha256") != generation_sha256:
+                raise GenerationError(
+                    "live evidence token is not prepared for this generation hash"
+                )
+            verified = _verify_full_generation_runtime(
+                stage,
+                live_evidence_token=live_evidence_token,
+                allowed_states={"prepared"},
+            )
+            if not verified.get("ok") or verified.get("generationSha256") != generation_sha256:
+                raise GenerationError("sealed stage failed runtime verification")
+            if final.exists() or final.is_symlink():
+                raise GenerationError("generation destination already exists")
+            identity = _validated_entry_identity(
+                token_registration["evidence"].get("entryIdentity")
+            )
+            reservation_id = str(
+                verified["runtimeReceipt"].get("assetReservationId") or ""
+            )
+            with run_registration["mutex"]:
+                if identity["channelId"] in run_registration["processed"]:
+                    raise GenerationError("full rebuild entry was already sealed in this run")
+                if reservation_id in run_registration["usedAssetReservations"]:
+                    raise GenerationError("full-run asset reservation was already consumed")
+            self._require_active_lock_lease(lock_token)
+            _require_active_run_entry_lock(self.entry_root, lock_token)
+            self._require_stage_base_current_unchanged(stage)
+            os.replace(stage, final)
+            _fsync_dir(self.generations)
+            with run_registration["mutex"]:
+                run_registration["usedAssetReservations"].add(reservation_id)
+                run_registration["processed"][identity["channelId"]] = generation_sha256
+                run_registration["sealedRoots"][identity["channelId"]] = str(final)
+            return final
+        finally:
+            try:
+                if lease is not None:
+                    self._end_lock_lease(lease)
+            finally:
+                try:
+                    _end_active_run_entry_lease(run_lease)
+                finally:
+                    _consume_live_evidence_token(live_evidence_token)
+
+    def publish_existing_generation_pointer(
+        self,
+        generation_id: str,
+        generation_sha256: str,
+        *,
+        lock_token: ArchiveLockToken | None = None,
+        run_context: FullRebuildRunContext,
+    ) -> dict[str, Any]:
+        """Publish and exact-read back a compatibility CURRENT pointer."""
+        registration = _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+        )
+        if lock_token is None:
+            lock_token = registration["lockToken"]
+        _require_run_context(
+            run_context,
+            kind="full_rebuild",
+            entry_root=self.entry_root,
+            lock_token=lock_token,
+        )
+        generation_id = _validated_generation_id(generation_id)
+        final = contained_path(self.generations, generation_id)
+        with _borrow_active_run_entry(self.entry_root, lock_token), self._borrow_lock(lock_token):
+            verified = verify_generation(final)
+            if verified.get("generationSha256") != generation_sha256:
+                raise GenerationError("compatibility generation checksum mismatch")
+            self._require_active_lock_lease(lock_token)
+            pointer = self._pointer_body(generation_id, generation_sha256)
+            pointer["pointerSha256"] = json_sha256(pointer)
+            atomic_json(self.pointer_path, pointer)
+            current = self.resolve_current()
+            if current is None or current != final:
+                raise GenerationError("compatibility CURRENT readback failed")
+            return json.loads(self.pointer_path.read_text(encoding="utf-8"))
 
     def publish_stage(
         self,
@@ -4819,4 +5138,5 @@ __all__ = [
     "render_message", "required_render_sections", "resolve_asset_sizes",
     "renderer_pointer_accounting", "sanitize_lossless_source", "source_field_census",
     "validate_record", "verify_full_generation", "verify_generation",
+    "verify_sealed_full_rebuild_run",
 ]

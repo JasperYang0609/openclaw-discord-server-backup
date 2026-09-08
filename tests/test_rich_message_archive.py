@@ -1021,6 +1021,55 @@ def test_real_full_pass_receipt_binds_non_self_referential_content_hash(tmp_path
         run_context.close()
 
 
+def test_root_atomic_full_stage_seals_before_compatibility_current(tmp_path):
+    store = make_store(tmp_path)
+    run_context = full_run_context(tmp_path)
+    try:
+        lock_token = context_lock_token(run_context)
+        evidence_token = live_evidence(store, "root-sealed", run_context)
+        stage = store.materialize_full_stage_from_live_evidence(
+            generation_id="root-sealed",
+            live_evidence_token=evidence_token,
+            downloader=rich.AssetDownloader(),
+            lock_token=lock_token,
+        )
+        store.reserve_full_stage_assets(
+            stage,
+            run_context=run_context,
+            channel_id="1490000000000000001",
+            relative_path="test/entry",
+            lock_token=lock_token,
+        )
+        installed = store.install_full_pass_evidence(
+            stage,
+            live_evidence_token=evidence_token,
+            lock_token=lock_token,
+        )
+        generation_sha256 = installed["manifest"]["generationSha256"]
+        final = store.seal_full_stage_for_root_run(
+            stage,
+            "root-sealed",
+            generation_sha256,
+            live_evidence_token=evidence_token,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
+        assert final.is_dir()
+        assert store.resolve_current() is None
+        sealed = rich.verify_sealed_full_rebuild_run(run_context)
+        assert sealed["gateStatus"] == "PASS"
+        pointer = store.publish_existing_generation_pointer(
+            "root-sealed",
+            generation_sha256,
+            lock_token=lock_token,
+            run_context=run_context,
+        )
+        assert pointer["generationId"] == "root-sealed"
+        assert store.resolve_current() == final
+    finally:
+        run_context.close()
+
+
 def test_cross_generation_install_rejects_and_consumes_bound_token(tmp_path):
     store = make_store(tmp_path)
     with full_run_context(tmp_path) as run_context:

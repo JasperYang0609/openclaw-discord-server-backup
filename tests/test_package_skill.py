@@ -23,6 +23,8 @@ PRIVATE_RUNTIME_PATHS = frozenset({
     "manifests/runtime-components.v1.json",
     "scripts/rich_message_archive.py",
     "scripts/rich_core_adapter_v3.py",
+    "scripts/run_full_rich_rebuild_v2.py",
+    "scripts/run_full_rich_baseline_v3.py",
     "scripts/run_daily_sync_v3.py",
     "scripts/run_managed_component.py",
 })

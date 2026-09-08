@@ -39,6 +39,8 @@ RUNTIME_COMPONENTS = {
 PRIVATE_RUNTIME_PATHS = frozenset({
     "manifests/runtime-components.v1.json",
     *RUNTIME_COMPONENTS.values(),
+    "scripts/run_full_rich_rebuild_v2.py",
+    "scripts/run_full_rich_baseline_v3.py",
 })
 
 
@@ -85,6 +87,8 @@ def installed_python_smoke() -> tuple[bool, str]:
         "backup_health_report.py",
         "daily_sync_lock_canary.py",
         "run_daily_sync_v3.py",
+        "run_full_rich_rebuild_v2.py",
+        "run_full_rich_baseline_v3.py",
     )
     for name in cli_scripts:
         script = SKILL_DIR / "scripts" / name
@@ -443,6 +447,8 @@ def main() -> int:
         "scripts/run_daily_sync_v3.py",
         "scripts/rich_message_archive.py",
         "scripts/rich_core_adapter_v3.py",
+        "scripts/run_full_rich_rebuild_v2.py",
+        "scripts/run_full_rich_baseline_v3.py",
         "manifests/runtime-components.v1.json",
         "manifests/owned-cron.v1.json",
         "prompts/core-backup.md",

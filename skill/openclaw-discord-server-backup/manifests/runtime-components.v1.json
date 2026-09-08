@@ -4,7 +4,7 @@
   "components": {
     "rich_message_archive.py": {
       "relativePath": "scripts/rich_message_archive.py",
-      "sha256": "541e3764a1c59eab63183a6f76b7f52bad9c54d93fb70aaf99805ab709aa442b",
+      "sha256": "a3cc59b37dadf466b5dffff25d4cadee2149d5d585581aa196f103f3f30f7665",
       "mode": "0600",
       "owner": "effective-user",
       "links": 1
