@@ -1493,8 +1493,20 @@ def apply_plan(
         # receives the same protection here.
         for role, legacy in sorted(adopted.items()):
             expected = by_role[role]
-            if any(job.get("declarationKey") == expected["declarationKey"] for job in inventory):
-                raise CronManagerError(f"cannot adopt {role}: owned declaration already exists")
+            owned_exists = any(
+                job.get("declarationKey") == expected["declarationKey"]
+                for job in inventory
+            )
+            if owned_exists:
+                # After the first successful adoption the exact legacy job is
+                # intentionally retained but disabled. Later owned upgrades
+                # must preserve that evidence instead of treating its presence
+                # as a fresh adoption collision.
+                if bool(legacy.get("enabled")):
+                    raise CronManagerError(
+                        f"coexisting adopted {role} must already be disabled"
+                    )
+                continue
             if bool(legacy.get("enabled")):
                 client.set_enabled(str(legacy["id"]), False)
                 disabled_adopted.append(legacy)

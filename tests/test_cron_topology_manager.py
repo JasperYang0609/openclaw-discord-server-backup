@@ -660,6 +660,60 @@ def test_adoption_prepare_apply_and_identical_rerun_is_idempotent(tmp_path):
     assert client.events == []
 
 
+def test_owned_upgrade_preserves_disabled_adopted_legacy(tmp_path):
+    desired, context = render(tmp_path)
+    current_owned = with_ids(desired)
+    current_owned[0]["description"] = "previous owned contract"
+    legacy = copy.deepcopy(next(row for row in desired if row["role"] == "workspace-snapshot"))
+    legacy.update({
+        "id": "legacy-monthly",
+        "name": "legacy workspace snapshot",
+        "declarationKey": "workspace-critical-assets-monthly-v1",
+        "enabled": False,
+    })
+    client = FakeClient([*current_owned, legacy])
+
+    result = manager.apply_plan(
+        client,
+        client.list_jobs(),
+        desired,
+        context.receipt_dir,
+        context.workspace,
+        run_canary=False,
+        adopted={"workspace-snapshot": legacy},
+    )
+
+    assert result["status"] == "ready"
+    assert next(row for row in client.jobs if row["id"] == "legacy-monthly")["enabled"] is False
+    assert not any(event[:2] == ("enabled", "legacy-monthly") for event in client.events)
+
+
+def test_owned_upgrade_rejects_enabled_adopted_legacy_before_mutation(tmp_path):
+    desired, context = render(tmp_path)
+    current_owned = with_ids(desired)
+    current_owned[0]["description"] = "previous owned contract"
+    legacy = copy.deepcopy(next(row for row in desired if row["role"] == "workspace-snapshot"))
+    legacy.update({
+        "id": "legacy-monthly",
+        "declarationKey": "workspace-critical-assets-monthly-v1",
+        "enabled": True,
+    })
+    client = FakeClient([*current_owned, legacy])
+
+    with pytest.raises(manager.CronManagerError, match="must already be disabled"):
+        manager.apply_plan(
+            client,
+            client.list_jobs(),
+            desired,
+            context.receipt_dir,
+            context.workspace,
+            run_canary=False,
+            adopted={"workspace-snapshot": legacy},
+        )
+
+    assert client.events == []
+
+
 def test_created_job_is_removed_when_converge_mutates_then_readback_fails(tmp_path):
     desired, context = render(tmp_path)
     client = MutateThenFailClient()
