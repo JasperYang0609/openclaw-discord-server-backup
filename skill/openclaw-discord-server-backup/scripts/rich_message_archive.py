@@ -96,6 +96,15 @@ class AssetDownloadError(RichArchiveError):
     pass
 
 
+class AssetContentLengthMismatch(AssetDownloadError):
+    """A bounded HTTP representation disagrees with Discord's recorded size."""
+
+    def __init__(self, expected_size: int, observed_size: int) -> None:
+        super().__init__("asset Content-Length does not match declared size")
+        self.expected_size = expected_size
+        self.observed_size = observed_size
+
+
 class GenerationError(RichArchiveError):
     pass
 
@@ -1055,13 +1064,33 @@ def validate_record(record: Mapping[str, Any], *, require_assets: bool = True, g
                     raise RichArchiveError(f"asset inventory source mismatch: {identity}:{key}")
             expected_size = expected_asset.get("declaredSize")
             actual_size = asset.get("declaredSize")
+            size_source = asset.get("sizeSource")
+            source_size_mismatch = asset.get("sourceSizeMismatch")
             if expected_size is not None:
-                if actual_size != expected_size or asset.get("sizeSource") not in (None, "discord_payload"):
+                exact_discord_size = (
+                    actual_size == expected_size
+                    and size_source in (None, "discord_payload")
+                    and source_size_mismatch is None
+                )
+                verified_current_representation = (
+                    isinstance(actual_size, int)
+                    and not isinstance(actual_size, bool)
+                    and actual_size >= 0
+                    and actual_size != expected_size
+                    and size_source == "http_get_content_length"
+                    and source_size_mismatch is True
+                )
+                if not exact_discord_size and not verified_current_representation:
                     raise RichArchiveError("Discord-declared asset size was altered")
             elif actual_size is not None and (
-                not isinstance(actual_size, int) or actual_size < 0 or asset.get("sizeSource") != "http_head"
+                not isinstance(actual_size, int)
+                or isinstance(actual_size, bool)
+                or actual_size < 0
+                or size_source != "http_head"
             ):
                 raise RichArchiveError("asset size without Discord metadata lacks verified HEAD provenance")
+            elif source_size_mismatch is not None:
+                raise RichArchiveError("asset size mismatch receipt lacks Discord provenance")
             if asset.get("sourceDeclaredSize") != expected_size:
                 raise RichArchiveError("asset source-declared size receipt mismatch")
             asset_count += bool(asset.get("inScope"))
@@ -1110,6 +1139,9 @@ def validate_record(record: Mapping[str, Any], *, require_assets: bool = True, g
                 != _attachment_equivalence_key(asset)
                 or source_asset.get("kind") == asset.get("kind")
                 or source_asset.get("status") != "complete"
+                or source_asset.get("sourceDeclaredSize") != source_asset.get("byteLength")
+                or source_asset.get("sizeSource") not in (None, "discord_payload")
+                or source_asset.get("sourceSizeMismatch") is not None
                 or source_asset.get("byteLength") != asset.get("byteLength")
                 or source_asset.get("sha256") != asset.get("sha256")
             ):
@@ -1880,9 +1912,16 @@ class AssetDownloader:
                 _close_response_safely(response)
                 raise AssetDownloadError("compressed asset response is forbidden")
             content_length = response.headers.get("Content-Length")
-            if content_length is None or not content_length.isdigit() or int(content_length) != expected_size:
+            if content_length is None or not content_length.isdigit():
                 _close_response_safely(response)
                 raise AssetDownloadError("asset Content-Length does not match declared size")
+            observed_size = int(content_length)
+            if observed_size > self.limits.per_file_bytes:
+                _close_response_safely(response)
+                raise AssetDownloadError("asset exceeds per-file size limit")
+            if observed_size != expected_size:
+                _close_response_safely(response)
+                raise AssetContentLengthMismatch(expected_size, observed_size)
             descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".download", dir=target.parent)
             digest = hashlib.sha256()
             count = 0
@@ -2037,6 +2076,9 @@ def _recover_equivalent_attachment_variants(
             or isinstance(expected_size, bool)
             or expected_size < 0
             or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or source.get("sourceDeclaredSize") != expected_size
+            or source.get("sizeSource") not in (None, "discord_payload")
+            or source.get("sourceSizeMismatch") is not None
         ):
             raise AssetDownloadError("equivalent attachment source receipt is invalid")
         source_path = contained_path(
@@ -2065,18 +2107,88 @@ def _recover_equivalent_attachment_variants(
     return output
 
 
+def _retry_verified_discord_size_drift(
+    assets: Sequence[Mapping[str, Any]],
+    observed_sizes: Mapping[str, int],
+    downloader: AssetDownloader,
+    generation_root: Path,
+) -> list[dict[str, Any]]:
+    """Retry both representations only after their bounded GET sizes are known."""
+    output = [dict(asset) for asset in assets]
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for asset in output:
+        key = _attachment_equivalence_key(asset)
+        if key is not None and asset.get("inScope"):
+            groups.setdefault(key, []).append(asset)
+    for rows in groups.values():
+        kinds = {str(row.get("kind") or "") for row in rows}
+        if len(rows) != 2 or kinds != {"attachment", "attachment_proxy"}:
+            continue
+        if any(
+            row.get("status") != "error"
+            or str(row.get("assetId") or "") not in observed_sizes
+            for row in rows
+        ):
+            continue
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = dict(row)
+            observed_size = observed_sizes[str(row["assetId"])]
+            if (
+                not isinstance(observed_size, int)
+                or isinstance(observed_size, bool)
+                or observed_size < 0
+                or observed_size > downloader.limits.per_file_bytes
+                or observed_size == row.get("sourceDeclaredSize")
+            ):
+                raise AssetDownloadError("asset size-drift receipt is invalid")
+            candidate.update({
+                "declaredSize": observed_size,
+                "sizeSource": "http_get_content_length",
+                "sourceSizeMismatch": True,
+                "status": "pending",
+                "error": None,
+            })
+            candidates.append(candidate)
+        preflight_asset_capacity(
+            candidates,
+            generation_root,
+            limits=downloader.limits,
+            assume_unknown_max=False,
+        )
+        replacements: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            try:
+                replacement = downloader.download(candidate, generation_root)
+            except AssetDownloadError as exc:
+                replacement = dict(candidate)
+                replacement.update({"status": "error", "error": str(exc)})
+            replacements[str(candidate["assetId"])] = replacement
+        output = [replacements.get(str(row.get("assetId") or ""), row) for row in output]
+    return output
+
+
 def apply_asset_results(record: Mapping[str, Any], downloader: AssetDownloader, generation_root: Path) -> dict[str, Any]:
     updated = dict(record)
     observations = [dict(row) for row in updated.get("observations") or []]
     for observation in observations:
         output: list[dict[str, Any]] = []
+        observed_sizes: dict[str, int] = {}
         for asset in observation.get("assetInventory") or []:
             try:
                 output.append(downloader.download(asset, generation_root))
+            except AssetContentLengthMismatch as exc:
+                failed = dict(asset)
+                failed.update({"status": "error", "error": str(exc)})
+                output.append(failed)
+                observed_sizes[str(asset.get("assetId") or "")] = exc.observed_size
             except AssetDownloadError as exc:
                 failed = dict(asset)
                 failed.update({"status": "error", "error": str(exc)})
                 output.append(failed)
+        output = _retry_verified_discord_size_drift(
+            output, observed_sizes, downloader, generation_root,
+        )
         observation["assetInventory"] = _recover_equivalent_attachment_variants(
             output, generation_root,
         )

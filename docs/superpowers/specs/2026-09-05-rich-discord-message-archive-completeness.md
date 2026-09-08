@@ -112,7 +112,7 @@ matches in message text.
 - Use attachment or asset ID (or a stable JSON pointer plus asset ID) as the
   storage identity. Filename is display-only after sanitization, so duplicate,
   case-folded, and Unicode-equivalent names cannot collide.
-- Stream to a temporary regular file, hash while writing, verify declared size when available, then atomically rename.
+- Stream to a temporary regular file, hash while writing, verify declared size when available, then atomically rename. If both exact Discord attachment URL variants independently return bounded `200` responses whose current `Content-Length` differs from the historical payload size, preserve that payload size as source evidence, preflight the two observed sizes, retry both variants independently, and record the verified current sizes plus mismatch provenance. Never substitute a transformed proxy representation for an original representation in this case.
 - Reuse an existing local file only when its stored SHA-256 and byte length verify.
 - A missing, expired, oversized, truncated, or hash-mismatched attachment is recorded and makes the relevant entry and full run non-PASS. It must not be silently ignored.
 - Remote URLs remain metadata, but a URL alone does not satisfy attachment completeness.

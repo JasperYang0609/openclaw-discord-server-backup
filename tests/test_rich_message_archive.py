@@ -866,6 +866,78 @@ def test_disagreeing_equivalent_completed_variants_fail_closed(tmp_path):
         rich._recover_equivalent_attachment_variants([proxy, direct, failed], tmp_path)
 
 
+def test_both_current_discord_variants_can_record_verified_size_drift(tmp_path):
+    downloader = rich.AssetDownloader(
+        opener=FakeOpener([
+            FakeResponse(body=b"ab"),
+            FakeResponse(body=b"wxyz"),
+            FakeResponse(body=b"ab"),
+            FakeResponse(body=b"wxyz"),
+        ]),
+        resolver=global_resolver,
+        limits=rich.AssetLimits(disk_reserve_bytes=0),
+    )
+
+    recovered = rich.apply_asset_results(
+        normalize(attachment_with_proxy()), downloader, tmp_path,
+    )
+    assets = recovered["observations"][0]["assetInventory"]
+
+    assert recovered["attachmentErrors"] == []
+    assert {row["kind"]: row["declaredSize"] for row in assets} == {
+        "attachment_proxy": 2,
+        "attachment": 4,
+    }
+    assert all(row["sourceDeclaredSize"] == 3 for row in assets)
+    assert all(row["sizeSource"] == "http_get_content_length" for row in assets)
+    assert all(row["sourceSizeMismatch"] is True for row in assets)
+    assert all(row["status"] == "complete" for row in assets)
+    assert all("recoveryMethod" not in row for row in assets)
+    assert rich.validate_record(
+        recovered, require_assets=True, generation_root=tmp_path,
+    )["ok"]
+
+
+def test_size_drift_requires_both_exact_attachment_variants(tmp_path):
+    downloader = rich.AssetDownloader(
+        opener=FakeOpener([
+            FakeResponse(body=b"ab"),
+            FakeResponse(status=404),
+        ]),
+        resolver=global_resolver,
+        limits=rich.AssetLimits(disk_reserve_bytes=0),
+    )
+
+    result = rich.apply_asset_results(
+        normalize(attachment_with_proxy()), downloader, tmp_path,
+    )
+
+    assert len(result["attachmentErrors"]) == 2
+    assert all(
+        row["status"] == "error"
+        for row in result["observations"][0]["assetInventory"]
+    )
+
+
+def test_size_drift_receipt_tampering_fails_closed(tmp_path):
+    record = rich.apply_asset_results(
+        normalize(attachment_with_proxy()),
+        rich.AssetDownloader(
+            opener=FakeOpener([
+                FakeResponse(body=b"ab"), FakeResponse(body=b"wxyz"),
+                FakeResponse(body=b"ab"), FakeResponse(body=b"wxyz"),
+            ]),
+            resolver=global_resolver,
+            limits=rich.AssetLimits(disk_reserve_bytes=0),
+        ),
+        tmp_path,
+    )
+    record["observations"][0]["assetInventory"][0]["sourceSizeMismatch"] = False
+
+    with pytest.raises(rich.RichArchiveError, match="Discord-declared asset size"):
+        rich.validate_record(record, require_assets=True, generation_root=tmp_path)
+
+
 def test_missing_sticker_size_is_resolved_by_safe_head_without_credentials():
     source = message(content="", sticker_items=[{
         "id": "1500000000000000001", "name": "貼圖", "format_type": 1,
