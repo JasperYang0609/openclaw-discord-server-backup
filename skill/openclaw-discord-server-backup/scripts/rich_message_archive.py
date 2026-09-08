@@ -55,7 +55,7 @@ STAGE_BASE_SCHEMA = "openclaw-discord-stage-base-current.v1"
 SOURCE_CENSUS_SCHEMA = "openclaw-discord-source-census.v2"
 CANONICAL_ARCHIVE_LOCK_NAME = ".channel_backup.lock"
 DEFAULT_LIVE_EVIDENCE_TTL_SECONDS = 300.0
-MAX_LIVE_EVIDENCE_TTL_SECONDS = 900.0
+MAX_LIVE_EVIDENCE_TTL_SECONDS = 24 * 60 * 60.0
 TZ_TAIPEI = timezone(timedelta(hours=8))
 MACHINE_MARKER_RE = re.compile(
     r"^<!-- openclaw-rich-message id=(\d{1,24}) visible=([0-9a-f]{64}) -->$",

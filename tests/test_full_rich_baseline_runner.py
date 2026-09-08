@@ -85,3 +85,28 @@ def test_live_inventory_requires_exact_identity_set(monkeypatch):
             [{**expected[0], "channelId": "2"}],
             archived_page_limit=10,
         )
+
+
+def test_evidence_ttl_uses_remaining_bounded_run_time(monkeypatch):
+    monkeypatch.setattr(baseline.time, "monotonic", lambda: 100.0)
+    assert baseline.remaining_evidence_ttl(1_000.0) == 900.0
+    assert baseline.remaining_evidence_ttl(
+        100.0 + baseline.rich.MAX_LIVE_EVIDENCE_TTL_SECONDS + 1,
+    ) == baseline.rich.MAX_LIVE_EVIDENCE_TTL_SECONDS
+    with pytest.raises(baseline.BaselineError, match="runtime_budget_exhausted"):
+        baseline.remaining_evidence_ttl(100.0)
+
+
+def test_runtime_argument_cannot_outlive_maximum_evidence_ttl(tmp_path):
+    args = baseline.build_parser().parse_args([
+        "--root", str(tmp_path),
+        "--state", str(tmp_path / "state.json"),
+        "--queue", str(tmp_path / "queue.json"),
+        "--openclaw-config", str(tmp_path / "openclaw.json"),
+        "--guild-id", "1476493755426017414",
+        "--run-id", "runtime-too-long",
+        "--max-runtime-seconds",
+        str(int(baseline.rich.MAX_LIVE_EVIDENCE_TTL_SECONDS) + 1),
+    ])
+    with pytest.raises(baseline.BaselineError, match="runtime_arguments_invalid"):
+        baseline.execute(args)

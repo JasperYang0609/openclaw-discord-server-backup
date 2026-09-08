@@ -467,6 +467,14 @@ def publish_compatibility(
     return updated
 
 
+def remaining_evidence_ttl(run_deadline_monotonic: float) -> float:
+    """Bind local materialization authority to the remaining run deadline."""
+    remaining = run_deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise BaselineError("runtime_budget_exhausted")
+    return min(remaining, rich.MAX_LIVE_EVIDENCE_TTL_SECONDS)
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     if (
         not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,126}[A-Za-z0-9]", args.run_id)
@@ -477,6 +485,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         or args.max_messages_per_entry < 0
         or args.max_requests < 1
         or args.max_runtime_seconds < 1
+        or args.max_runtime_seconds > rich.MAX_LIVE_EVIDENCE_TTL_SECONDS
     ):
         raise BaselineError("runtime_arguments_invalid")
     archive_root = safe_absolute(args.root, directory=True)
@@ -493,10 +502,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     state_identity = path_identity(state_path)
     queue_identity = path_identity(queue_path)
     token = load_token(openclaw_config, args.token_env)
+    run_deadline_monotonic = time.monotonic() + args.max_runtime_seconds
     transport = DiscordTransport(
         token,
         max_requests=args.max_requests,
-        deadline_monotonic=time.monotonic() + args.max_runtime_seconds,
+        deadline_monotonic=run_deadline_monotonic,
     )
     inventory = live_inventory(
         transport,
@@ -590,6 +600,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 page_limit=args.page_size,
                 max_pages=args.max_pages_per_entry,
                 max_messages=args.max_messages_per_entry,
+                evidence_ttl_seconds=remaining_evidence_ttl(
+                    run_deadline_monotonic,
+                ),
             )
             stage = store.materialize_full_stage_from_live_evidence(
                 generation_id=generation_id,
