@@ -519,6 +519,18 @@ def test_cron_add_uses_isolated_session_target_for_daily_command(tmp_path):
     assert "--disabled" in args
 
 
+def test_cron_edit_converts_existing_daily_job_to_command_in_place(tmp_path):
+    desired, _ = render(tmp_path)
+    row = next(item for item in desired if item["role"] == "daily-sync-1")
+    args = manager.cron_edit_args("owned-daily", row, disabled=True)
+
+    assert args[:3] == ["cron", "edit", "owned-daily"]
+    assert "--command-argv" in args
+    assert "--message" not in args
+    assert "--disable" in args
+    assert "--declaration-key" not in args
+
+
 def test_command_post_add_never_sends_unsupported_tools_patch(tmp_path, monkeypatch):
     desired, _ = render(tmp_path)
     row = next(item for item in desired if item["payload"]["kind"] == "command")

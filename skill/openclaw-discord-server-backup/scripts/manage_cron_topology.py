@@ -1069,6 +1069,23 @@ class OpenClawCronClient:
         return validate_inventory(payload)
 
     def converge_disabled(self, desired: dict[str, Any]) -> dict[str, Any]:
+        declaration_key = str(desired["declarationKey"])
+        matches = [
+            job for job in self.list_jobs()
+            if str(job.get("declarationKey") or "") == declaration_key
+        ]
+        if len(matches) > 1:
+            raise CronManagerError("owned declaration is duplicated before update")
+        if matches:
+            job_id = str(matches[0]["id"])
+            self.run(cron_edit_args(job_id, desired, disabled=True))
+            readback = [
+                job for job in self.list_jobs()
+                if str(job.get("id") or "") == job_id
+            ]
+            if len(readback) != 1:
+                raise CronManagerError("OpenClaw cron edit readback is missing or ambiguous")
+            return readback[0]
         proc = self.run(cron_add_args(desired, disabled=True))
         try:
             job = extract_job(json.loads(proc.stdout))
@@ -1263,6 +1280,78 @@ def cron_add_args(job: dict[str, Any], *, disabled: bool) -> list[str]:
     if disabled:
         args.append("--disabled")
     args.append("--json")
+    return args
+
+
+def cron_edit_args(job_id: str, job: dict[str, Any], *, disabled: bool) -> list[str]:
+    """Build a complete in-place patch for an existing declaration.
+
+    `cron add` is declaration-key idempotent but OpenClaw 2026.7.1-2 does not
+    convert an existing agent payload into a command payload through that path.
+    Editing the exact receipted job ID performs the supported payload-kind
+    transition while the later exact readback still gates activation.
+    """
+    schedule = job["schedule"]
+    payload = job["payload"]
+    args = [
+        "cron", "edit", job_id,
+        "--name", str(job["name"]),
+        "--description", str(job["description"]),
+        "--cron", str(schedule["expr"]),
+        "--tz", str(schedule["tz"]),
+        "--exact",
+        "--session", str(job["sessionTarget"]),
+    ]
+    if payload["kind"] == "command":
+        args.extend([
+            "--command-argv", json.dumps(payload["argv"], ensure_ascii=False),
+            "--command-cwd", str(payload["cwd"]),
+            "--timeout-seconds", str(payload["timeoutSeconds"]),
+            "--no-output-timeout-seconds", str(payload["noOutputTimeoutSeconds"]),
+            "--output-max-bytes", str(payload["outputMaxBytes"]),
+        ])
+    elif payload["kind"] == "agentTurn":
+        args.extend([
+            "--message", str(payload["message"]),
+            "--agent", str(job["agentId"]),
+            "--timeout-seconds", str(payload["timeoutSeconds"]),
+            "--light-context" if payload.get("lightContext", True) else "--no-light-context",
+        ])
+        tools = payload.get("toolsAllow")
+        if tools is None:
+            args.append("--clear-tools")
+        else:
+            args.extend(["--tools", ",".join(str(item) for item in tools)])
+    else:
+        raise CronManagerError("unsupported desired payload kind")
+    delivery = normalized_delivery(job.get("delivery"))
+    if delivery["mode"] == "none":
+        args.append("--no-deliver")
+    else:
+        args.extend([
+            "--announce", "--channel", str(delivery["channel"]),
+            "--to", str(delivery["to"]),
+        ])
+        if delivery.get("accountId"):
+            args.extend(["--account", str(delivery["accountId"])])
+        else:
+            args.append("--clear-account")
+    alert = job.get("failureAlert")
+    if alert:
+        args.extend([
+            "--failure-alert",
+            "--failure-alert-after", str(alert["after"]),
+            "--failure-alert-channel", str(alert["channel"]),
+            "--failure-alert-to", str(alert["to"]),
+            "--failure-alert-cooldown", "1h",
+            "--failure-alert-exclude-skipped",
+            "--failure-alert-mode", str(alert["mode"]),
+        ])
+        if alert.get("accountId"):
+            args.extend(["--failure-alert-account-id", str(alert["accountId"])])
+    else:
+        args.append("--no-failure-alert")
+    args.append("--disable" if disabled else "--enable")
     return args
 
 
