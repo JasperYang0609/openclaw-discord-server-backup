@@ -4,7 +4,9 @@ import argparse
 import importlib.util
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -250,6 +252,47 @@ def test_health_report_runs_topology_verify_before_render(monkeypatch, tmp_path,
     assert calls[0][calls[0].index("--adoption-map") + 1] == str(adoption)
     assert calls[0][calls[0].index("--prepared-adoption-receipt") + 1] == str(prepared)
     assert "排程與告警：正常" in capsys.readouterr().out
+
+
+def test_health_report_uses_configured_gemini_manifest(monkeypatch, tmp_path, capsys):
+    args, workspace, _customer = make_args(tmp_path, "health-report")
+    config_path = workspace / "memory/config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    gemini = workspace / "private/incremental-manifest.latest.json"
+    gemini.parent.mkdir()
+    runner.health.atomic_json(gemini, {
+        "mode": "incremental",
+        "indexedAt": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
+        "rowsAfter": 42,
+        "chunksAvailable": 42,
+        "embedding": {"provider": "google-gemini", "model": "gemini-embedding-001", "dimensions": 768},
+    })
+    config["health"] = {"geminiManifestPath": str(gemini)}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    receipt_dir = workspace / "memory/health"
+    for component in [*runner.health.DAILY_COMPONENTS, *runner.health.WEEKLY_COMPONENTS, *runner.health.MONTHLY_COMPONENTS]:
+        producer = (
+            "openclaw-discord-server-backup/daily-sync-core-v3" if component.startswith("daily-sync-")
+            else "openclaw-discord-server-backup/cron-manager.v1" if component == "cron-topology"
+            else "openclaw-discord-server-backup/run-managed-component.v1"
+        )
+        declared_role = "topology" if component == "cron-topology" else component
+        runner.health.write_component(
+            receipt_dir, component, "ok", "verified",
+            f"openclaw-discord-server-backup:123456789012345678:{declared_role}:v1",
+            producer=producer,
+            checks=[{"key": "gate", "status": "ok", "summary": "passed"}],
+        )
+
+    class Proc:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **kw: Proc())
+    assert runner.verify_topology_and_render(args) == 0
+    output = capsys.readouterr().out
+    assert "Gemini 已同步（42 筆）" in output
 
 
 def test_health_report_rejects_prepared_receipt_without_adoption_map(tmp_path):

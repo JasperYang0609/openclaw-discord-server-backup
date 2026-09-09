@@ -720,6 +720,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--openclaw-bin", default="openclaw")
     ap.add_argument("--adoption-map")
     ap.add_argument("--qwen-receipt", help="Explicit receipt path from the owned Qwen-local installer")
+    ap.add_argument("--gemini-manifest", help="Explicit Gemini incremental manifest path")
     ap.add_argument("--offline-scaffold", action="store_true")
     ap.add_argument("--force", action="store_true", help="Deprecated compatibility flag; upgrades are already convergent")
     ap.add_argument("--skip-canary", action="store_true", help=argparse.SUPPRESS)
@@ -820,16 +821,34 @@ def main() -> int:
             )
             if adoption_path is None:
                 raise InstallError("prepared adoption receipt requires its configured adoption map")
+        health_settings = config.get("health")
+        if not isinstance(health_settings, dict):
+            health_settings = {}
+        gemini_manifest_arg = getattr(args, "gemini_manifest", None)
+        if gemini_manifest_arg:
+            config["health"] = health_settings
+            gemini_lexical = Path(gemini_manifest_arg).expanduser()
+            if not gemini_lexical.is_absolute():
+                raise InstallError("Gemini manifest path must be absolute")
+            gemini_lexical = Path(os.path.abspath(gemini_lexical))
+            reject_symlink_components(gemini_lexical, "Gemini manifest path")
+            health_settings["geminiManifestPath"] = str(gemini_lexical.resolve(strict=False))
+        elif health_settings.get("geminiManifestPath"):
+            gemini_lexical = Path(str(health_settings["geminiManifestPath"])).expanduser()
+            if not gemini_lexical.is_absolute():
+                raise InstallError("configured Gemini manifest path must be absolute")
+            reject_symlink_components(Path(os.path.abspath(gemini_lexical)), "Gemini manifest path")
         if args.qwen_receipt:
+            config["health"] = health_settings
             qwen_lexical = Path(args.qwen_receipt).expanduser()
             if not qwen_lexical.is_absolute():
                 raise InstallError("Qwen receipt path must be absolute")
             qwen_lexical = Path(os.path.abspath(qwen_lexical))
             reject_symlink_components(qwen_lexical, "Qwen receipt path")
             qwen_path = qwen_lexical.resolve(strict=False)
-            config.setdefault("health", {})["qwenReceiptPath"] = str(qwen_path)
-        elif isinstance(config.get("health"), dict) and config["health"].get("qwenReceiptPath"):
-            qwen_lexical = Path(str(config["health"]["qwenReceiptPath"])).expanduser()
+            health_settings["qwenReceiptPath"] = str(qwen_path)
+        elif health_settings.get("qwenReceiptPath"):
+            qwen_lexical = Path(str(health_settings["qwenReceiptPath"])).expanduser()
             if not qwen_lexical.is_absolute():
                 raise InstallError("configured Qwen receipt path must be absolute")
             reject_symlink_components(Path(os.path.abspath(qwen_lexical)), "Qwen receipt path")

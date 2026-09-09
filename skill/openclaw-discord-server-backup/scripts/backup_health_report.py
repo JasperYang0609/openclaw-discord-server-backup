@@ -33,6 +33,9 @@ QWEN_DECLARATION_KEYS = {
     "openclaw-lancedb-knowledge-local-snapshot-v1",
 }
 QWEN_MAX_AGE_SECONDS = 129_600
+GEMINI_PROVIDER = "google-gemini"
+GEMINI_MODEL = "gemini-embedding-001"
+GEMINI_DIMENSIONS = 768
 LOCAL_PRODUCERS = {
     **{component: {"openclaw-discord-server-backup/run-managed-component.v1"} for component in (
         "core-backup", "discovery", "caught-up-audit", "backlog",
@@ -322,6 +325,83 @@ def load_qwen_receipt(path: Path, now: datetime) -> dict[str, Any]:
         }
 
 
+def load_gemini_manifest(path: Path, now: datetime) -> dict[str, Any]:
+    try:
+        payload = json.loads(read_receipt_bytes(path).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise HealthError("Gemini manifest root must be an object")
+        embedding = payload.get("embedding")
+        if payload.get("mode") != "incremental":
+            raise HealthError("Gemini manifest mode is not incremental")
+        if not isinstance(embedding, dict):
+            raise HealthError("Gemini manifest embedding identity is missing")
+        if embedding.get("provider") != GEMINI_PROVIDER:
+            raise HealthError("Gemini manifest provider identity is invalid")
+        if embedding.get("model") != GEMINI_MODEL:
+            raise HealthError("Gemini manifest model identity is invalid")
+        if embedding.get("dimensions") != GEMINI_DIMENSIONS:
+            raise HealthError("Gemini manifest dimensions are invalid")
+        rows = payload.get("rowsAfter")
+        chunks = payload.get("chunksAvailable")
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1 or chunks != rows:
+            raise HealthError("Gemini manifest row counts are invalid")
+        indexed_at = payload.get("indexedAt")
+        if not isinstance(indexed_at, str):
+            raise HealthError("Gemini manifest indexedAt is missing")
+        checked = parse_checked_at(indexed_at)
+        age = now.astimezone(checked.tzinfo) - checked
+        if age < timedelta(minutes=-5) or age > timedelta(hours=30):
+            raise HealthError("Gemini manifest is stale or from the future")
+        if checked.astimezone(now.tzinfo).date() != now.date():
+            raise HealthError("Gemini manifest is not from the current local backup date")
+        return {
+            "schema": SCHEMA,
+            "producer": "google-gemini",
+            "declarationKey": "gemini-embedding-001-incremental",
+            "component": "gemini-index",
+            "status": "ok",
+            "checkedAt": indexed_at,
+            "summary": "Gemini 索引已同步",
+            "checks": [{"key": "identity_and_rows", "status": "ok", "summary": "Gemini 索引身分與筆數一致"}],
+            "metrics": {"rows": rows},
+            "anomalies": [],
+            "pending": [],
+        }
+    except (OSError, UnicodeError, json.JSONDecodeError, HealthError) as exc:
+        return {
+            "schema": SCHEMA,
+            "producer": "health-renderer",
+            "declarationKey": "gemini-index",
+            "component": "gemini-index",
+            "status": "error",
+            "checkedAt": now.isoformat(),
+            "summary": "Gemini 索引回報無法信任",
+            "checks": [],
+            "metrics": {},
+            "anomalies": [{
+                "code": "gemini_manifest_invalid",
+                "summary": str(exc),
+                "impact": "無法確認搜尋索引是否完成今日增量",
+                "dataLoss": "unknown",
+                "repairStatus": "需要重新執行 Gemini 增量驗證",
+            }],
+            "pending": [],
+        }
+
+
+def qwen_cold_standby_is_preserved(path: Path) -> bool:
+    """Validate identity and storage safety without requiring a fresh daily receipt."""
+    try:
+        payload = validate_component_receipt(json.loads(read_receipt_bytes(path).decode("utf-8")))
+        return (
+            payload.get("producer") == QWEN_PRODUCER
+            and payload.get("declarationKey") in QWEN_DECLARATION_KEYS
+            and payload.get("component") == "qwen-local"
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, HealthError):
+        return False
+
+
 def worst_status(receipts: list[dict[str, Any]]) -> str:
     rank = {"ok": 0, "pending": 1, "warning": 2, "error": 3}
     return max((receipt["status"] for receipt in receipts), key=rank.__getitem__, default="pending")
@@ -386,6 +466,7 @@ def render_report(
     receipt_dir: Path,
     *,
     now: datetime,
+    gemini_manifest: Path | None = None,
     qwen_receipt: Path | None = None,
 ) -> str:
     receipts = {
@@ -406,9 +487,8 @@ def render_report(
         component: load_receipt(receipt_dir / "components" / f"{component}.json", component, now, timedelta(days=32))
         for component in MONTHLY_COMPONENTS
     }
-    qwen = None
-    if qwen_receipt is not None:
-        qwen = load_qwen_receipt(qwen_receipt, now)
+    gemini = load_gemini_manifest(gemini_manifest, now) if gemini_manifest is not None else None
+    qwen = load_qwen_receipt(qwen_receipt, now) if gemini is None and qwen_receipt is not None else None
 
     effective_receipts = supersede_drained_queue_pending(receipts)
 
@@ -428,14 +508,22 @@ def render_report(
     if snapshot_rows and all(row.get("metrics", {}).get("baselineNotDue") is True for row in snapshot_rows):
         snapshot_text = "已安裝，尚未到首次驗證（不影響目前原始備份）"
     topology_text, topology_anomalies, topology_pending = group_summary([receipts["cron-topology"]], "正常")
-    if qwen is None:
+    if gemini is not None:
+        index_text, index_anomalies, index_pending = group_summary([gemini], "Gemini 已同步")
+        if gemini.get("status") == "ok":
+            index_text = f"Gemini 已同步（{gemini['metrics']['rows']} 筆）"
+            if qwen_receipt is not None:
+                qwen_text = "Qwen 冷備援已保留" if qwen_cold_standby_is_preserved(qwen_receipt) else "Qwen 冷備援狀態未確認"
+                index_text = f"{index_text}；{qwen_text}"
+    elif qwen is None:
         index_text = "未設定本機搜尋索引回報（不影響 Discord 原始備份）"
         index_anomalies: list[dict[str, Any]] = []
         index_pending: list[str] = []
     else:
         index_text, index_anomalies, index_pending = group_summary([qwen], "已同步")
 
-    all_rows = [*effective_receipts.values(), *weekly.values(), *monthly.values(), *([qwen] if qwen else [])]
+    index_rows = [gemini] if gemini is not None else ([qwen] if qwen else [])
+    all_rows = [*effective_receipts.values(), *weekly.values(), *monthly.values(), *index_rows]
     overall = worst_status(all_rows)
     anomalies = [*core_anomalies, *channel_anomalies, *index_anomalies, *snapshot_anomalies, *topology_anomalies]
     pending = list(dict.fromkeys([*core_pending, *channel_pending, *index_pending, *snapshot_pending, *topology_pending]))
@@ -499,6 +587,7 @@ def main() -> int:
     render = sub.add_parser("render")
     render.add_argument("--receipt-dir", required=True)
     render.add_argument("--timezone", default="Asia/Taipei")
+    render.add_argument("--gemini-manifest")
     render.add_argument("--qwen-receipt")
     render.add_argument("--now", help="Test-only ISO timestamp; defaults to current time")
     args = parser.parse_args()
@@ -524,6 +613,7 @@ def main() -> int:
             now = now.replace(tzinfo=zone)
         print(render_report(
             Path(args.receipt_dir).expanduser().resolve(), now=now.astimezone(zone),
+            gemini_manifest=Path(os.path.abspath(Path(args.gemini_manifest).expanduser())) if args.gemini_manifest else None,
             qwen_receipt=Path(os.path.abspath(Path(args.qwen_receipt).expanduser())) if args.qwen_receipt else None,
         ))
         return 0

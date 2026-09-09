@@ -68,6 +68,26 @@ def write_qwen(path: Path, payload):
     os.chmod(path, 0o600)
 
 
+def gemini_payload(*, indexed_at=NOW.isoformat(), rows=125638, chunks=125638):
+    return {
+        "mode": "incremental",
+        "indexedAt": indexed_at,
+        "rowsAfter": rows,
+        "chunksAvailable": chunks,
+        "embedding": {
+            "provider": "google-gemini",
+            "model": "gemini-embedding-001",
+            "dimensions": 768,
+        },
+    }
+
+
+def write_gemini(path: Path, payload=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    health.atomic_json(path, payload or gemini_payload())
+    os.chmod(path, 0o600)
+
+
 def test_healthy_report_is_concise_and_monthly_snapshot_is_current(tmp_path):
     complete_local_receipts(tmp_path)
     report = health.render_report(tmp_path, now=NOW)
@@ -76,6 +96,71 @@ def test_healthy_report_is_concise_and_monthly_snapshot_is_current(tmp_path):
     assert "未設定本機搜尋索引回報" in report
     for forbidden in ("cursor", "added=", "processed=", "/logs/"):
         assert forbidden not in report
+
+
+def test_gemini_manifest_is_primary_and_stale_qwen_is_cold_standby(tmp_path):
+    complete_local_receipts(tmp_path)
+    gemini = tmp_path / "gemini/incremental-manifest.latest.json"
+    qwen = tmp_path / "qwen/qwen.json"
+    write_gemini(gemini)
+    payload = qwen_payload()
+    payload["checkedAt"] = (NOW - timedelta(days=7)).isoformat()
+    write_qwen(qwen, payload)
+
+    report = health.render_report(
+        tmp_path,
+        now=NOW,
+        gemini_manifest=gemini,
+        qwen_receipt=qwen,
+    )
+
+    assert "✅ 正常" in report
+    assert "搜尋索引：Gemini 已同步（125638 筆）；Qwen 冷備援已保留" in report
+    assert "Qwen receipt is stale" not in report
+
+
+@pytest.mark.parametrize("mutation", ["provider", "model", "mode", "rows", "date", "permissions", "oversize"])
+def test_invalid_gemini_manifest_is_never_green(tmp_path, mutation):
+    complete_local_receipts(tmp_path)
+    gemini = tmp_path / "gemini/incremental-manifest.latest.json"
+    payload = gemini_payload()
+    if mutation == "provider":
+        payload["embedding"]["provider"] = "local"
+    elif mutation == "model":
+        payload["embedding"]["model"] = "other"
+    elif mutation == "mode":
+        payload["mode"] = "full"
+    elif mutation == "rows":
+        payload["chunksAvailable"] = payload["rowsAfter"] - 1
+    elif mutation == "date":
+        payload["indexedAt"] = (NOW - timedelta(days=1)).isoformat()
+    write_gemini(gemini, payload)
+    if mutation == "permissions":
+        os.chmod(gemini, 0o644)
+    elif mutation == "oversize":
+        payload["padding"] = "x" * 20000
+        gemini.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(gemini, 0o600)
+
+    report = health.render_report(tmp_path, now=NOW, gemini_manifest=gemini)
+
+    assert "✅ 正常" not in report
+    assert "Gemini 索引回報無法信任" in report
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_gemini_manifest_through_symlinked_ancestor_is_never_green(tmp_path):
+    complete_local_receipts(tmp_path)
+    real = tmp_path / "real/sub"
+    gemini = real / "incremental-manifest.latest.json"
+    write_gemini(gemini)
+    link = tmp_path / "linked"
+    link.symlink_to(tmp_path / "real", target_is_directory=True)
+
+    report = health.render_report(tmp_path, now=NOW, gemini_manifest=link / "sub/incremental-manifest.latest.json")
+
+    assert "✅ 正常" not in report
+    assert "Gemini 索引回報無法信任" in report
 
 
 def test_all_three_lock_skips_without_later_audit_are_never_green(tmp_path):

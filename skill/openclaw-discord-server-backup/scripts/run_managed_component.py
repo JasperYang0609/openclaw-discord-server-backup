@@ -441,10 +441,13 @@ def verify_topology_and_render(args: argparse.Namespace) -> int:
             }],
             pending=["等待排程拓撲修復"],
         )
-    qwen_value = ((config.get("health") or {}).get("qwenReceiptPath")) if isinstance(config.get("health"), dict) else None
+    health_config = config.get("health") if isinstance(config.get("health"), dict) else {}
+    gemini_value = health_config.get("geminiManifestPath")
+    qwen_value = health_config.get("qwenReceiptPath")
     report = health.render_report(
         receipt_dir,
         now=datetime.now(ZoneInfo(timezone_name)),
+        gemini_manifest=Path(os.path.abspath(Path(gemini_value).expanduser())) if gemini_value else None,
         qwen_receipt=Path(os.path.abspath(Path(qwen_value).expanduser())) if qwen_value else None,
     )
     print(report)

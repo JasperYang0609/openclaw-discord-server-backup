@@ -100,6 +100,26 @@ class InstallerDesktopBackupTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
 
+    def test_installer_persists_only_an_absolute_safe_gemini_manifest_path(self):
+        manifest = self.base / "private/incremental-manifest.latest.json"
+        manifest.parent.mkdir()
+        manifest.write_text("{}\n", encoding="utf-8")
+        manifest.chmod(0o600)
+
+        proc = self.install(
+            "--server-name", "南方", "--gemini-manifest", str(manifest),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        config = json.loads(
+            (self.workspace / "memory/openclaw_discord_backup_config.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(config["health"]["geminiManifestPath"], str(manifest.resolve()))
+
+        unsafe = self.install(
+            "--server-name", "另一台", "--gemini-manifest", "relative.json",
+        )
+        self.assertNotEqual(unsafe.returncode, 0)
+
     def test_identical_rerun_does_not_rewrite_config_state_or_queue(self):
         first = self.install("--server-name", "南方")
         self.assertEqual(first.returncode, 0, first.stderr)
