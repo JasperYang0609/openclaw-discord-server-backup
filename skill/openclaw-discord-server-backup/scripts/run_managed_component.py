@@ -20,6 +20,12 @@ ROLES = {
     "caught-up-audit", "backlog",
     "weekly-inventory", "weekly-raw", "workspace-snapshot", "health-report",
 }
+DISCORD_API_HELPERS = {
+    "audit_discord_inventory_v3.py",
+    "audit_caught_up_v3.py",
+    "run_backlog_worker_v3.py",
+    "weekly_raw_reconcile_v4.py",
+}
 
 def load_sibling(name: str):
     path = HERE / name
@@ -39,6 +45,40 @@ def read_config(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError("config root must be an object")
     return data
+
+
+def configured_discord_token(
+    backup_config: dict[str, Any],
+    openclaw_config_path: Path,
+    *,
+    env_name: str = "DISCORD_BOT_TOKEN",
+) -> str | None:
+    """Resolve a Discord token without placing it in argv or persisted output."""
+    inherited = os.getenv(env_name)
+    if inherited:
+        return inherited
+    if not openclaw_config_path.is_file() or openclaw_config_path.is_symlink():
+        return None
+    root = json.loads(openclaw_config_path.read_text(encoding="utf-8"))
+    discord = ((root.get("channels") or {}).get("discord") or {})
+    if not isinstance(discord, dict):
+        return None
+    account_id = str(backup_config.get("accountId") or "default")
+    accounts = discord.get("accounts")
+    if isinstance(accounts, dict):
+        account = accounts.get(account_id)
+        if isinstance(account, dict):
+            token = account.get("token")
+            if isinstance(token, str) and token and token.strip() == token:
+                return token
+    legacy = discord.get("token")
+    if isinstance(legacy, str) and legacy and legacy.strip() == legacy:
+        return legacy
+    return None
+
+
+def command_uses_discord_api(command: list[str]) -> bool:
+    return len(command) > 1 and Path(command[1]).name in DISCORD_API_HELPERS
 
 
 def reject_symlink_components(path: Path, label: str) -> None:
@@ -295,6 +335,16 @@ def run_role(args: argparse.Namespace) -> int:
         args.role, workspace=workspace, config_path=config_path, config=config,
         backup_root=backup_root, receipt_dir=receipt_dir, today=today,
     )
+    child_env: dict[str, str] | None = None
+    if any(command_uses_discord_api(command) for command in commands):
+        openclaw_config = safe_absolute(
+            str(config.get("openclawConfig") or Path.home() / ".openclaw/openclaw.json"),
+            "OpenClaw config",
+        )
+        token = configured_discord_token(config, openclaw_config)
+        if token:
+            child_env = os.environ.copy()
+            child_env.setdefault("DISCORD_BOT_TOKEN", token)
     combined: list[str] = []
     metrics: dict[str, Any] = {}
     structured: list[dict[str, Any]] = []
@@ -303,7 +353,10 @@ def run_role(args: argparse.Namespace) -> int:
     inventory_skip = False
     failure_payload: dict[str, Any] | None = None
     for command in commands:
-        proc = subprocess.run(command, cwd=workspace, text=True, capture_output=True, check=False)
+        proc = subprocess.run(
+            command, cwd=workspace, text=True, capture_output=True, check=False,
+            env=child_env,
+        )
         combined.append("$ " + " ".join(Path(value).name if index in {0, 1} else "[arg]" for index, value in enumerate(command)))
         combined.append(proc.stdout)
         combined.append(proc.stderr)

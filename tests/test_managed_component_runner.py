@@ -44,6 +44,85 @@ def make_args(tmp_path: Path, role: str):
     ), workspace, customer
 
 
+def test_configured_account_token_is_child_env_only(monkeypatch, tmp_path):
+    args, workspace, _ = make_args(tmp_path, "discovery")
+    config_path = workspace / "memory/config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["accountId"] = "default"
+    openclaw_config = workspace / "private/openclaw.json"
+    openclaw_config.parent.mkdir()
+    secret = "discord-test-token-not-for-logs"
+    openclaw_config.write_text(json.dumps({
+        "channels": {"discord": {"accounts": {"default": {"token": secret}}}},
+    }), encoding="utf-8")
+    config["openclawConfig"] = str(openclaw_config)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.setattr(runner, "command_for", lambda *a, **kw: [[
+        sys.executable, str(runner.HERE / "audit_discord_inventory_v3.py"),
+    ]])
+    seen = {}
+
+    class Proc:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        seen["env"] = kwargs.get("env")
+        return Proc()
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    assert runner.run_role(args) == 0
+    assert seen["env"]["DISCORD_BOT_TOKEN"] == secret
+    assert secret not in " ".join(seen["command"])
+    receipt_root = workspace / "memory/health"
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8") for path in receipt_root.rglob("*") if path.is_file()
+    )
+    assert secret not in persisted
+
+
+def test_discord_token_resolution_precedence_and_legacy(monkeypatch, tmp_path):
+    _args, workspace, _ = make_args(tmp_path, "discovery")
+    openclaw_config = workspace / "openclaw.json"
+    openclaw_config.write_text(json.dumps({
+        "channels": {"discord": {
+            "token": "legacy-token",
+            "accounts": {
+                "default": {"token": "default-token"},
+                "other": {"token": "other-token"},
+            },
+        }},
+    }), encoding="utf-8")
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    assert runner.configured_discord_token(
+        {"accountId": "other"}, openclaw_config,
+    ) == "other-token"
+    assert runner.configured_discord_token(
+        {"accountId": "missing"}, openclaw_config,
+    ) == "legacy-token"
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "environment-token")
+    assert runner.configured_discord_token(
+        {"accountId": "other"}, openclaw_config,
+    ) == "environment-token"
+
+
+def test_secret_reference_object_is_not_stringified(monkeypatch, tmp_path):
+    _args, workspace, _ = make_args(tmp_path, "discovery")
+    openclaw_config = workspace / "openclaw.json"
+    openclaw_config.write_text(json.dumps({
+        "channels": {"discord": {"accounts": {
+            "default": {"token": {"provider": "env", "id": "DISCORD_SECRET"}},
+        }}},
+    }), encoding="utf-8")
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    assert runner.configured_discord_token(
+        {"accountId": "default"}, openclaw_config,
+    ) is None
+
+
 def test_core_role_runs_backup_and_verify_restore_for_latest_and_snapshot(tmp_path):
     args, workspace, customer = make_args(tmp_path, "core-backup")
     config = runner.read_config(workspace / "memory/config.json")
