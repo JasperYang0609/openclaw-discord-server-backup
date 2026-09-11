@@ -61,3 +61,16 @@ sync, audit, and backlog were affected.
   child-environment-only credential transport, fail-closed object handling,
   deterministic package/hash verification, bounded diagnostics, and regression
   evidence. A03/A06/A07: `N/A_WITH_EVIDENCE` for the reasons above.
+
+## Live deployment evidence
+
+- Release commit deployed: `41e30a6`.
+- Transactional installer: `READY`; 11/11 owned jobs updated and verified.
+- Installed-layout post-run check: PASS, including 28 compiled scripts and 17
+  CLI entry-point checks.
+- Manual incident recovery through the installed cron payloads: discovery PASS;
+  daily-sync batches 1–3 PASS; caught-up audit PASS; bounded backlog PASS.
+- Final active queue: 0. Consolidated health reports core files complete,
+  channels/threads caught up, search index current, and topology/alerts normal.
+- The next natural schedule remains the final regression observation; no
+  recurring schedule, permission, backup root, or customer archive was changed.
