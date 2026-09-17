@@ -69,6 +69,69 @@ def test_scan_freezes_report_entry_and_excludes_newer_raw_and_live_ids(
     assert rows[0]["localOnly"] == 0
 
 
+def test_freeze_scope_cutoffs_covers_every_entry_and_preserves_existing_cutoff():
+    entries = [
+        ("active", {"channelId": "1"}),
+        ("raw-only", {"channelId": "2"}),
+        ("empty", {"channelId": "3"}),
+        ("report", {"channelId": "4"}),
+    ]
+
+    cutoffs = weekly.freeze_scope_cutoffs(
+        entries,
+        {
+            "active": [{"id": "10"}, {"id": "30"}],
+            "report": [{"id": "999"}],
+        },
+        {
+            "active": {"20"},
+            "raw-only": {"40"},
+            "empty": set(),
+            "report": {"90"},
+        },
+        {"report": "25"},
+    )
+
+    assert cutoffs == {
+        "active": "30",
+        "raw-only": "40",
+        "empty": "0",
+        "report": "25",
+    }
+
+
+def test_scan_applies_frozen_cutoff_to_every_entry(tmp_path: Path, monkeypatch):
+    entries = [
+        ("first", {"channelId": "1", "relativePath": "first"}),
+        ("second", {"channelId": "2", "relativePath": "second"}),
+    ]
+    monkeypatch.setattr(
+        weekly.reconcile,
+        "archive_message_ids",
+        lambda raw_dir: ({"10": 1, "20": 1}, []),
+    )
+    monkeypatch.setattr(
+        weekly.reconcile,
+        "fetch_all_messages",
+        lambda token, channel_id, page_limit: [{"id": "10"}, {"id": "20"}],
+    )
+
+    rows, messages, raw_ids = weekly.scan(
+        entries,
+        tmp_path,
+        "token",
+        100,
+        cutoff_message_ids={"first": "10", "second": "10"},
+    )
+
+    assert [row["liveMessages"] for row in rows] == [1, 1]
+    assert {key: [message["id"] for message in value] for key, value in messages.items()} == {
+        "first": ["10"],
+        "second": ["10"],
+    }
+    assert raw_ids == {"first": {"10"}, "second": {"10"}}
+
+
 def test_safe_entry_dir_rejects_path_escape(tmp_path: Path):
     try:
         weekly.safe_entry_dir(tmp_path, "../outside")

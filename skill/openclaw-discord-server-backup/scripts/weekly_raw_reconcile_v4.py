@@ -501,6 +501,7 @@ def scan(
     page_limit: int,
     report_entry_key: str | None = None,
     report_cutoff_message_id: str | None = None,
+    cutoff_message_ids: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, set[str]]]:
     rows: list[dict[str, Any]] = []
     messages_by_key: dict[str, list[dict[str, Any]]] = {}
@@ -509,7 +510,9 @@ def scan(
         relative_path = str(entry.get("relativePath") or key)
         raw_dir = safe_entry_dir(root, relative_path) / "raw"
         raw_counts, _ = reconcile.archive_message_ids(raw_dir)
-        cutoff = report_cutoff_message_id if key == report_entry_key else None
+        cutoff = (cutoff_message_ids or {}).get(key)
+        if cutoff is None and key == report_entry_key:
+            cutoff = report_cutoff_message_id
         raw_ids = {
             message_id for message_id in raw_counts
             if within_cutoff(message_id, cutoff)
@@ -550,6 +553,30 @@ def scan(
             row["liveError"] = f"{type(exc).__name__}: {exc}"
         rows.append(row)
     return rows, messages_by_key, raw_ids_by_key
+
+
+def freeze_scope_cutoffs(
+    entries: list[tuple[str, dict[str, Any]]],
+    messages_by_key: dict[str, list[dict[str, Any]]],
+    raw_ids_by_key: dict[str, set[str]],
+    existing: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Freeze the first observed history boundary for every managed entry.
+
+    Messages newer than these boundaries belong to the normal incremental
+    pipeline. This keeps a long full-history closeout from chasing live traffic
+    forever while preserving local-only evidence inside the frozen scope.
+    """
+    cutoffs = dict(existing or {})
+    for key, _entry in entries:
+        if key in cutoffs:
+            continue
+        observed = {
+            str(message["id"])
+            for message in messages_by_key.get(key, [])
+        } | set(raw_ids_by_key.get(key, set()))
+        cutoffs[key] = max(observed, key=int, default="0")
+    return cutoffs
 
 
 def apply_missing(
@@ -726,6 +753,11 @@ def main() -> int:
         report_cutoff_message_id = capture_report_cutoff(
             entries, args.report_entry_key, token
         )
+        scope_cutoffs = (
+            {args.report_entry_key: report_cutoff_message_id}
+            if args.report_entry_key is not None and report_cutoff_message_id is not None
+            else {}
+        )
         for pass_number in range(1, args.max_closeout_passes + 1):
             rows, messages_by_key, raw_ids_by_key = scan(
                 entries,
@@ -734,7 +766,12 @@ def main() -> int:
                 args.page_limit,
                 args.report_entry_key,
                 report_cutoff_message_id,
+                scope_cutoffs,
             )
+            if pass_number == 1:
+                scope_cutoffs = freeze_scope_cutoffs(
+                    entries, messages_by_key, raw_ids_by_key, scope_cutoffs,
+                )
             live_errors = sum(bool(row.get("liveError")) for row in rows)
             live_only = sum(int(row.get("liveOnly") or 0) for row in rows)
             pass_result = {
@@ -764,6 +801,7 @@ def main() -> int:
             args.page_limit,
             args.report_entry_key,
             report_cutoff_message_id,
+            scope_cutoffs,
         )
         final_live_errors = sum(bool(row.get("liveError")) for row in final_rows)
         final_live_only = sum(int(row.get("liveOnly") or 0) for row in final_rows)
@@ -793,11 +831,12 @@ def main() -> int:
             "finalLiveOnly": final_live_only,
             "finalLiveErrors": final_live_errors,
             "activeQueue": active_queue,
+            "frozenScopeEntries": len(scope_cutoffs),
             "reportEntryKey": args.report_entry_key,
             "reportEntryCutoffMessageId": report_cutoff_message_id,
             "localOnlyClassification": classification,
             "recoveryPath": str(evidence_dir / "pre-repair") if copied else None,
-            "selfDriftGuard": "Report-entry messages newer than the frozen cutoff belong to the next incremental scope.",
+            "selfDriftGuard": "Messages newer than each entry's first-scan cutoff belong to the next incremental scope.",
         }
         atomic_json(evidence_dir / "weekly-reconciliation-summary.json", result)
         atomic_json(evidence_dir / "local-only-id-classification.json", classification)
