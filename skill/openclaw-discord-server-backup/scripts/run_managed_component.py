@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ DISCORD_API_HELPERS = {
     "run_backlog_worker_v3.py",
     "weekly_raw_reconcile_v4.py",
 }
+WEEKLY_RAW_PROGRESS_INTERVAL_SECONDS = 60.0
 
 def load_sibling(name: str):
     path = HERE / name
@@ -323,6 +325,50 @@ def success_summary(role: str, metrics: dict[str, Any]) -> tuple[str, str, list[
     return "ok", "完成", []
 
 
+def run_captured_with_progress(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None,
+    progress_label: str,
+    progress_interval_seconds: float = WEEKLY_RAW_PROGRESS_INTERVAL_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Capture child output while keeping the outer watchdog observably alive.
+
+    Progress contains no command, path, identifiers, or child output. The hard
+    runtime limit remains owned by OpenClaw cron; this only prevents a healthy
+    long scan from being killed by the shorter no-output watchdog.
+    """
+    if progress_interval_seconds <= 0:
+        raise ValueError("progress interval must be positive")
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=progress_interval_seconds)
+                return subprocess.CompletedProcess(
+                    command, process.returncode, stdout, stderr,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed = max(1, int(time.monotonic() - started))
+                print(
+                    f"[{progress_label}] still running; elapsed={elapsed}s",
+                    flush=True,
+                )
+    except BaseException:
+        process.kill()
+        process.communicate()
+        raise
+
+
 def run_role(args: argparse.Namespace) -> int:
     workspace = safe_absolute(args.workspace, "workspace", require_directory=True)
     config_path = workspace_child(workspace, args.config, "config path")
@@ -353,10 +399,18 @@ def run_role(args: argparse.Namespace) -> int:
     inventory_skip = False
     failure_payload: dict[str, Any] | None = None
     for command in commands:
-        proc = subprocess.run(
-            command, cwd=workspace, text=True, capture_output=True, check=False,
-            env=child_env,
-        )
+        if args.role == "weekly-raw":
+            proc = run_captured_with_progress(
+                command,
+                cwd=workspace,
+                env=child_env,
+                progress_label="weekly-raw",
+            )
+        else:
+            proc = subprocess.run(
+                command, cwd=workspace, text=True, capture_output=True, check=False,
+                env=child_env,
+            )
         combined.append("$ " + " ".join(Path(value).name if index in {0, 1} else "[arg]" for index, value in enumerate(command)))
         combined.append(proc.stdout)
         combined.append(proc.stderr)

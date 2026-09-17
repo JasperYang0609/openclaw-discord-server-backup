@@ -92,7 +92,8 @@ def test_healthy_report_is_concise_and_monthly_snapshot_is_current(tmp_path):
     complete_local_receipts(tmp_path)
     report = health.render_report(tmp_path, now=NOW)
     assert "✅ 正常" in report
-    assert "快照與還原驗證：快照與還原驗證通過" in report
+    assert "每週完整性驗證：完整清單與 Raw 全歷史對帳通過" in report
+    assert "工作區快照與還原：工作區快照、校驗與還原測試通過" in report
     assert "未設定本機搜尋索引回報" in report
     for forbidden in ("cursor", "added=", "processed=", "/logs/"):
         assert forbidden not in report
@@ -311,8 +312,26 @@ def test_not_yet_due_baselines_are_n_a_without_false_verification_claim(tmp_path
         )
     report = health.render_report(tmp_path, now=NOW)
     assert "⚠️ 需注意" in report
-    assert "已安裝，尚未到首次驗證" in report
-    assert "快照與還原驗證通過" not in report
+    assert "已安裝，尚未到首次每週驗證" in report
+    assert "已安裝，尚未到首次每月快照" in report
+    assert "完整清單與 Raw 全歷史對帳通過" not in report
+    assert "工作區快照、校驗與還原測試通過" not in report
+
+
+def test_stale_weekly_raw_is_not_misreported_as_index_or_workspace_snapshot(tmp_path):
+    complete_local_receipts(tmp_path)
+    write_ok(tmp_path, "weekly-raw", checked_at=NOW - timedelta(days=9))
+    gemini = tmp_path / "gemini/incremental-manifest.latest.json"
+    write_gemini(gemini)
+
+    report = health.render_report(tmp_path, now=NOW, gemini_manifest=gemini)
+
+    assert "❌ 異常" in report
+    assert "搜尋索引：Gemini 已同步（125638 筆）" in report
+    assert "每週完整性驗證：驗證回報無法信任" in report
+    assert "工作區快照與還原：工作區快照、校驗與還原測試通過" in report
+    assert "待處理：需要重新執行驗證" in report
+    assert "工作區快照與還原：驗證回報無法信任" not in report
 
 
 def test_yesterday_daily_receipts_cannot_make_today_green(tmp_path):

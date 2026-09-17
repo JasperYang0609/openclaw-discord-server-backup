@@ -136,6 +136,40 @@ def test_core_role_runs_backup_and_verify_restore_for_latest_and_snapshot(tmp_pa
     assert str(customer / "核心文件/snapshots/2026-09-04") in commands[3]
 
 
+def test_weekly_raw_progress_is_visible_while_child_output_remains_captured(
+    tmp_path, capsys
+):
+    proc = runner.run_captured_with_progress(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.08); print('final-result')",
+        ],
+        cwd=tmp_path,
+        env=None,
+        progress_label="weekly-raw",
+        progress_interval_seconds=0.02,
+    )
+
+    visible = capsys.readouterr().out
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "final-result"
+    assert proc.stderr == ""
+    assert "[weekly-raw] still running" in visible
+    assert "final-result" not in visible
+
+
+def test_weekly_raw_progress_runner_rejects_nonpositive_interval(tmp_path):
+    with pytest.raises(ValueError, match="positive"):
+        runner.run_captured_with_progress(
+            [sys.executable, "-c", "print('unused')"],
+            cwd=tmp_path,
+            env=None,
+            progress_label="weekly-raw",
+            progress_interval_seconds=0,
+        )
+
+
 def test_structured_lock_skip_with_zero_exit_writes_warning(monkeypatch, tmp_path):
     args, workspace, _ = make_args(tmp_path, "backlog")
     monkeypatch.setattr(runner, "command_for", lambda *a, **kw: [[

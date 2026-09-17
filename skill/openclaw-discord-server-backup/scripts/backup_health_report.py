@@ -503,10 +503,22 @@ def render_report(
             "repairStatus": "下一輪會從原游標續做",
         })
         channel_pending.append("等待後續同步或追平稽核")
-    snapshot_rows = [*weekly.values(), *monthly.values()]
-    snapshot_text, snapshot_anomalies, snapshot_pending = group_summary(snapshot_rows, "快照與還原驗證通過")
-    if snapshot_rows and all(row.get("metrics", {}).get("baselineNotDue") is True for row in snapshot_rows):
-        snapshot_text = "已安裝，尚未到首次驗證（不影響目前原始備份）"
+    weekly_rows = list(weekly.values())
+    weekly_text, weekly_anomalies, weekly_pending = group_summary(
+        weekly_rows, "完整清單與 Raw 全歷史對帳通過",
+    )
+    if weekly_rows and all(
+        row.get("metrics", {}).get("baselineNotDue") is True for row in weekly_rows
+    ):
+        weekly_text = "已安裝，尚未到首次每週驗證（不影響目前原始備份）"
+    monthly_rows = list(monthly.values())
+    monthly_text, monthly_anomalies, monthly_pending = group_summary(
+        monthly_rows, "工作區快照、校驗與還原測試通過",
+    )
+    if monthly_rows and all(
+        row.get("metrics", {}).get("baselineNotDue") is True for row in monthly_rows
+    ):
+        monthly_text = "已安裝，尚未到首次每月快照（不影響目前原始備份）"
     topology_text, topology_anomalies, topology_pending = group_summary([receipts["cron-topology"]], "正常")
     if gemini is not None:
         index_text, index_anomalies, index_pending = group_summary([gemini], "Gemini 已同步")
@@ -525,8 +537,20 @@ def render_report(
     index_rows = [gemini] if gemini is not None else ([qwen] if qwen else [])
     all_rows = [*effective_receipts.values(), *weekly.values(), *monthly.values(), *index_rows]
     overall = worst_status(all_rows)
-    anomalies = [*core_anomalies, *channel_anomalies, *index_anomalies, *snapshot_anomalies, *topology_anomalies]
-    pending = list(dict.fromkeys([*core_pending, *channel_pending, *index_pending, *snapshot_pending, *topology_pending]))
+    anomalies = [
+        *core_anomalies, *channel_anomalies, *index_anomalies,
+        *weekly_anomalies, *monthly_anomalies, *topology_anomalies,
+    ]
+    pending = list(dict.fromkeys([
+        *core_pending, *channel_pending, *index_pending,
+        *weekly_pending, *monthly_pending, *topology_pending,
+    ]))
+    if not pending:
+        pending = list(dict.fromkeys(
+            str(item.get("repairStatus"))
+            for item in anomalies
+            if isinstance(item, dict) and item.get("repairStatus")
+        ))
     if anomalies and overall == "ok":
         overall = "warning"
     icon = "✅ 正常" if overall == "ok" else ("⚠️ 需注意" if overall in {"warning", "pending"} else "❌ 異常")
@@ -536,7 +560,8 @@ def render_report(
         f"- 核心文件：{core_text}",
         f"- 頻道／討論串：{channel_text}",
         f"- 搜尋索引：{index_text}",
-        f"- 快照與還原驗證：{snapshot_text}",
+        f"- 每週完整性驗證：{weekly_text}",
+        f"- 工作區快照與還原：{monthly_text}",
         f"- 排程與告警：{topology_text}",
         f"- 待處理：{'；'.join(pending[:3]) if pending else '無'}",
     ]
