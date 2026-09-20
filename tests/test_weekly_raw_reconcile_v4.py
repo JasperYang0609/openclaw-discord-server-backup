@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,178 @@ def test_scan_applies_frozen_cutoff_to_every_entry(tmp_path: Path, monkeypatch):
         "second": ["10"],
     }
     assert raw_ids == {"first": {"10"}, "second": {"10"}}
+
+
+def test_scan_keeps_only_exception_class_from_discord_read_failure(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        weekly.reconcile,
+        "archive_message_ids",
+        lambda _raw_dir: ({"10": 1}, []),
+    )
+
+    def fail_read(*_args, **_kwargs):
+        raise TimeoutError("private Discord response body")
+
+    monkeypatch.setattr(weekly.reconcile, "fetch_all_messages", fail_read)
+
+    rows, messages, raw_ids = weekly.scan(
+        [("flaky", {"channelId": "2", "relativePath": "flaky"})],
+        tmp_path,
+        "token",
+        100,
+    )
+
+    assert rows[0]["liveError"] == "TimeoutError"
+    assert "private Discord response body" not in json.dumps(rows)
+    assert messages == {}
+    assert raw_ids == {"flaky": {"10"}}
+
+
+def run_final_retry_scenario(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    retry_row: dict,
+) -> tuple[int, dict, list[list[str]], list[list[str]]]:
+    state_path = tmp_path / "memory/state.json"
+    queue_path = tmp_path / "memory/queue.json"
+    root = tmp_path / "archive"
+    evidence = tmp_path / "evidence"
+    state_path.parent.mkdir(parents=True)
+    root.mkdir()
+    state_path.write_text(json.dumps({
+        "entries": {
+            "healthy": {"channelId": "1", "relativePath": "healthy"},
+            "flaky": {"channelId": "2", "relativePath": "flaky"},
+        }
+    }), encoding="utf-8")
+    queue_path.write_text('{"items": []}', encoding="utf-8")
+
+    scan_calls: list[list[str]] = []
+    responses = [
+        (
+            [
+                {"key": "healthy", "channelId": "1", "liveMessages": 1, "liveOnly": 0},
+                {"key": "flaky", "channelId": "2", "liveMessages": 1, "liveOnly": 1},
+            ],
+            {"healthy": [{"id": "10"}], "flaky": [{"id": "20"}]},
+            {"healthy": {"10"}, "flaky": set()},
+        ),
+        (
+            [
+                {"key": "healthy", "channelId": "1", "liveMessages": 1, "liveOnly": 0},
+                {"key": "flaky", "channelId": "2", "liveError": "TimeoutError: private response body"},
+            ],
+            {"healthy": [{"id": "10"}]},
+            {"healthy": {"10"}, "flaky": {"20"}},
+        ),
+        (
+            [retry_row],
+            {"flaky": [{"id": "20"}]} if not retry_row.get("liveError") else {},
+            {"flaky": {"20"}},
+        ),
+    ]
+
+    def fake_scan(entries, *_args, **_kwargs):
+        scan_calls.append([key for key, _entry in entries])
+        return responses.pop(0)
+
+    apply_calls: list[list[str]] = []
+
+    def fake_apply_missing(
+        _state, _queue, entries, _root, _messages, _raw_ids, _today,
+        _recovery, _state_path, _queue_path, _copied,
+    ):
+        apply_calls.append([key for key, _entry in entries])
+        return 1, ["flaky"]
+
+    monkeypatch.setattr(weekly, "scan", fake_scan)
+    monkeypatch.setattr(weekly, "apply_missing", fake_apply_missing)
+    monkeypatch.setattr(weekly.worker, "load_discord_token", lambda *_args: "token")
+    monkeypatch.setattr(weekly, "capture_report_cutoff", lambda *_args: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "weekly_raw_reconcile_v4.py",
+            "--state", str(state_path),
+            "--queue", str(queue_path),
+            "--root", str(root),
+            "--today", "2026-09-20",
+            "--evidence-dir", str(evidence),
+            "--max-closeout-passes", "1",
+        ],
+    )
+
+    exit_code = weekly.main()
+    summary = json.loads(
+        (evidence / "weekly-reconciliation-summary.json").read_text(encoding="utf-8")
+    )
+    return exit_code, summary, scan_calls, apply_calls
+
+
+def test_final_only_transient_retries_target_entry_without_duplicate_append(
+    tmp_path: Path, monkeypatch
+):
+    exit_code, summary, scan_calls, apply_calls = run_final_retry_scenario(
+        tmp_path,
+        monkeypatch,
+        retry_row={
+            "key": "flaky",
+            "channelId": "2",
+            "liveMessages": 1,
+            "liveOnly": 0,
+            "localOnly": 0,
+        },
+    )
+
+    assert exit_code == 0
+    assert scan_calls == [["flaky", "healthy"], ["flaky", "healthy"], ["flaky"]]
+    assert apply_calls == [["flaky", "healthy"]]
+    assert summary["appended"] == 1
+    assert summary["finalLiveErrors"] == 0
+    assert summary["finalReadRetry"] == {
+        "attemptedEntries": 1,
+        "recoveredEntries": 1,
+        "exhaustedEntries": 0,
+    }
+    assert summary["finalReadErrors"] == []
+    assert summary["localOnlyClassification"]["setConservationPass"] is True
+
+
+def test_persistent_final_read_error_fails_closed_with_redacted_receipt(
+    tmp_path: Path, monkeypatch
+):
+    exit_code, summary, scan_calls, apply_calls = run_final_retry_scenario(
+        tmp_path,
+        monkeypatch,
+        retry_row={
+            "key": "flaky",
+            "channelId": "2",
+            "liveError": "TimeoutError: another private response body",
+        },
+    )
+
+    assert exit_code == 2
+    assert scan_calls == [["flaky", "healthy"], ["flaky", "healthy"], ["flaky"]]
+    assert apply_calls == [["flaky", "healthy"]]
+    assert summary["appended"] == 1
+    assert summary["finalLiveErrors"] == 1
+    assert summary["finalReadRetry"] == {
+        "attemptedEntries": 1,
+        "recoveredEntries": 0,
+        "exhaustedEntries": 1,
+    }
+    assert summary["finalReadErrors"] == [{
+        "entry": "flaky",
+        "channelId": "2",
+        "errorClass": "TimeoutError",
+    }]
+    assert set(summary["finalReadErrors"][0]) == {"entry", "channelId", "errorClass"}
+    assert "private response body" not in json.dumps(summary)
+    assert summary["localOnlyClassification"]["setConservationPass"] is True
 
 
 def test_safe_entry_dir_rejects_path_escape(tmp_path: Path):

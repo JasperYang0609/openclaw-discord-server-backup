@@ -550,9 +550,111 @@ def scan(
                 "localOnly": len(raw_ids - live_ids),
             })
         except Exception as exc:
-            row["liveError"] = f"{type(exc).__name__}: {exc}"
+            # Exception messages may contain Discord response bodies or other
+            # customer content. Keep only the class needed for fail-closed
+            # diagnostics and never persist the message.
+            row["liveError"] = type(exc).__name__
         rows.append(row)
     return rows, messages_by_key, raw_ids_by_key
+
+
+def sanitized_final_read_errors(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the allowlisted, content-free final read error receipt."""
+    errors: list[dict[str, Any]] = []
+    for row in rows:
+        value = row.get("liveError")
+        if not value:
+            continue
+        candidate = str(value).split(":", 1)[0].strip()
+        if (
+            not candidate
+            or len(candidate) > 128
+            or not candidate.isascii()
+            or not (candidate[0].isalpha() or candidate[0] == "_")
+            or any(not (character.isalnum() or character == "_") for character in candidate)
+        ):
+            candidate = "UnknownError"
+        channel_id = row.get("channelId")
+        errors.append({
+            "entry": str(row.get("key") or ""),
+            "channelId": str(channel_id) if channel_id is not None else None,
+            "errorClass": candidate,
+        })
+    return errors
+
+
+def retry_failed_final_reads(
+    rows: list[dict[str, Any]],
+    messages_by_key: dict[str, list[dict[str, Any]]],
+    raw_ids_by_key: dict[str, set[str]],
+    entries: list[tuple[str, dict[str, Any]]],
+    root: Path,
+    token: str,
+    page_limit: int,
+    report_entry_key: str | None = None,
+    report_cutoff_message_id: str | None = None,
+    cutoff_message_ids: dict[str, str] | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, set[str]],
+    dict[str, int],
+]:
+    """Retry final read failures once, targeting only the failed entries.
+
+    This is deliberately a read-only closeout retry. It never calls the repair
+    writer, so it cannot append a second copy of a message already repaired by
+    an earlier closeout pass. Persistent errors remain in ``rows`` and keep the
+    overall reconcile fail-closed.
+    """
+    initial_error_keys = {
+        str(row.get("key")) for row in rows if row.get("liveError")
+    }
+    entry_by_key = {key: entry for key, entry in entries}
+    retry_entries = [
+        (key, entry_by_key[key])
+        for key, _entry in entries
+        if key in initial_error_keys and entry_by_key[key].get("channelId")
+    ]
+    if not retry_entries:
+        return rows, messages_by_key, raw_ids_by_key, {
+            "attemptedEntries": 0,
+            "recoveredEntries": 0,
+            "exhaustedEntries": len(initial_error_keys),
+        }
+
+    retry_rows, retry_messages, retry_raw_ids = scan(
+        retry_entries,
+        root,
+        token,
+        page_limit,
+        report_entry_key,
+        report_cutoff_message_id,
+        cutoff_message_ids,
+    )
+    retry_row_by_key = {str(row.get("key")): row for row in retry_rows}
+    missing_rows = {key for key, _entry in retry_entries} - set(retry_row_by_key)
+    if missing_rows:
+        raise RuntimeError("targeted final read retry returned incomplete entry coverage")
+
+    merged_rows = [retry_row_by_key.get(str(row.get("key")), row) for row in rows]
+    merged_messages = dict(messages_by_key)
+    merged_raw_ids = dict(raw_ids_by_key)
+    for key, _entry in retry_entries:
+        merged_raw_ids[key] = retry_raw_ids[key]
+        if key in retry_messages:
+            merged_messages[key] = retry_messages[key]
+        else:
+            merged_messages.pop(key, None)
+
+    remaining_error_keys = {
+        str(row.get("key")) for row in merged_rows if row.get("liveError")
+    }
+    return merged_rows, merged_messages, merged_raw_ids, {
+        "attemptedEntries": len(retry_entries),
+        "recoveredEntries": len(initial_error_keys - remaining_error_keys),
+        "exhaustedEntries": len(remaining_error_keys),
+    }
 
 
 def freeze_scope_cutoffs(
@@ -803,6 +905,24 @@ def main() -> int:
             report_cutoff_message_id,
             scope_cutoffs,
         )
+        (
+            final_rows,
+            final_messages,
+            final_raw_ids,
+            final_read_retry,
+        ) = retry_failed_final_reads(
+            final_rows,
+            final_messages,
+            final_raw_ids,
+            entries,
+            root,
+            token,
+            args.page_limit,
+            args.report_entry_key,
+            report_cutoff_message_id,
+            scope_cutoffs,
+        )
+        final_read_errors = sanitized_final_read_errors(final_rows)
         final_live_errors = sum(bool(row.get("liveError")) for row in final_rows)
         final_live_only = sum(int(row.get("liveOnly") or 0) for row in final_rows)
         classification = classify_local_only(final_rows, final_messages, final_raw_ids)
@@ -830,6 +950,8 @@ def main() -> int:
             "appended": total_appended,
             "finalLiveOnly": final_live_only,
             "finalLiveErrors": final_live_errors,
+            "finalReadRetry": final_read_retry,
+            "finalReadErrors": final_read_errors,
             "activeQueue": active_queue,
             "frozenScopeEntries": len(scope_cutoffs),
             "reportEntryKey": args.report_entry_key,
