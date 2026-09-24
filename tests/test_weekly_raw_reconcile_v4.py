@@ -42,6 +42,23 @@ def test_capture_report_cutoff_uses_latest_message(monkeypatch):
     assert calls == [("token", "3", None, 1)]
 
 
+def test_weekly_worker_renderer_preserves_component_only_status_message():
+    rendered = weekly.worker.fmt_raw({
+        "id": "1552571944937721877",
+        "timestamp": "2026-09-24T06:47:00+00:00",
+        "content": "",
+        "author": {"username": "小萊"},
+        "attachments": [],
+        "components": [{
+            "type": 17,
+            "components": [{"type": 10, "content": "狀態回報窗正文"}],
+        }],
+    })
+
+    assert "狀態回報窗正文" in rendered
+    assert "discord-component-payload-ref:1552571944937721877" in rendered
+
+
 def test_scan_freezes_report_entry_and_excludes_newer_raw_and_live_ids(
     tmp_path: Path, monkeypatch
 ):
@@ -359,6 +376,58 @@ def test_apply_missing_is_append_only_and_creates_recovery(tmp_path: Path, monke
         "queue.json", "raw/topic/2026-08-22.md", "state.json"
     }
     assert entry["lastWrittenMessageId"] == "101"
+
+
+def test_apply_missing_backfills_component_only_body_for_existing_raw_id(tmp_path: Path):
+    message_id = "1552571944937721877"
+    state_path = tmp_path / "memory/state.json"
+    queue_path = tmp_path / "memory/queue.json"
+    root = tmp_path / "archive"
+    raw = root / "topic/raw/2026-09-24.md"
+    raw.parent.mkdir(parents=True)
+    raw.write_text(
+        f"### 2026-09-24 14:47:00 +0800 — 小萊 — id:{message_id}\n\n(無文字內容)\n",
+        encoding="utf-8",
+    )
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text('{"entries": {}}', encoding="utf-8")
+    queue_path.write_text('{"items": []}', encoding="utf-8")
+    entry = {
+        "channelId": "1",
+        "relativePath": "topic",
+        "syncStatus": "healthy",
+        "lastWrittenMessageId": message_id,
+        "lastMessageId": message_id,
+    }
+    message = {
+        "id": message_id,
+        "timestamp": "2026-09-24T06:47:00+00:00",
+        "content": "",
+        "author": {"username": "小萊"},
+        "attachments": [],
+        "components": [{"type": 10, "content": "回補後的狀態回報正文"}],
+    }
+
+    appended, affected = weekly.apply_missing(
+        {"entries": {"topic": entry}},
+        {"items": []},
+        [("topic", entry)],
+        root,
+        {"topic": [message]},
+        {"topic": {message_id}},
+        "2026-09-24",
+        tmp_path / "evidence/pre-repair",
+        state_path,
+        queue_path,
+        set(),
+    )
+
+    assert appended == 0
+    assert affected == ["topic"]
+    text = raw.read_text(encoding="utf-8")
+    assert "回補後的狀態回報正文" in text
+    assert text.count(f"discord-component-payload-ref:{message_id}") == 1
+    assert (tmp_path / "evidence/pre-repair/evidence-manifest.json").is_file()
 
 
 def evidence_fixture(tmp_path: Path):

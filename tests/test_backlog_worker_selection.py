@@ -269,6 +269,65 @@ def test_legacy_selector_never_consumes_any_rich_prefixed_reason():
     assert [row[0] for row in selected] == ["legacy"]
     assert worker.active_rich_queue_keys(state, queue) == ["future-rich", "known-rich"]
 
+
+def test_component_only_status_message_is_preserved_and_searchable(tmp_path: Path):
+    message_id = "1552571944937721877"
+    message = {
+        "id": message_id,
+        "timestamp": "2026-09-24T06:47:00+00:00",
+        "content": "",
+        "author": {"username": "小萊"},
+        "attachments": [],
+        "components": [{
+            "type": 17,
+            "components": [{
+                "type": 10,
+                "content": "狀態更新：正在驗證 raw 備份。",
+            }],
+        }],
+    }
+    entry = {"relativePath": "測試/狀態卡"}
+
+    assert worker.append_batch(tmp_path, entry, [message], "status-card-test") == 1
+
+    raw = tmp_path / "測試/狀態卡/raw/2026-09-24.md"
+    text = raw.read_text(encoding="utf-8")
+    assert "狀態更新：正在驗證 raw 備份。" in text
+    assert f"<!-- {worker.COMPONENT_PAYLOAD_MARKER}:{message_id} -->" in text
+    assert '"type": 17' in text
+    assert "備份 / OpenClaw / cron / state" in worker.summarize_batch([message])["topics"]
+
+
+def test_component_supplement_backfills_existing_id_once(tmp_path: Path):
+    message_id = "1552571944937721877"
+    raw_dir = tmp_path / "測試/狀態卡/raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "2026-09-24.md").write_text(
+        f"### 2026-09-24 14:47:00 +0800 — 小萊 — id:{message_id}\n\n(無文字內容)\n",
+        encoding="utf-8",
+    )
+    message = {
+        "id": message_id,
+        "timestamp": "2026-09-24T06:47:00+00:00",
+        "content": "",
+        "author": {"username": "小萊"},
+        "attachments": [],
+        "components": [{"type": 10, "content": "歷史狀態卡正文"}],
+    }
+    entry = {"relativePath": "測試/狀態卡"}
+
+    assert worker.append_component_supplements(
+        tmp_path, entry, [message], "historical-backfill"
+    ) == 1
+    assert worker.append_component_supplements(
+        tmp_path, entry, [message], "historical-backfill"
+    ) == 0
+
+    text = (raw_dir / "2026-09-24.md").read_text(encoding="utf-8")
+    assert text.count("歷史狀態卡正文") == 1
+    assert text.count(f"{worker.COMPONENT_PAYLOAD_MARKER}:{message_id}") == 1
+    assert len(worker.existing_raw_message_ids(raw_dir)) == 1
+
 if __name__ == "__main__":
     test_selects_healthy_stale_entry_not_in_queue()
     test_reactivated_queue_cursor_never_lags_state_cursor()

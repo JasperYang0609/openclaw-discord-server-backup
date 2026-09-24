@@ -9,6 +9,9 @@ It uses V3 cursor state, explicit backlog queue, deterministic workers, and live
 A channel/thread is incrementally caught up only when `read after=<cursor>` returns
 0 messages. Daily sync also re-reads a bounded recent window and commits normalized
 rich payload plus assets through a verified generation before moving the cursor.
+Legacy raw repair paths preserve Discord component payloads, including component-only
+Status Update UI cards, and weekly repair appends idempotent supplements for older
+message IDs that were previously stored without their component body.
 `lastBackup` alone is not completion or rich-content proof.
 
 ## Install

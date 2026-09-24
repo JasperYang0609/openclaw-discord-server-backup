@@ -705,7 +705,11 @@ def apply_missing(
         ]
         for key, _entry in entries
     }
-    if any(missing_by_key.values()):
+    component_pending_by_key = {
+        key: worker.pending_component_messages(root, entry, messages_by_key.get(key) or [])
+        for key, entry in entries
+    }
+    if any(missing_by_key.values()) or any(component_pending_by_key.values()):
         if not copied:
             create_pre_repair_evidence(
                 recovery_root, state_path, queue_path, root, entries
@@ -716,27 +720,35 @@ def apply_missing(
     for key, entry in entries:
         messages = messages_by_key.get(key) or []
         missing = missing_by_key[key]
-        if not missing:
+        pending_components = component_pending_by_key[key]
+        if not missing and not pending_components:
             continue
         # Verification immediately precedes every append. If evidence is missing,
         # extra, symlinked, traversing, or changed, no repair write is attempted.
         verify_evidence_bundle(recovery_root)
-        worker.append_batch(root, entry, missing, f"weekly full-inventory repair {now}")
-        latest = max((str(message["id"]) for message in messages), key=int)
-        entry.update({
-            "lastWrittenMessageId": latest,
-            "lastMessageId": latest,
-            "lastBackup": today,
-            "lastSuccessfulWriteAt": now,
-            "syncStatus": "healthy",
-            "backlogReason": None,
-            "consecutiveErrors": 0,
-            "updatedAt": now,
-        })
-        reconcile.mark_queue_caught_up(queue, key, latest, now)
-        appended += len(missing)
+        if missing:
+            worker.append_batch(root, entry, missing, f"weekly full-inventory repair {now}")
+            latest = max((str(message["id"]) for message in messages), key=int)
+            entry.update({
+                "lastWrittenMessageId": latest,
+                "lastMessageId": latest,
+                "lastBackup": today,
+                "lastSuccessfulWriteAt": now,
+                "syncStatus": "healthy",
+                "backlogReason": None,
+                "consecutiveErrors": 0,
+                "updatedAt": now,
+            })
+            reconcile.mark_queue_caught_up(queue, key, latest, now)
+            appended += len(missing)
+        worker.append_component_supplements(
+            root,
+            entry,
+            messages,
+            f"weekly component backfill {now}",
+        )
         affected.append(key)
-    if affected:
+    if appended:
         state["updatedAt"] = now
         queue["updatedAt"] = now
         atomic_json(state_path, state)
