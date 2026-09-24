@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Preserve Discord component-only messages (including Status Update UI cards) in
+  raw Markdown writers, and let weekly repair append idempotent component
+  supplements for previously archived blank message IDs.
 - Add a transactional, idempotent fresh-install/upgrade workflow for all 11 owned
   jobs: complete-inventory and duplicate-key gates, disabled staging, isolated
   command and shared-session canaries, enable-last commit, exact verification,

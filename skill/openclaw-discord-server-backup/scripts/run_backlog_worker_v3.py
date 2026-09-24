@@ -20,6 +20,10 @@ from typing import Any
 ACTIVE = {"queued", "catching_up", "retry"}
 TZ_TAIPEI = timezone(timedelta(hours=8))
 MAX_429_RETRIES = 8
+COMPONENT_PAYLOAD_MARKER = "discord-component-payload-ref"
+COMPONENT_PAYLOAD_MARKER_RE = re.compile(
+    rf"<!--\s*{COMPONENT_PAYLOAD_MARKER}:(\d{{15,20}})\s*-->"
+)
 
 
 def entry_is_excluded(entry: dict[str, Any]) -> bool:
@@ -194,18 +198,47 @@ def clean_content(text: str) -> str:
     return text if text.strip() else "(無文字內容)"
 
 
+def component_payload_markdown(msg: dict[str, Any]) -> str:
+    """Render the complete Discord component payload without losing future fields."""
+    components = msg.get("components")
+    if not components:
+        return ""
+    payload = json.dumps(components, ensure_ascii=False, sort_keys=True, indent=2)
+    indented = "\n".join(f"    {line}" for line in payload.splitlines())
+    return (
+        f"<!-- {COMPONENT_PAYLOAD_MARKER}:{msg['id']} -->\n\n"
+        f"[元件內容]\n\n{indented}"
+    )
+
+
+def searchable_message_text(msg: dict[str, Any]) -> str:
+    """Return ordinary text plus component text for summaries and links."""
+    parts = [str(msg.get("content") or "")]
+    components = msg.get("components")
+    if components:
+        parts.append(json.dumps(components, ensure_ascii=False, sort_keys=True))
+    return "\n".join(part for part in parts if part)
+
+
 def fmt_raw(msg: dict[str, Any]) -> str:
     dt = msg_dt(msg).astimezone(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S %z")
-    content = clean_content(msg.get("content") or "")
+    parts: list[str] = []
+    content = str(msg.get("content") or "")
+    if content.strip():
+        parts.append(content)
+    component_payload = component_payload_markdown(msg)
+    if component_payload:
+        parts.append(component_payload)
     attachments = msg.get("attachments") or []
     if attachments:
         lines = [f"[附件] {a.get('filename','file')} {a.get('url','')}" for a in attachments]
-        content = content + "\n" + "\n".join(lines)
-    return f"\n### {dt} — {author_name(msg)} — id:{msg['id']}\n\n{content}\n"
+        parts.append("\n".join(lines))
+    body = "\n\n".join(parts) if parts else clean_content("")
+    return f"\n### {dt} — {author_name(msg)} — id:{msg['id']}\n\n{body}\n"
 
 
 def summarize_batch(msgs: list[dict[str, Any]]) -> dict[str, list[str]]:
-    text = "\n".join((m.get("content") or "") for m in msgs)
+    text = "\n".join(searchable_message_text(m) for m in msgs)
     topics = []
     patterns = [
         ("程式 / app / 實作討論", r"code|bug|Flutter|FlutterFlow|SQL|API|push|commit|錯誤|修正|功能|頁面"),
@@ -220,7 +253,7 @@ def summarize_batch(msgs: list[dict[str, Any]]) -> dict[str, list[str]]:
             break
     links = []
     for m in msgs:
-        links.extend(re.findall(r"https?://\S+", m.get("content") or ""))
+        links.extend(re.findall(r"https?://\S+", searchable_message_text(m)))
         for a in m.get("attachments") or []:
             links.append(f"{a.get('filename','attachment')}: {a.get('url','')}")
     return {
@@ -237,6 +270,64 @@ def ensure_dirs(root: Path, rel: str) -> Path:
     (base / "summary").mkdir(parents=True, exist_ok=True)
     (base / "legacy").mkdir(parents=True, exist_ok=True)
     return base
+
+
+def existing_component_payload_refs(raw_dir: Path) -> set[str]:
+    refs: set[str] = set()
+    if not raw_dir.is_dir():
+        return refs
+    for path in sorted(raw_dir.glob("*.md")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        refs.update(COMPONENT_PAYLOAD_MARKER_RE.findall(text))
+    return refs
+
+
+def pending_component_messages(
+    root: Path,
+    entry: dict[str, Any],
+    msgs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rel = entry.get("relativePath")
+    if not rel:
+        raise RuntimeError("entry missing relativePath")
+    existing_refs = existing_component_payload_refs(root / rel / "raw")
+    return [
+        msg for msg in sorted(msgs, key=lambda row: int(row["id"]))
+        if msg.get("components") and str(msg["id"]) not in existing_refs
+    ]
+
+
+def append_component_supplements(
+    root: Path,
+    entry: dict[str, Any],
+    msgs: list[dict[str, Any]],
+    run_label: str,
+) -> int:
+    """Append idempotent component supplements for already archived IDs."""
+    rel = entry.get("relativePath")
+    if not rel:
+        raise RuntimeError("entry missing relativePath")
+    base = ensure_dirs(root, rel)
+    pending = pending_component_messages(root, entry, msgs)
+    if not pending:
+        return 0
+    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for msg in pending:
+        by_day[msg_day_tw(msg)].append(msg)
+    for day, day_msgs in by_day.items():
+        raw = base / "raw" / f"{day}.md"
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n\n---\n## Discord 元件內容補充 — {run_label} — "
+                f"{len(day_msgs)} messages\n"
+            )
+            for msg in day_msgs:
+                dt = msg_dt(msg).astimezone(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S %z")
+                handle.write(
+                    f"\n#### {dt} — {author_name(msg)}\n\n"
+                    f"{component_payload_markdown(msg)}\n"
+                )
+    return len(pending)
 
 
 def append_batch(root: Path, entry: dict[str, Any], msgs: list[dict[str, Any]], run_label: str) -> None:

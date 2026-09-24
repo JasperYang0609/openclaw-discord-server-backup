@@ -6,7 +6,11 @@ It uses V3 cursor state, explicit backlog queue, deterministic workers, and live
 
 ## Core guarantee
 
-A channel/thread is caught up only when `read after=<cursor>` returns 0 messages. `lastBackup` is not completion proof.
+A channel/thread is caught up only when `read after=<cursor>` returns 0 messages.
+Raw writers also preserve Discord component payloads, including component-only
+Status Update UI cards, and weekly repair can append idempotent supplements for
+older message IDs previously stored without their component body. `lastBackup`
+is not completion proof.
 
 ## Install
 
