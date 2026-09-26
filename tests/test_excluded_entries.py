@@ -1,5 +1,7 @@
 import importlib.util
+import json
 from pathlib import Path
+import sys
 
 
 ROOT = Path(__file__).parents[1] / "skill/openclaw-discord-server-backup/scripts"
@@ -79,3 +81,41 @@ def test_audit_invalidates_excluded_queue_without_probing():
     assert changed == 1
     assert queue["items"][0]["status"] == "invalid"
     assert queue["items"][0]["attempts"] == 0
+
+
+def test_audit_reports_active_queue_after_requeue(monkeypatch, tmp_path, capsys):
+    state_path = tmp_path / "state.json"
+    queue_path = tmp_path / "queue.json"
+    state_path.write_text(json.dumps({
+        "entries": {
+            "topic": {
+                "channelId": "1497025304323948577",
+                "relativePath": "topic",
+                "type": "channel",
+                "lastWrittenMessageId": "100",
+                "lastMessageId": "100",
+                "syncStatus": "healthy",
+            }
+        }
+    }), encoding="utf-8")
+    queue_path.write_text(json.dumps({"version": 1, "items": []}), encoding="utf-8")
+
+    monkeypatch.setattr(audit, "load_token", lambda *_args, **_kwargs: "test-token")
+    monkeypatch.setattr(audit, "read_after", lambda *_args, **_kwargs: {
+        "ok": True,
+        "messages": [{"id": "101", "timestamp": "2026-09-26T00:00:00Z"}],
+    })
+    monkeypatch.setattr(sys, "argv", [
+        "audit_caught_up_v3.py",
+        "--state", str(state_path),
+        "--queue", str(queue_path),
+        "--requeue",
+    ])
+
+    assert audit.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+
+    assert result["requeued"] is True
+    assert result["activeQueue"] == 1
+    assert queue["items"][0]["status"] == "queued"
