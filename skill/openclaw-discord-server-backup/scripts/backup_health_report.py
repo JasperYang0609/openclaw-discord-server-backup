@@ -524,9 +524,6 @@ def render_report(
         index_text, index_anomalies, index_pending = group_summary([gemini], "Gemini 已同步")
         if gemini.get("status") == "ok":
             index_text = f"Gemini 已同步（{gemini['metrics']['rows']} 筆）"
-            if qwen_receipt is not None:
-                qwen_text = "Qwen 冷備援已保留" if qwen_cold_standby_is_preserved(qwen_receipt) else "Qwen 冷備援狀態未確認"
-                index_text = f"{index_text}；{qwen_text}"
     elif qwen is None:
         index_text = "未設定本機搜尋索引回報（不影響 Discord 原始備份）"
         index_anomalies: list[dict[str, Any]] = []

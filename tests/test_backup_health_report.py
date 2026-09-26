@@ -99,7 +99,7 @@ def test_healthy_report_is_concise_and_monthly_snapshot_is_current(tmp_path):
         assert forbidden not in report
 
 
-def test_gemini_manifest_is_primary_and_stale_qwen_is_cold_standby(tmp_path):
+def test_gemini_manifest_is_primary_and_does_not_describe_qwen_as_live_backup(tmp_path):
     complete_local_receipts(tmp_path)
     gemini = tmp_path / "gemini/incremental-manifest.latest.json"
     qwen = tmp_path / "qwen/qwen.json"
@@ -116,7 +116,8 @@ def test_gemini_manifest_is_primary_and_stale_qwen_is_cold_standby(tmp_path):
     )
 
     assert "✅ 正常" in report
-    assert "搜尋索引：Gemini 已同步（125638 筆）；Qwen 冷備援已保留" in report
+    assert "搜尋索引：Gemini 已同步（125638 筆）" in report
+    assert "Qwen" not in report
     assert "Qwen receipt is stale" not in report
 
 
