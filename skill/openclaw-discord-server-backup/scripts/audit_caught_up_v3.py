@@ -184,13 +184,17 @@ def main() -> int:
             msg = res["messages"][-1]
             live_new.append({"key": key, "cursor": cursor, "nextId": msg.get("id"), "nextTs": msg.get("timestamp")})
 
-    active_queue = [item for item in queue.get("items", []) if item.get("status") in ACTIVE_QUEUE]
     if args.requeue and live_new:
         requeue(state, queue, live_new)
         save_json(state_path, state)
         save_json(queue_path, queue)
     elif invalidated_queue_items:
         save_json(queue_path, queue)
+
+    # Report the queue after this audit's mutations. Computing this before
+    # requeue made newly discovered work invisible to the health receipt and
+    # could incorrectly render the channel backup as fully caught up.
+    active_queue = [item for item in queue.get("items", []) if item.get("status") in ACTIVE_QUEUE]
 
     result = {
         "checkedAt": datetime.now(timezone.utc).isoformat(),
