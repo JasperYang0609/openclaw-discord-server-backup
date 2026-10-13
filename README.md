@@ -52,9 +52,12 @@ is a no-op. Unknown or look-alike jobs are reported and left untouched; legacy
 adoption requires an explicit ID plus SHA-256 fingerprint map.
 
 Use `--offline-scaffold` only when the gateway is intentionally unavailable. This
-returns `PARTIAL_MANUAL_ACTION`, not a ready install. Install the separate local Qwen
-knowledge product first when searchable memory is required, and pass only its
-explicit receipt path; this installer never guesses another product's files or jobs.
+returns `PARTIAL_MANUAL_ACTION`, not a ready install. When searchable memory is
+required, install the separate
+[`openclaw-lancedb-knowledge`](https://github.com/JasperYang0609/openclaw-lancedb-knowledge-skill)
+product first with Google Gemini `gemini-embedding-001`, then pass its explicit
+incremental manifest path with `--gemini-manifest`; this installer never guesses
+another product's files or jobs.
 
 The default backlog topology is night-only: bounded runs at 23:10 and hourly from
 00:10 through 04:10 (Asia/Taipei). It deliberately avoids daytime catch-up work and
@@ -91,8 +94,9 @@ suite when `pytest` is available. Treat failure as a backup correctness issue.
 
 Routine jobs write private structured receipts and stay silent. At 07:05 the health
 job verifies the topology and emits one Traditional Chinese, plain-language report.
-It never treats yesterday's daily or Qwen receipt as today's proof, and it never
-claims weekly/monthly verification before the first scheduled evidence exists.
+It never treats yesterday's daily evidence or Gemini incremental manifest as today's
+proof, and it never claims weekly/monthly verification before the first scheduled
+evidence exists.
 Technical fields such as cursors, batch counts, and log paths remain in local logs.
 
 ## Maintainer use of Codex
